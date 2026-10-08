@@ -36,7 +36,21 @@ nothing from the list above is staged.
 2. **Branches.** Work on feature branches (`feature/<topic>`,
    `fix/<topic>`); never commit directly to `main`/`master` unless the
    user asks. Create from the default branch, keep names kebab-case.
-3. **Commits.** Stage deliberately (`git add <paths>`, not `git add -A`
+3. **README check before every commit.** `README.md` is the project's
+   description and setup guide and must stay true. Before committing, read
+   the staged diff (`git diff --cached --stat`, then the relevant hunks)
+   and compare it against what the README states: the agent table and
+   flow diagram, the "What we use" stack, the repository layout, the
+   setup steps (prerequisites, `.env.example` variables, install/run/test
+   commands), the troubleshooting table and the project-folder
+   conventions. If the change adds/renames/removes an agent, tool, MCP
+   server, dependency, env variable, folder, command or UI tab, or changes
+   behaviour the README describes, update `README.md` (and
+   `.env.example` / `projects/README.md` when they are affected) and
+   include it in the same commit. If nothing in the README is affected,
+   say so in one line of your report. Never commit a change that makes
+   the README wrong.
+4. **Commits.** Stage deliberately (`git add <paths>`, not `git add -A`
    blindly), one logical change per commit, message in imperative mood:
    a short title (<= 72 chars), blank line, a body saying what and why.
    End every commit message with the attribution line the conversation's
@@ -44,7 +58,7 @@ nothing from the list above is staged.
    `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`). Use a
    single-quoted here-string / heredoc for multi-line messages. Never use
    `--no-verify`, `--amend` on pushed commits, or `-i` interactive modes.
-4. **GitLab.** Prefer the `glab` CLI when installed (`glab auth status`,
+5. **GitLab.** Prefer the `glab` CLI when installed (`glab auth status`,
    `glab mr create --fill`, `glab mr list`, `glab repo view`). If it is
    missing, use the REST API with `curl` and a token from the environment
    (`GITLAB_TOKEN`, header `PRIVATE-TOKEN`) against `GITLAB_URL` (default
@@ -52,23 +66,28 @@ nothing from the list above is staged.
    other than `.env`, and never commit `.env`. If no token/CLI is
    available, do the local git work and tell the user exactly what is
    needed to push or open a merge request.
-5. **Remotes and pushes.** Add the remote as `origin`; push with
+6. **Remotes and pushes.** Add the remote as `origin`; push with
    `git push -u origin <branch>`. Force-push, history rewrite, branch
    deletion on the remote and tag deletion only on an explicit instruction
    that names the branch/tag.
-6. **Merge requests.** Title from the branch's purpose, description with:
+7. **Merge requests.** Title from the branch's purpose, description with:
    what changed (bullets), how it was verified (e.g. `pytest tests -q`
    result), anything reviewers should know; end with the PR attribution
    line the system reminder prescribes (currently
    `🤖 Generated with [Claude Code](https://claude.com/claude-code)`).
    Target the default branch unless told otherwise.
-7. **Conflicts.** Explain which files conflict and why before resolving;
+8. **Conflicts.** Explain which files conflict and why before resolving;
    resolve only trivial ones yourself (whitespace, imports), otherwise ask.
-8. **Verification before reporting.** After commits: `git log --oneline -3`
+9. **Tests gate every commit.** A Claude Code hook
+   (`.claude/hooks/pre_commit_tests.py`, registered in `.claude/settings.json`)
+   runs `python -m pytest tests -q` before any `git commit` you issue and
+   blocks the commit when the suite fails. When that happens, do not retry
+   or work around it: report the failing tests to the main conversation.
+10. **Verification before reporting.** After commits: `git log --oneline -3`
    and `git status --short` must show the expected state. After pushes:
    `git ls-remote --heads origin <branch>`. Run `python -m pytest tests -q`
    before creating a merge request and quote the result.
-9. **Safety.** Never delete or truncate `observability/*.db`,
+11. **Safety.** Never delete or truncate `observability/*.db`,
    `checkpoints/*.db` or anything under `runs/`/`projects/` — the dev
    server holds the databases open. Never run `git clean -fdx` without an
    explicit instruction; prefer `git clean -n` to show what it would do.
@@ -77,6 +96,7 @@ nothing from the list above is staged.
 
 ## Reporting
 Reply in under 150 words: current branch and commit, what you did (commands
-in a fenced block), what you verified, the MR link if one was created, and
-anything the user must do (authenticate, create the GitLab project, decide
-what to do with `reference/`).
+in a fenced block), whether `README.md` was updated for this commit or why
+it did not need to be, what you verified, the MR link if one was created,
+and anything the user must do (authenticate, create the GitLab project,
+decide what to do with `reference/`).

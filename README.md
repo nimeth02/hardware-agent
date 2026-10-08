@@ -62,6 +62,7 @@ server/                 FastAPI app (server/app.py) and static UI (server/static
 projects/               example projects the simulation/implementation agents run as-is (see projects/README.md)
 tests/                  unit tests per agent
 .claude/agents/         Claude Code subagents used during development (ui-backend, project-guide, source-control)
+.claude/hooks/          Claude Code hooks: pre_commit_tests.py runs the unit tests before any git commit Claude issues
 ```
 
 ## Setup guide
