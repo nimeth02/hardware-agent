@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hardware Agent</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Hardware Agent</h1>
+  <nav>
+    <button class="tab-btn active" data-tab="agents">Agents</button>
+    <button class="tab-btn" data-tab="pipeline">Pipeline</button>
+    <button class="tab-btn" data-tab="observability">Observability</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-pipeline" class="tab">
+    <div class="panel">
+      <label for="pipeline-input">Requirement text</label>
+      <div id="pipeline-examples-row" class="examples-row"></div>
+      <textarea id="pipeline-input" rows="10" placeholder="Describe the hardware you need..."></textarea>
+      <div class="row">
+        <button id="pipeline-start-btn">Start Pipeline</button>
+        <span id="pipeline-start-status" class="status"></span>
+      </div>
+    </div>
+
+    <div id="pipeline-timings-panel" class="panel hidden">
+      <label>Steps</label>
+      <ul id="pipeline-timings" class="timings-list"></ul>
+    </div>
+
+    <div id="pipeline-review-panel" class="panel hidden">
+      <label>Suggestions</label>
+      <ul id="pipeline-suggestions" class="suggestions-list"></ul>
+      <label>Spec review (edit the JSON if needed, then approve)</label>
+      <textarea id="pipeline-spec-json" rows="16"></textarea>
+      <div class="row">
+        <button id="pipeline-approve-btn">Approve &amp; Generate RTL</button>
+        <span id="pipeline-approve-status" class="status"></span>
+      </div>
+    </div>
+
+    <div id="pipeline-rtl-panel" class="panel hidden">
+      <label>Generated RTL</label>
+      <p id="pipeline-rtl-meta" class="status"></p>
+      <pre id="pipeline-rtl-code" class="result-box"></pre>
+      <label>Lint</label>
+      <ul id="pipeline-rtl-lint" class="suggestions-list"></ul>
+      <label>Notes</label>
+      <ul id="pipeline-rtl-notes"></ul>
+    </div>
+  </section>
+
+  <section id="tab-agents" class="tab active">
+    <div class="row" style="margin-top:0">
+      <div class="row" style="margin-top:0">
+        <label for="agent-select" style="margin:0">Agent</label>
+        <select id="agent-select"></select>
+        <span id="agent-desc" class="status"></span>
+      </div>
+      <nav class="subnav">
+        <button class="tab-btn active" data-subtab="run">Run</button>
+        <button class="tab-btn" data-subtab="history">Previous runs</button>
+      </nav>
+    </div>
+
+    <div id="agents-view-run" class="subtab active">
+    <div class="panel">
+      <div class="row" style="margin-top:12px;justify-content:flex-start">
+        <label for="agent-input" style="margin:0">Input (JSON)</label>
+        <button id="agent-fill-btn" type="button" class="example-btn" title="Replace spec / rtl / testbench fields with the latest results of the producing agents">Fill from latest runs</button>
+      </div>
+      <div id="agent-examples-row" class="examples-row"></div>
+      <textarea id="agent-input" rows="12"></textarea>
+      <div class="row">
+        <button id="agent-run-btn">Run agent</button>
+        <span id="agent-run-status" class="status"></span>
+      </div>
+    </div>
+
+    <div id="agent-run-panel" class="panel hidden">
+      <div class="row" style="margin-top:0">
+        <label style="margin:0">Run</label>
+        <span id="agent-run-meta" class="status" style="flex:1"></span>
+      </div>
+      <div id="agent-use-row" class="examples-row hidden" style="margin-top:10px"></div>
+      <label style="margin-top:12px">Timeline</label>
+      <table>
+        <thead><tr><th>#</th><th>Event</th><th>Detail</th><th>Status</th><th>Duration</th></tr></thead>
+        <tbody id="agent-events"></tbody>
+      </table>
+      <label style="margin-top:14px">LLM calls (thinking)</label>
+      <div id="agent-llm-calls"></div>
+      <label style="margin-top:14px">Tool calls</label>
+      <div id="agent-tool-calls"></div>
+      <div id="agent-clarify" class="hidden" style="margin-top:14px">
+        <label>The agent is waiting for you</label>
+        <p id="agent-question" class="msg-block"></p>
+        <textarea id="agent-answer" rows="3" placeholder="Your answer..."></textarea>
+        <div class="row">
+          <button id="agent-answer-btn">Answer &amp; resume session</button>
+          <span id="agent-answer-status" class="status"></span>
+        </div>
+      </div>
+      <div id="agent-orch-block" class="hidden" style="margin-top:14px">
+        <label>Orchestrator</label>
+        <div id="agent-orch-body"></div>
+      </div>
+      <div id="agent-sim-block" class="hidden" style="margin-top:14px">
+        <label>Simulation</label>
+        <div id="agent-sim-body"></div>
+      </div>
+      <div id="agent-impl-block" class="hidden" style="margin-top:14px">
+        <label>Implementation</label>
+        <div id="agent-impl-body"></div>
+      </div>
+      <div id="agent-suggestions-block" class="hidden" style="margin-top:14px">
+        <label>Suggestions</label>
+        <ul id="agent-suggestions" class="suggestions-list"></ul>
+      </div>
+      <div id="agent-code-blocks" class="hidden" style="margin-top:14px"></div>
+      <div id="agent-vectors-block" class="hidden" style="margin-top:14px">
+        <label>Test vectors</label>
+        <div class="code-block-head">
+          <span id="agent-vectors-meta"></span>
+          <span>
+            <button id="agent-vectors-copy" class="copy-btn" type="button">Copy CSV</button>
+            <button id="agent-vectors-download" class="copy-btn" type="button">Download</button>
+          </span>
+        </div>
+        <div class="vectors-table-wrap">
+          <table id="agent-vectors-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <label style="margin-top:10px">Validation</label>
+        <ul id="agent-vectors-issues" class="suggestions-list"></ul>
+      </div>
+      <label style="margin-top:14px">Final result</label>
+      <pre id="agent-result" class="result-box"></pre>
+    </div>
+    </div>
+
+    <div id="agents-view-history" class="subtab">
+    <div class="panel">
+      <div class="row" style="margin-top:0">
+        <label style="margin:0">Previous runs — click one to open it in the Run view</label>
+        <button id="agent-runs-refresh">Refresh</button>
+      </div>
+      <table>
+        <thead><tr><th>Started</th><th>Agent</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
+        <tbody id="agent-runs"></tbody>
+      </table>
+    </div>
+    </div>
+  </section>
+
+  <section id="tab-observability" class="tab">
+    <div class="panel">
+      <div class="row">
+        <label>LLM call traces</label>
+        <button id="refresh-traces-btn">Refresh</button>
+      </div>
+      <table id="traces-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Source</th>
+            <th>Model</th>
+            <th>Duration (ms)</th>
+            <th>Status</th>
+            <th>Output preview</th>
+          </tr>
+        </thead>
+        <tbody id="traces-tbody"></tbody>
+      </table>
+    </div>
+
+    <div id="trace-detail" class="panel hidden">
+      <div class="row">
+        <label>Trace detail</label>
+        <button id="close-detail-btn">Close</button>
+      </div>
+      <div id="trace-detail-body"></div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

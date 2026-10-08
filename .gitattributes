@@ -1,0 +1,12 @@
+# Normalise line endings: LF in the repository, native on checkout is not
+# needed (Python, VHDL, JS, markdown all work with LF on Windows).
+* text=auto eol=lf
+*.vhd text eol=lf
+*.py text eol=lf
+*.csv text eol=lf
+*.md text eol=lf
+
+# Binary artefacts (should not be committed, but never diff them if they are)
+*.db binary
+*.dcp binary
+*.wdb binary

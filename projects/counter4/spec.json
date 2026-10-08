@@ -1,0 +1,22 @@
+{
+  "status": "complete",
+  "entity_name": "counter4",
+  "description": "4-bit up counter with enable",
+  "ports": [
+    {"name": "clk", "direction": "input", "width": "1", "type": "clock"},
+    {"name": "rst", "direction": "input", "width": "1", "type": "reset"},
+    {"name": "en", "direction": "input", "width": "1", "type": "enable"},
+    {"name": "count", "direction": "output", "width": "4", "type": "unsigned"}
+  ],
+  "clock": {"required": true, "name": "clk", "frequency_mhz": 100},
+  "reset": {"required": true, "name": "rst", "type": "synchronous", "active": "high"},
+  "behavior": [
+    "On rst=1, count clears to 0 on the next rising clk edge.",
+    "When en=1, count increments each rising clk edge.",
+    "When en=0, count holds.",
+    "Wraps from 15 to 0."
+  ],
+  "constraints": [],
+  "assumptions": [],
+  "ambiguities": []
+}

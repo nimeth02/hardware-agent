@@ -1,0 +1,315 @@
+:root {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --border: #dde3ec;
+  --text: #1c2330;
+  --muted: #667085;
+  --accent: #2f6fed;
+  --error: #d43d3d;
+  --ok: #1e9e6a;
+  --warn: #c98a00;
+  --code-bg: #f8fafc;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+nav { display: flex; gap: 8px; }
+
+.tab-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.tab-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(47, 111, 237, 0.10);
+}
+
+main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+
+.tab { display: none; flex-direction: column; gap: 16px; }
+.tab.active { display: flex; }
+
+.subnav { display: flex; gap: 6px; }
+.subnav .tab-btn { font-size: 13px; padding: 4px 12px; }
+.subtab { display: none; flex-direction: column; gap: 16px; }
+.subtab.active { display: flex; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.examples-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.example-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 5px 12px;
+  border-radius: 14px;
+  font-size: 12px;
+}
+
+.example-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+textarea {
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  resize: vertical;
+}
+
+textarea:focus { outline: none; border-color: var(--accent); }
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+button:hover { opacity: 0.9; }
+button:disabled { opacity: 0.5; cursor: default; }
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.status { font-size: 13px; color: var(--muted); }
+.status.error { color: var(--error); }
+.status.warn { color: var(--warn); }
+
+.result-box {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.code-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.code-block { margin-top: 6px; white-space: pre; }
+.copy-btn { padding: 3px 10px; font-size: 12px; }
+.vectors-table-wrap { max-height: 360px; overflow: auto; margin-bottom: 10px; }
+.vectors-table-wrap table { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.vectors-table-wrap td, .vectors-table-wrap th { padding: 4px 8px; white-space: nowrap; }
+
+table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th { color: var(--muted); font-weight: 500; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: rgba(16, 24, 40, 0.03); }
+tbody tr.selected { background: rgba(47, 111, 237, 0.10); }
+
+.badge-ok { color: var(--ok); }
+.badge-error { color: var(--error); }
+.badge-warn { color: var(--warn); }
+
+/* Simulation verdict pill: pass green, fail red, error amber, none grey. */
+.verdict-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--muted);
+}
+.verdict-badge.verdict-pass { background: var(--ok); }
+.verdict-badge.verdict-fail { background: var(--error); }
+.verdict-badge.verdict-error { background: var(--warn); }
+/* Orchestrator status pill: complete green, needs review amber, failed red. */
+.verdict-badge.orch-complete { background: var(--ok); }
+.verdict-badge.orch-needs_review { background: var(--warn); }
+.verdict-badge.orch-failed { background: var(--error); }
+/* One collapsible block per sub-agent result inside the Orchestrator panel. */
+details.orch-section {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-top: 10px;
+}
+details.orch-section > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+details.orch-section > .orch-section-body { margin-top: 6px; }
+/* Orchestrator timeline: decision rows and one collapsible group row per
+   sub-agent tool call; nested sub-agent rows are indented under it. */
+tr.orch-top td, tr.orch-group td { font-weight: 500; }
+tr.orch-nested { cursor: default; background: rgba(16, 24, 40, 0.02); }
+tr.orch-nested td:first-child { padding-left: 28px; color: var(--muted); }
+.orch-toggle { display: inline-block; width: 16px; color: var(--muted); }
+.orch-count { color: var(--muted); font-size: 12px; font-weight: 400; }
+.sim-text { font-size: 13px; color: var(--text); white-space: pre-wrap; }
+/* Implementation metrics: a compact, non-clickable key/value table. */
+.metrics-table { width: auto; min-width: 280px; margin-top: 6px; }
+.metrics-table th { width: 140px; padding: 4px 10px; }
+.metrics-table td { padding: 4px 10px; font-family: ui-monospace, Consolas, monospace; }
+.metrics-table tbody tr { cursor: default; }
+.metrics-table tbody tr:hover { background: transparent; }
+
+.hidden { display: none; }
+
+.msg-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.msg-role {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+#pipeline-spec-json {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+#pipeline-rtl-notes {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+#pipeline-rtl-notes li { margin-bottom: 4px; }
+
+.suggestions-list {
+  margin: 0 0 14px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.suggestions-list li {
+  font-size: 13px;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--accent);
+  background: rgba(47, 111, 237, 0.07);
+  border-radius: 0 4px 4px 0;
+}
+
+.suggestions-list .empty {
+  border-left-color: var(--ok);
+  background: rgba(30, 158, 106, 0.08);
+  color: var(--muted);
+}
+
+select {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 14px;
+}
+
+details.msg-block summary { cursor: pointer; font-family: -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px; }
+
+.timings-list {
+  margin: 0 0 14px 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.timings-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.timings-list .t-step { flex: 1; font-family: ui-monospace, Consolas, monospace; }
+.timings-list .t-status { width: 70px; font-size: 12px; color: var(--muted); }
+.timings-list .t-status.ok { color: var(--ok); }
+.timings-list .t-status.error { color: var(--error); }
+.timings-list .t-status.paused { color: var(--accent); }
+.timings-list .t-ms { width: 90px; text-align: right; font-family: ui-monospace, Consolas, monospace; }
+.timings-list .t-total { font-weight: 600; border-bottom: none; }
+.timings-list .empty { color: var(--muted); border-bottom: none; }
