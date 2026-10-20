@@ -1,6 +1,6 @@
 # agents/simulation_agent/project_loader.py — tool: read a project folder
-# (src/, tb/, spec.json, test_vectors.csv) through the file-server MCP and
-# describe it for the simulation tools.
+# (src/, tb/, spec.json, test_vectors_in.csv + test_vectors_out.csv) through
+# the file-server MCP and describe it for the simulation tools.
 #
 # Going through the MCP server keeps file access scoped to the project and
 # makes every read visible as a tool call in the run's observability record.
@@ -21,8 +21,9 @@ _ENTITY_RE = re.compile(r"\bentity\s+(\w+)\s+is", re.IGNORECASE)
 
 class SimulationProjectLoader:
     def load(self, project_dir: str) -> dict:
-        """{name, dir, src_files, tb_file, top_entity, spec, test_vectors,
-        testbench_code}. Raises RuntimeError when the folder is unusable."""
+        """{name, dir, src_files, tb_file, top_entity, spec, test_vectors
+        (the CSV names staged for the testbench), testbench_code}. Raises
+        RuntimeError when the folder is unusable."""
         return run_sync(self.aload(project_dir))
 
     async def aload(self, project_dir: str) -> dict:
@@ -63,15 +64,15 @@ class SimulationProjectLoader:
                 except json.JSONDecodeError as e:
                     raise RuntimeError(f"spec.json is not valid JSON: {e}") from e
 
-            test_vectors = next((n for n in root_files if n.lower().endswith(".csv")), None)
-            if test_vectors:
-                # xsim runs with work_proj/ as cwd: put the CSV where a
-                # relative open() in the testbench will find it.
+            test_vectors = [n for n in root_files if n.lower().endswith(".csv")]
+            for csv_name in test_vectors:
+                # xsim runs with work_proj/ as cwd: put the CSVs where a
+                # relative open() in the testbench will find them.
                 out = text(await tools["write_file"].ainvoke(
-                    {"path": f"work_proj/{test_vectors}", "content": await read(test_vectors),
+                    {"path": f"work_proj/{csv_name}", "content": await read(csv_name),
                      "project_dir": project_dir}))
                 if out.startswith("ERROR"):
-                    raise RuntimeError(f"cannot stage {test_vectors} into work_proj: {out}")
+                    raise RuntimeError(f"cannot stage {csv_name} into work_proj: {out}")
 
         return {
             "name": Path(project_dir).name,

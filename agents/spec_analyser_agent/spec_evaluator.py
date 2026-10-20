@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import re
 
+from agents.vhdl_version import SPEC_FIELD, SUPPORTED_VERSIONS, normalize_version
+
 # A plain number ("8"), a range ("[7:0]", "[N-1:0]"), or a symbolic width
 # ("N", "DATA_WIDTH", "N+1") — generics/parameters are legitimate in VHDL.
 # Something like "8bits" or "8 bit" is still flagged.
@@ -65,6 +67,12 @@ def evaluate_spec(spec: dict) -> list[dict]:
 
     if not spec.get("behavior"):
         issue("no_behavior", "No functional behavior is described.")
+
+    # Absent is fine (the generator fills the default); present-but-garbage is not.
+    version = spec.get(SPEC_FIELD)
+    if version is not None and normalize_version(version) is None:
+        issue("bad_vhdl_version",
+              f"vhdl_version '{version}' is not one of {', '.join(SUPPORTED_VERSIONS)}.")
 
     for amb in spec.get("ambiguities") or []:
         issue("ambiguity", str(amb))

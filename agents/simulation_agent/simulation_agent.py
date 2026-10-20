@@ -1,5 +1,5 @@
 # agents/simulation_agent/simulation_agent.py — bounded planning agent that
-# simulates a project folder (src/, tb/, test_vectors.csv) through the
+# simulates a project folder (src/, tb/, test_vectors_in/out.csv) through the
 # Vivado MCP server and delivers a verdict.
 #
 #   START -> decide -+- load_project --------------------------------+
@@ -71,7 +71,7 @@ class SimulationAgent:
         warnings = list(state.get("warnings", []))
         if project.get("spec") is None:
             warnings.append("no spec.json in the project; the analyst will judge from the testbench alone")
-        if project.get("test_vectors") is None:
+        if not project.get("test_vectors"):
             warnings.append("no test-vector CSV in the project")
         return {"project": project, "warnings": warnings}
 

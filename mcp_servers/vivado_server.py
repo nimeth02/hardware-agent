@@ -84,9 +84,15 @@ else:
 # real failures distinctly from warnings ("WARNING:") or info messages.
 _ERROR_LINE_RE = re.compile(r'^ERROR:', re.MULTILINE)
 
+# What xsim's `run` accepts: a plain decimal and a time unit, e.g. "10us",
+# "2.5 ms". No exponent notation, no bare number.
+_SIM_TIME_RE = re.compile(r'^\s*\d+(?:\.\d+)?\s*(?:fs|ps|ns|us|ms|s)\s*$', re.IGNORECASE)
 
-def _cap(text: str, limit: int = 4000) -> str:
-    """Cap output at limit chars — xvhdl logs can be long."""
+
+def _cap(text: str, limit: int = 200_000) -> str:
+    """Cap output at limit chars. The cap is generous (200 KB) so the full
+    xvhdl/xsim log reaches the run store and the UI; consumers that feed an
+    LLM must trim to a tail themselves (see simulation_analyst)."""
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n... [truncated {len(text) - limit} chars] ..."
@@ -140,7 +146,8 @@ def _remote_xvhdl(file: str, project_dir: str, vhdl_std: str) -> dict:
     }
 
 
-def _remote_simulation(tb_file: str, top_entity: str, project_dir: str, sim_time: str) -> dict:
+def _remote_simulation(tb_file: str, top_entity: str, project_dir: str, sim_time: str,
+                       src_vhdl_std: str = "93") -> dict:
     """
     Full remote simulation pipeline: upload src/* + tb file, xvhdl x2,
     xelab, xsim. Compiles all .vhd files in src/ so the design library
@@ -195,10 +202,11 @@ def _remote_simulation(tb_file: str, top_entity: str, project_dir: str, sim_time
         s = settings
         w = f"{tmpdir}/work"
 
-        # Stage 1: compile design files (VHDL-93)
+        # Stage 1: compile design files in the spec's VHDL edition
+        src_flag = "--2008 " if src_vhdl_std == "2008" else ""
         if src_list:
             out1, err1, rc1 = _remote_run(client,
-                f"source {s} && cd {w} && xvhdl {src_list} 2>&1", timeout=120)
+                f"source {s} && cd {w} && xvhdl {src_flag}{src_list} 2>&1", timeout=120)
             if rc1 != 0 or "ERROR:" in out1:
                 _remote_run(client, f"rm -rf {tmpdir}")
                 return {"status": "error", "sim_passed": False,
@@ -229,7 +237,7 @@ def _remote_simulation(tb_file: str, top_entity: str, project_dir: str, sim_time
 
         sim_passed = "SIMULATION PASSED" in out4
         sim_failed = "SIMULATION FAILED" in out4
-        has_error  = "ERROR:" in out4
+        has_error  = bool(_ERROR_LINE_RE.search(out4))   # line-start only; script lines are echoed as "## ..."
         status = "ok" if (sim_passed and not sim_failed and not has_error and rc4 == 0) else "error"
 
         _remote_run(client, f"rm -rf {tmpdir}")
@@ -466,7 +474,7 @@ def _check_tcl_for_deletion(tcl_path: Path) -> str | None:
 
 @mcp.tool()
 def run_simulation(tb_file: str, top_entity: str, project_dir: str,
-                   sim_time: str = "10us") -> dict:
+                   sim_time: str = "10us", src_vhdl_std: str = "93") -> dict:
     """
     Run the full simulation pipeline: compile design + testbench, elaborate,
     simulate. Looks for "SIMULATION PASSED" / "SIMULATION FAILED" markers
@@ -481,15 +489,19 @@ def run_simulation(tb_file: str, top_entity: str, project_dir: str,
                      already in the same work library.
         project_dir: Absolute path to the project root.
         sim_time:    Simulation duration (default "10us").
+        src_vhdl_std: "93" (default) or "2008" — the edition the design files
+                     in src/ are written in. Used by the remote pipeline, which
+                     compiles src/ itself; locally src/ is compiled beforehand
+                     by run_xvhdl. The testbench is always compiled as 2008.
 
     Returns:
         status:      "ok" or "error"
         sim_passed:  bool — True only if "SIMULATION PASSED" found and no errors
-        sim_output:  tail of xsim stdout (capped at 4000 chars)
+        sim_output:  xsim stdout (capped at 200 KB)
         vcd_path:    path to the waveform file, or None if not generated
     """
     if is_remote_mode():
-        return _remote_simulation(tb_file, top_entity, project_dir, sim_time)
+        return _remote_simulation(tb_file, top_entity, project_dir, sim_time, src_vhdl_std)
 
     if not _env_result["ok"]:
         return {
@@ -551,12 +563,22 @@ def run_simulation(tb_file: str, top_entity: str, project_dir: str,
     # ── Stage 3: simulate with VCD capture ───────────────────────────────
     # xsim runs a TCL script that opens VCD logging, runs for sim_time,
     # then quits. Bare "waves.vcd" resolves relative to cwd (= work_dir).
+    #
+    # sim_time must be a plain decimal plus unit ("10us", "2.5 ms"). xsim's
+    # `run` rejects anything else (e.g. "8e-05us"); because a failing
+    # command aborts the -t script before `quit`, xsim would then sit at its
+    # prompt until the timeout. Validate first, and wrap `run` in catch so
+    # `quit` is always reached even if xsim complains for another reason.
+    if not _SIM_TIME_RE.match(sim_time or ""):
+        return {"status": "error", "sim_passed": False, "error_class": "input",
+                "sim_output": f"Invalid sim_time {sim_time!r}: expected a decimal number followed by "
+                              f"fs/ps/ns/us/ms/s, e.g. '10us'.", "vcd_path": None}
     xsim_tcl = work_dir / "xsim_run.tcl"
     xsim_tcl.write_text(
         "open_vcd waves.vcd\n"
         "if {[catch {log_vcd /*/dut/*} err]} { puts \"log_vcd: $err -- continuing\" }\n"
-        f"run {sim_time}\n"
-        "close_vcd\n"
+        f"if {{[catch {{run {sim_time}}} err]}} {{ puts \"ERROR: run {sim_time} failed: $err\" }}\n"
+        "catch {close_vcd}\n"
         "quit\n",
         encoding="utf-8",
     )
@@ -572,7 +594,9 @@ def run_simulation(tb_file: str, top_entity: str, project_dir: str,
     sim_stdout = r3.stdout or ""
     sim_passed = "SIMULATION PASSED" in sim_stdout
     sim_failed = "SIMULATION FAILED" in sim_stdout
-    has_error  = "ERROR:" in sim_stdout
+    # Line-start match only: xsim echoes every script line as "## ...", and
+    # xsim_run.tcl itself contains the text "ERROR:" in its catch handler.
+    has_error  = bool(_ERROR_LINE_RE.search(sim_stdout))
 
     # Only a clean PASSED with no contradicting FAILED/ERROR counts as success
     status = "ok" if (sim_passed and not sim_failed and not has_error and r3.returncode == 0) else "error"

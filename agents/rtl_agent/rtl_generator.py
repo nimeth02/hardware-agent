@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.json_utils import extract_json
 from agents.rtl_agent.state import AGENT_NAME
+from agents.vhdl_version import resolve_vhdl_version
 from observability.callback import ObservabilityCallbackHandler
 from prompts.rtl_agent_prompt import RTL_AGENT_SYSTEM_PROMPT, RTL_FIX_ADDENDUM, RTL_SKILLS_ADDENDUM
 from services.llm_client import get_llm
@@ -45,7 +46,9 @@ class RTLGenerator:
 
     def generate_raw(self, spec: dict, skills: dict[str, str] | None = None,
                      previous_rtl: dict | None = None, lint_issues: list[dict] | None = None) -> str:
-        system = RTL_AGENT_SYSTEM_PROMPT
+        # The prompt names the edition (agents/vhdl_version.py decides it);
+        # the spec itself is passed through unchanged.
+        system = RTL_AGENT_SYSTEM_PROMPT.replace("{VHDL_VERSION}", resolve_vhdl_version(spec))
         if skills:
             system += RTL_SKILLS_ADDENDUM + "\n\n".join(f"### {name}\n{content}" for name, content in skills.items())
         fixing = previous_rtl is not None and bool(lint_issues)

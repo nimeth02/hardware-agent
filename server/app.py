@@ -1,10 +1,10 @@
 # server/app.py — FastAPI backend: spec-analysis query endpoint,
-# spec -> human review -> RTL pipeline, and the observability API.
+# spec -> human review -> RTL -> test vectors -> testbench pipeline, and the observability API.
 #
 # Serves the static HTML/JS UI from server/static/ and exposes:
 #   POST /api/analyze                  run the spec analyzer alone, return the result
-#   POST /api/pipeline/start           start the spec->RTL pipeline; pauses for human review
-#   POST /api/pipeline/{id}/resume     submit the reviewed/edited spec, run RTL generation
+#   POST /api/pipeline/start           start the spec->RTL->test vectors->testbench pipeline; pauses for human review
+#   POST /api/pipeline/{id}/resume     submit the reviewed/edited spec, run RTL, test vectors and testbench generation
 #   GET  /api/traces                   list recorded LLM call traces (newest first)
 #   GET  /api/traces/{id}              full detail for one trace
 #   GET  /api/steps/{run_id}           per-node step timings for a run (pipeline thread_id or analyze run)
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -25,10 +26,10 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agents.pipeline import resume_pipeline, start_pipeline
+from agents.pipeline_agent.pipeline import resume_pipeline, start_pipeline
 from agents.registry import AGENTS, describe_agents
 from agents.spec_analyser_agent.spec_analyzer_agent import resume_spec_analysis, run_spec_analysis
-from observability.agent_run import observe_run
+from observability.agent_run import STOP_MESSAGE, RunStatus, RunStopped, observe_run, request_stop
 from observability.run_store import store as run_store
 from observability.step_tracer import observe_steps
 from observability.storage import get_trace, list_steps, list_traces
@@ -122,6 +123,21 @@ class AgentRunRequest(BaseModel):
     input: dict
 
 
+# xsim's `run <time>` needs a plain decimal plus unit ("10us", "2.5 ms"); other
+# forms (scientific notation, bare numbers) hang the simulator. Same pattern as
+# the UI (app.js) and the Vivado MCP server.
+_SIM_TIME_RE = re.compile(r"^\s*\d+(\.\d+)?\s*(fs|ps|ns|us|ms|s)\s*$", re.IGNORECASE)
+
+
+def _validate_sim_time(payload: dict) -> None:
+    value = payload.get("sim_time")
+    if value is None or value == "":
+        return  # the agent applies its default (10us)
+    if not isinstance(value, str) or not _SIM_TIME_RE.match(value):
+        raise HTTPException(status_code=422, detail=f"Invalid sim_time {value!r}: expected a decimal number "
+                            "followed by a unit (fs, ps, ns, us, ms or s), e.g. '10us' or '2.5ms'.")
+
+
 @app.get("/api/agents")
 def get_agents() -> list[dict]:
     return describe_agents()
@@ -134,8 +150,8 @@ def _execute_agent(entry, payload: dict, run_id: str, resume: bool, call: Callab
         with observe_run(entry.name, payload, agent_version=entry.version, model=require_llm_model(),
                          run_id=run_id, resume=resume) as run:
             run.set_result(call())
-    except Exception:
-        pass  # already recorded as run_failed
+    except (Exception, RunStopped):
+        pass  # already recorded as run_failed / run_stopped
 
 
 @app.post("/api/agents/{agent_name}/run")
@@ -144,6 +160,7 @@ def run_single_agent(agent_name: str, req: AgentRunRequest, background: Backgrou
     entry = AGENTS.get(agent_name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"unknown agent '{agent_name}'")
+    _validate_sim_time(req.input)
     run_id = str(uuid.uuid4())
     # Create the row now so a client can subscribe before the work starts.
     run_store.create_run(run_id, entry.name, entry.version, require_llm_model(), req.input)
@@ -199,7 +216,7 @@ async def stream_agent_run(run_id: str) -> StreamingResponse:
             for e in run["events"][sent:]:
                 yield f"event: step\ndata: {json.dumps(e, default=str)}\n\n"
             sent = len(run["events"])
-            if run["status"] in ("completed", "failed"):
+            if run["status"] in ("completed", "failed", "stopped"):
                 summary = {k: run[k] for k in ("id", "status", "error", "duration_ms", "final_result")}
                 yield f"event: done\ndata: {json.dumps(summary, default=str)}\n\n"
                 return
@@ -207,6 +224,25 @@ async def stream_agent_run(run_id: str) -> StreamingResponse:
 
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/agent-runs/{run_id}/stop")
+def stop_agent_run(run_id: str) -> dict:
+    """Ask a running agent to stop. Cooperative (threads cannot be killed):
+    the run ends at its next step boundary — LLM call, tool call or graph
+    node — so a tool already in flight (e.g. a simulator run inside an MCP
+    server) finishes first. The run then ends with status "stopped"."""
+    run = run_store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run["status"] != RunStatus.RUNNING:
+        raise HTTPException(status_code=409, detail=f"run is already {run['status']}")
+    if request_stop(run_id):
+        return {"run_id": run_id, "status": "stopping"}
+    # Marked running in the store but not live in this process (the server was
+    # restarted while it ran): nothing to interrupt, close the record now.
+    run_store.finish_run(run_id, RunStatus.STOPPED, f"{STOP_MESSAGE} (run was no longer active on the server)", None)
+    return {"run_id": run_id, "status": "stopped"}
 
 
 @app.get("/api/agent-runs")
@@ -260,4 +296,15 @@ def get_trace_detail(trace_id: str) -> dict:
     return trace
 
 
-app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+class NoCacheStaticFiles(StaticFiles):
+    """Static UI files are revalidated on every request so updates show up
+    without a hard refresh. ETag/Last-Modified are kept, so conditional
+    requests still return 304. API routes are unaffected (not served here)."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="static")

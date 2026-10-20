@@ -23,6 +23,7 @@ from langgraph.graph import END, START, StateGraph
 from agents.test_vector_agent.state import (
     MAX_ITERATIONS, MAX_STALLED_FIXES, Action, TestVectorAgentState, TestVectorStatus, initial_state,
 )
+from agents.test_vector_agent.test_vector_generator import shared_matlab_session
 from agents.test_vector_agent.test_vector_guard import guard
 from agents.test_vector_agent.tools import TestVectorAgentTools
 from services.config import REPO_ROOT
@@ -136,7 +137,15 @@ class TestVectorAgent:
     # ── public API ───────────────────────────────────────────────────────
     def run(self, spec: dict, run_dir: str | None = None) -> dict:
         run_dir = run_dir or new_run_dir(spec)
-        return self.summarize(self.graph.invoke(initial_state(spec, run_dir)))
+        # One MATLAB for the whole run: every generate_vectors attempt inside
+        # the block reuses the same MATLAB MCP server instead of booting a
+        # fresh MATLAB (1–2 min) per attempt. Closed when the run ends.
+        with shared_matlab_session() as matlab:
+            # TODO(human): when should MATLAB be switched on? Leave this empty
+            # and it starts on the first generate_vectors attempt (nothing is
+            # booted if the run stops before that). Or call `matlab.start()`
+            # here so MATLAB boots while skills are still being loaded.
+            return self.summarize(self.graph.invoke(initial_state(spec, run_dir)))
 
     @staticmethod
     def summary(state: TestVectorAgentState) -> dict:

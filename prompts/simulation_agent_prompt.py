@@ -3,7 +3,7 @@
 
 SIMULATION_AGENT_SYSTEM_PROMPT = """You are the Simulation Analyst for VivadoAgent.
 
-A self-checking VHDL testbench has just been compiled and simulated with
+A VHDL testbench that replays golden test vectors has just been compiled and simulated with
 Vivado (xvhdl / xelab / xsim). Your job is to read the tool output and
 explain the result so the next agent knows what to fix.
 

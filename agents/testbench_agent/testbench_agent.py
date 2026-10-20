@@ -1,6 +1,10 @@
 # agents/testbench_agent/testbench_agent.py — bounded planning agent that
-# turns an approved spec + its RTL into a lint-clean, self-checking
-# testbench, using the project's testbench-rule skills.
+# turns an approved spec + its RTL into a lint-clean testbench that replays
+# the golden test vectors at simulation time, using the project's
+# testbench-rule skills. The testbench never receives the vectors: it reads
+# projects/<id>/test_vectors_in.csv (cycle + the spec's input ports) and
+# test_vectors_out.csv (cycle + its output ports), whose layout is fixed by
+# convention, so the spec alone tells it what to drive and what to compare.
 #
 #   START -> decide -+- load_skills ------------------------------+
 #                    +- generate_testbench -> lint_testbench ------+-> decide ...

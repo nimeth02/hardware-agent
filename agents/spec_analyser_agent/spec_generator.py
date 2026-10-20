@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.json_utils import extract_json
 from agents.spec_analyser_agent.state import AGENT_NAME
+from agents.vhdl_version import with_vhdl_version
 from observability.callback import ObservabilityCallbackHandler
 from prompts.spec_analyzer_prompt import SPEC_ANALYZER_SYSTEM_PROMPT, SPEC_CLARIFICATION_ADDENDUM
 from services.llm_client import get_llm
@@ -25,7 +26,9 @@ def parse_spec_response(raw: str) -> dict:
             "status": "needs_clarification",
             "ambiguities": ["Spec analyzer did not return valid JSON.", str(raw)[:500]],
         }
-    return spec
+    # Every downstream agent reads the edition from the spec; fill the
+    # default here so none of them has to guess (agents/vhdl_version.py).
+    return with_vhdl_version(spec)
 
 
 class SpecGenerator:

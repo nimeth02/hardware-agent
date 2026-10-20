@@ -14,6 +14,7 @@ import tempfile
 
 from agents.lint_utils import compiler_errors
 from agents.mcp_utils import mcp_run_xvhdl, mcp_write_files
+from agents.vhdl_version import resolve_vhdl_version, xvhdl_std
 
 _ENTITY_RE = re.compile(r"\bentity\s+(\w+)\s+is", re.IGNORECASE)
 
@@ -42,6 +43,20 @@ def _static_checks(spec: dict, rtl: dict, testbench: dict) -> list[dict]:
         if re.search(r"\bTODO\b|\bFIXME\b", line) or re.fullmatch(r"\s*(--)?\s*\.\.\.\s*", line):
             issue("placeholder", f"Placeholder left in the code at line {n}: {line.strip()}")
 
+    # xvhdl accepts "sig <= a when c else b;" inside a process, but xelab
+    # 2020.1 refuses it at elaboration (long after lint). Catch it here.
+    in_process = False
+    for n, line in enumerate(code.splitlines(), 1):
+        text = line.split("--", 1)[0]
+        if re.search(r"\bend\s+process\b", text, re.IGNORECASE):
+            in_process = False
+        elif re.search(r"\bprocess\b", text, re.IGNORECASE):
+            in_process = True
+        elif in_process and re.search(r"<=.*\bwhen\b.*\belse\b", text, re.IGNORECASE):
+            issue("conditional_assignment_in_process",
+                  f"Line {n}: 'x <= a when c else b' inside a process is not simulated by xelab 2020.1; "
+                  f"use 'if c then x <= a; else x <= b; end if;'.")
+
     m = _ENTITY_RE.search(code)
     if not m:
         issue("no_entity", "No 'entity ... is' declaration found.")
@@ -62,6 +77,70 @@ def _static_checks(spec: dict, rtl: dict, testbench: dict) -> list[dict]:
         if name and not re.search(rf"\b{re.escape(name)}\b", code):
             issue("port_not_connected", f"Spec port '{name}' does not appear in the testbench.")
 
+    issues += _replay_checks(spec, code)
+    return issues
+
+
+# Two-argument reads only: read_wide's own `read(l, c, ok)` character reads
+# are not column reads.
+_READ_RE = re.compile(r"\bread(?:_wide)?\s*\(\s*(\w+)\s*,\s*[\w.()' ]+?\s*\)", re.IGNORECASE)
+_INT_VAR_RE = re.compile(r"\bvariable\s+([^:;]+?)\s*:\s*integer\b", re.IGNORECASE)
+_SELF_CMP_RE = re.compile(r"\bif\s+(\w+)\s*/=\s*(\w+)\b", re.IGNORECASE)
+
+
+def _port_bits(port: dict) -> int | None:
+    width = str(port.get("width") or "").strip()
+    if re.fullmatch(r"\d+", width):
+        return int(width)
+    m = re.fullmatch(r"\[(\d+):(\d+)\]", width)
+    return abs(int(m.group(1)) - int(m.group(2))) + 1 if m else None
+
+
+def _replay_checks(spec: dict, code: str) -> list[dict]:
+    """Mistakes in replaying the CSVs that compile fine but break the
+    simulation: a row read with fewer/more values than its columns (every
+    later value lands in the wrong variable), a 32-bit-or-wider port read
+    into an `integer` (textio stops at 2**31-1), and a cycle check that
+    compares a variable with itself."""
+    issues: list[dict] = []
+    text = "\n".join(line.split("--", 1)[0] for line in code.splitlines())   # drop comments
+    ports = [p for p in (spec.get("ports") or []) if isinstance(p, dict) and p.get("name")]
+    direction = lambda p: str(p.get("direction", "")).lower()   # noqa: E731
+    inputs = [p for p in ports if direction(p) == "input"]
+    outputs = [p for p in ports if direction(p) == "output"]
+
+    int_vars = [v.strip().lower() for m in _INT_VAR_RE.finditer(text) for v in m.group(1).split(",")]
+    for p in ports:
+        bits = _port_bits(p)
+        if bits is not None and bits >= 32:
+            hits = [v for v in int_vars if p["name"].lower() in v]
+            if hits:
+                issues.append({"code": "wide_port_read_as_integer",
+                               "detail": f"Port '{p['name']}' is {bits} bits but variable(s) {hits} are 'integer' "
+                                         f"(textio read stops at 2**31-1); declare it as "
+                                         f"std_logic_vector({bits - 1} downto 0) and use read_wide (WIDE PORTS rule)."})
+
+    if inputs and outputs:
+        counts: dict[str, int] = {}
+        for m in _READ_RE.finditer(text):
+            counts[m.group(1).lower()] = counts.get(m.group(1).lower(), 0) + 1
+        expected = sorted([1 + len(inputs), 1 + len(outputs)])
+        got = sorted(counts.values(), reverse=True)[:2]
+        if counts and sorted(got) != expected:
+            in_cols = ", ".join(["cycle"] + [p["name"] for p in inputs])
+            out_cols = ", ".join(["cycle"] + [p["name"] for p in outputs])
+            issues.append({"code": "column_count_mismatch",
+                           "detail": f"Reads per line variable: {counts}. test_vectors_in.csv has exactly these "
+                                     f"{1 + len(inputs)} columns: [{in_cols}] and test_vectors_out.csv exactly these "
+                                     f"{1 + len(outputs)}: [{out_cols}] (direction from the spec, NOT the name: "
+                                     f"s_axis_tready is an output, m_axis_tready an input). Read each row's columns "
+                                     f"in that order, one read per column, even ones you do not use."})
+
+    for m in _SELF_CMP_RE.finditer(text):
+        if m.group(1).lower() == m.group(2).lower():
+            issues.append({"code": "self_comparison",
+                           "detail": f"'if {m.group(1)} /= {m.group(2)}' compares a variable with itself; read the "
+                                     f"outputs-row cycle into a second variable (v_cycle_out) and compare the two."})
     return issues
 
 
@@ -72,7 +151,8 @@ def _compile(spec: dict, rtl: dict, testbench: dict) -> tuple[str | None, list[d
     compiler is None when Vivado is unavailable (static checks only)."""
     dut = rtl.get("entity_name") or spec.get("entity_name") or "design"
     tb_name = testbench.get("entity_name") or f"{dut}_tb"
-    sources = [(f"{dut}.vhd", "93", "DUT", rtl.get("code") or ""),
+    # DUT in the spec's edition (agents/vhdl_version.py); testbench always 2008.
+    sources = [(f"{dut}.vhd", xvhdl_std(resolve_vhdl_version(spec)), "DUT", rtl.get("code") or ""),
                (f"{tb_name}.vhd", "2008", "testbench", testbench.get("code") or "")]
     with tempfile.TemporaryDirectory() as tmp:
         mcp_write_files(tmp, {name: code for name, _, _, code in sources})

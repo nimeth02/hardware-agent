@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -30,17 +31,66 @@ class EventType(str, Enum):
     RUN_RESUMED = "run_resumed"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
+    RUN_STOPPED = "run_stopped"        # the run ended because the user asked it to
     LLM_CALL = "llm_call"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     AGENT_STEP = "agent_step"
     ERROR = "error"
+    STOP_REQUESTED = "stop_requested"  # user asked a running orchestrator to stop
+    AGENT_INPUT = "agent_input"        # orchestrator -> agent: exactly what it handed over
+    AGENT_OUTPUT = "agent_output"      # agent -> orchestrator: exactly what came back
+    STATE = "state"                    # orchestrator's state (notebook) before and after a step
+
+
+class RunFinished(Exception):
+    """A tool raises a subclass of this to end an agent loop on purpose
+    (the work is done). The recorder logs it as a finished result, not an
+    error."""
+
+
+class RunStopped(BaseException):
+    """Raised by the recorder at the next step boundary (LLM call, tool call
+    or graph node) once the user asked the run to stop. A BaseException on
+    purpose: the agents' own `except Exception` fall-backs (which turn any
+    error into a FAILED result and carry on) must not swallow it, so the
+    whole run — orchestrator and nested agents — unwinds within one step."""
+
+
+STOP_MESSAGE = "stopped by user"
 
 
 class RunStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    STOPPED = "stopped"
+
+
+# Runs currently inside an observe_run block in this process, by run id, so a
+# web request (another thread) can flip their stop flag.
+_live_runs: dict[str, "AgentRunRecorder"] = {}
+_live_lock = threading.Lock()
+
+
+def request_stop(run_id: str) -> bool:
+    """Ask a live run to stop at its next step boundary. Python threads
+    cannot be killed, so this is cooperative: the recorder raises RunStopped
+    from the next LLM/tool/node start it sees; a tool already in flight
+    (e.g. a simulator run inside an MCP server) finishes first. Returns
+    False when no run with this id is live in this process."""
+    with _live_lock:
+        recorder = _live_runs.get(run_id)
+    if recorder is None:
+        return False
+    recorder.stop.set()
+    recorder.store.add_event(run_id, EventType.STOP_REQUESTED, recorder.step, None, "requested", {"by": "user"})
+    return True
+
+
+def is_live(run_id: str) -> bool:
+    with _live_lock:
+        return run_id in _live_runs
 
 
 def _message_to_dict(msg: BaseMessage) -> dict:
@@ -59,7 +109,12 @@ def _prompt_version(messages: list[BaseMessage]) -> str | None:
     return None
 
 
-def _preview(value: Any, limit: int = 4000) -> Any:
+# Full payloads (tool inputs/outputs) are kept up to this size so the UI can
+# show the complete xsim/xvhdl log; the short *_preview fields stay small.
+FULL_PAYLOAD_LIMIT = 200_000
+
+
+def _preview(value: Any, limit: int = FULL_PAYLOAD_LIMIT) -> Any:
     if isinstance(value, str) and len(value) > limit:
         return value[:limit] + f"... [truncated {len(value) - limit} chars]"
     return value
@@ -72,11 +127,16 @@ class AgentRunRecorder(BaseCallbackHandler):
         self.run_id = run_id
         self.store = store
         self.step = 0
+        self.stop = threading.Event()  # set by request_stop(); checked at every step boundary
         self._open: dict[str, dict] = {}
 
     def _next_step(self) -> int:
         self.step += 1
         return self.step
+
+    def _check_stop(self) -> None:
+        if self.stop.is_set():
+            raise RunStopped(STOP_MESSAGE)
 
     # ── graph nodes → AGENT_STEP ─────────────────────────────────────────
     def on_chain_start(self, serialized: dict[str, Any], inputs: dict[str, Any], *, run_id: UUID,
@@ -84,6 +144,7 @@ class AgentRunRecorder(BaseCallbackHandler):
                        **kwargs: Any) -> None:
         if not metadata or "langgraph_node" not in metadata:
             return
+        self._check_stop()
         parent = self._open.get(str(parent_run_id)) if parent_run_id else None
         if parent and parent.get("kind") == "step" and parent["name"] == metadata["langgraph_node"]:
             return  # LangGraph wraps a node's callable in a second run with the same metadata
@@ -101,6 +162,8 @@ class AgentRunRecorder(BaseCallbackHandler):
             return
         if isinstance(error, GraphInterrupt):
             self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], self._ms(o), "interrupted", {"node": o["name"]})
+        elif isinstance(error, RunStopped):
+            self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], self._ms(o), "stopped", {"node": o["name"]})
         else:
             self.store.add_event(self.run_id, EventType.ERROR, o["step"], self._ms(o), "error",
                                  {"node": o["name"], "error": str(error)})
@@ -108,6 +171,7 @@ class AgentRunRecorder(BaseCallbackHandler):
     # ── LLM calls ────────────────────────────────────────────────────────
     def on_chat_model_start(self, serialized: dict[str, Any], messages: list[list[BaseMessage]], *,
                             run_id: UUID, **kwargs: Any) -> None:
+        self._check_stop()
         kw = (serialized or {}).get("kwargs") or {}
         msgs = messages[0] if messages else []
         self._open[str(run_id)] = {"kind": "llm", "step": self._next_step(), "t0": time.perf_counter(),
@@ -126,8 +190,12 @@ class AgentRunRecorder(BaseCallbackHandler):
         ms = self._ms(o)
         self.store.add_llm_call(self.run_id, o["step"], o["model"], o["prompt_version"], o["input"], output,
                                 usage.get("prompt_tokens"), usage.get("completion_tokens"), ms, "ok", None)
+        # Token counts go on the event too, so the live timeline can show the
+        # context size of every call without waiting for the full llm_calls record.
         self.store.add_event(self.run_id, EventType.LLM_CALL, o["step"], ms, "ok",
                              {"model": o["model"], "tool_calls": [t.get("name") for t in output.get("tool_calls", [])],
+                              "input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens"),
+                              "messages": len(o["input"]),
                               "output_preview": _preview(str(output.get("content", "")), 200)})
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
@@ -142,12 +210,13 @@ class AgentRunRecorder(BaseCallbackHandler):
     # ── tool calls ───────────────────────────────────────────────────────
     def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: UUID,
                       inputs: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        self._check_stop()
         name = (serialized or {}).get("name") or "tool"
         o = {"kind": "tool", "name": name, "step": self._next_step(), "t0": time.perf_counter(),
              "input": inputs if inputs is not None else input_str}
         self._open[str(run_id)] = o
         self.store.add_event(self.run_id, EventType.TOOL_CALL, o["step"], None, "started",
-                             {"tool": name, "input": _preview(o["input"], 1000)})
+                             {"tool": name, "input": _preview(o["input"])})
 
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
         o = self._open.pop(str(run_id), None)
@@ -164,8 +233,37 @@ class AgentRunRecorder(BaseCallbackHandler):
         if not o:
             return
         ms = self._ms(o)
+        if isinstance(error, RunFinished):
+            self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], str(error), ms, "finished", None)
+            self.store.add_event(self.run_id, EventType.TOOL_RESULT, o["step"], ms, "finished",
+                                 {"tool": o["name"], "output_preview": str(error)})
+            return
+        if isinstance(error, RunStopped):
+            self._close_stopped(o)
+            return
         self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], None, ms, "error", str(error))
         self.store.add_event(self.run_id, EventType.ERROR, o["step"], ms, "error", {"tool": o["name"], "error": str(error)})
+
+    def _close_stopped(self, o: dict) -> None:
+        """Record a tool call / LLM call / node that was open when the run stopped."""
+        ms = self._ms(o)
+        if o["kind"] == "tool":
+            self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], None, ms, "stopped", STOP_MESSAGE)
+            self.store.add_event(self.run_id, EventType.TOOL_RESULT, o["step"], ms, "stopped",
+                                 {"tool": o["name"], "output_preview": STOP_MESSAGE})
+        elif o["kind"] == "llm":
+            self.store.add_llm_call(self.run_id, o["step"], o["model"], o["prompt_version"], o["input"], None,
+                                    None, None, ms, "stopped", STOP_MESSAGE)
+        else:
+            self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], ms, "stopped", {"node": o["name"]})
+
+    def close_all_stopped(self) -> None:
+        """RunStopped is a BaseException, which some LangChain wrappers do not
+        report through on_*_error: close whatever is still open so the UI does
+        not show it as running forever."""
+        for o in list(self._open.values()):
+            self._close_stopped(o)
+        self._open.clear()
 
     @staticmethod
     def _ms(o: dict) -> float:
@@ -174,6 +272,15 @@ class AgentRunRecorder(BaseCallbackHandler):
 
 _current_recorder: ContextVar[AgentRunRecorder | None] = ContextVar("agent_run_recorder", default=None)
 register_configure_hook(_current_recorder, inheritable=True)
+
+
+def emit_event(event_type: EventType, status: str | None, data: Any) -> None:
+    """Record a custom event against the run currently being observed, if
+    any — for agent code with something to report outside the automatic
+    LLM/tool-call callbacks. A no-op outside an observe_run block."""
+    recorder = _current_recorder.get()
+    if recorder is not None:
+        recorder.store.add_event(recorder.run_id, event_type, recorder.step, None, status, data)
 
 
 class RunHandle:
@@ -209,13 +316,30 @@ def observe_run(agent_name: str, input: Any, *, agent_version: str | None = None
     else:
         store.add_event(run_id, EventType.RUN_STARTED, 0, None, None, {"agent": agent_name})
     token = _current_recorder.set(recorder)
+    with _live_lock:
+        _live_runs[run_id] = recorder
     try:
         yield handle
+    except RunStopped:
+        _finish_stopped(store, run_id, recorder, handle)
+        raise
     except Exception as e:
-        _current_recorder.reset(token)
+        if recorder.stop.is_set():  # the stop surfaced as some other error: still "stopped", not "failed"
+            _finish_stopped(store, run_id, recorder, handle)
+            raise
         store.add_event(run_id, EventType.RUN_FAILED, recorder.step, None, "error", {"error": str(e)})
         store.finish_run(run_id, RunStatus.FAILED, str(e), handle.result)
         raise
-    _current_recorder.reset(token)
-    store.add_event(run_id, EventType.RUN_COMPLETED, recorder.step, None, "ok", None)
-    store.finish_run(run_id, RunStatus.COMPLETED, None, handle.result)
+    else:
+        store.add_event(run_id, EventType.RUN_COMPLETED, recorder.step, None, "ok", None)
+        store.finish_run(run_id, RunStatus.COMPLETED, None, handle.result)
+    finally:
+        _current_recorder.reset(token)
+        with _live_lock:
+            _live_runs.pop(run_id, None)
+
+
+def _finish_stopped(store: AgentRunStore, run_id: str, recorder: AgentRunRecorder, handle: RunHandle) -> None:
+    recorder.close_all_stopped()
+    store.add_event(run_id, EventType.RUN_STOPPED, recorder.step, None, "stopped", {"error": STOP_MESSAGE})
+    store.finish_run(run_id, RunStatus.STOPPED, STOP_MESSAGE, handle.result)

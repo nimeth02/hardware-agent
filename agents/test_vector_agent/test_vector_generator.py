@@ -7,10 +7,22 @@
 # script runs. The loop is bounded here (step cap, failed-run cap, no
 # re-running an unchanged script); the surrounding agent bounds the outer
 # generate -> validate cycle.
+#
+# MATLAB takes 1–2 minutes to boot and lives inside the MATLAB MCP server
+# process, so the server (and its MATLAB) should be opened once per agent
+# run, not once per attempt. The agent wraps its run in
+# `with shared_matlab_session():`; every generate() inside the block reuses
+# that one session. A generate() outside the block opens its own.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
+import re
+import threading
+from contextlib import contextmanager
+from typing import Iterator
 
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
@@ -52,12 +64,25 @@ def parse_test_vector_response(raw: str) -> dict:
 def failure_result(reason: str, detail: str = "") -> dict:
     return {
         "script": "gen_test_vectors.m",
-        "csv_file": "test_vectors.csv",
-        "columns": [],
+        "input_csv": "test_vectors_in.csv",
+        "output_csv": "test_vectors_out.csv",
+        "input_columns": [],
+        "output_columns": [],
         "num_vectors": 0,
         "scenarios": [],
         "notes": [reason] + ([detail] if detail else []),
     }
+
+
+FORBIDDEN_MATLAB = ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+                    "typecast", "bitshift", "bitsll", "bitsra", "bitsrl", "idivide", "intmax", "intmin")
+_FORBIDDEN_RE = re.compile(r"\b(" + "|".join(FORBIDDEN_MATLAB) + r")\s*\(")
+
+
+def _forbidden_matlab(code: str) -> list[str]:
+    """Integer-class MATLAB calls used in the script (comments ignored)."""
+    text = "\n".join(line.split("%", 1)[0] for line in code.splitlines())
+    return sorted({m.group(1) for m in _FORBIDDEN_RE.finditer(text)})
 
 
 def _guard_run_tool(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILURES) -> list[BaseTool]:
@@ -66,13 +91,34 @@ def _guard_run_tool(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILURES)
     by_name = {t.name: t for t in tools}
     gen_tool = by_name["generate_matlab_script"]
     run_tool = by_name["run_matlab_script"]
-    state = {"failures": 0, "dirty": True, "last_error": ""}
+    state = {"failures": 0, "dirty": True, "last_error": "", "scripts": set()}
+
+    def _stem(name) -> str:
+        return str(name or "").strip().removesuffix(".m")
 
     async def generate(**kwargs):
+        # MATLAB refuses to mix integer classes; every observed failed run
+        # came from these. Reject the script before it is written (not a
+        # counted failure) so the LLM rewrites it in double arithmetic.
+        bad = _forbidden_matlab(str(kwargs.get("code") or ""))
+        if bad:
+            return ("REJECTED: the script uses " + ", ".join(bad) + " — integer-class functions are not "
+                    "allowed (they cause 'Integers can only be combined with integers of the same class'). "
+                    "Do all arithmetic in double: mod(x, 2^N) to wrap, floor(x / 2^k) to shift right, "
+                    "x * 2^k to shift left, hi * 2^lo_bits + lo to pack (NUMBER TYPES rule). Rewrite and call "
+                    "generate_matlab_script again.")
         state["dirty"] = True
+        state["scripts"].add(_stem(kwargs.get("filename")))
         return await gen_tool.ainvoke(kwargs)
 
     async def run(**kwargs):
+        # Running anything but a script the LLM wrote (observed: `dir` to look
+        # for a reference file) is a misuse, not a failed golden model: reject
+        # it with a hint and do not count it against the failure cap.
+        if _stem(kwargs.get("script_name")) not in state["scripts"]:
+            return ("REJECTED: run_matlab_script only runs a script you wrote with "
+                    "generate_matlab_script (e.g. gen_test_vectors). It cannot list folders "
+                    "or run built-ins; the spec is your only input, there is no reference file.")
         if state["failures"] and not state["dirty"]:
             return ("REJECTED: the script has not changed since its last failed run. "
                     "Fix the error and call generate_matlab_script first.")
@@ -94,6 +140,111 @@ def _guard_run_tool(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILURES)
     return [wrapped.get(t.name, t) for t in tools]
 
 
+# ── one MATLAB session for a whole agent run ───────────────────────────────
+#
+# An MCP session is bound to the event loop it was opened on, and generate()
+# is called from sync graph nodes (each run_sync call is a fresh loop). So a
+# session that must outlive one attempt gets its own loop on its own thread;
+# each attempt's tool loop is submitted to that loop. The session is entered
+# and exited by the same task (`_serve`), as the MCP stdio transport requires.
+
+class MatlabSession:
+    """One MATLAB MCP session kept open on a private event-loop thread.
+    Opened lazily (first `tools`/`run`, or start()); close() exits the
+    session and stops the thread."""
+
+    def __init__(self):
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._tools: list[BaseTool] | None = None
+        self._error: BaseException | None = None
+        self._ready = threading.Event()
+        self._closing: asyncio.Event | None = None
+
+    @property
+    def started(self) -> bool:
+        return self._thread is not None
+
+    def start(self) -> None:
+        """Spawn the MATLAB MCP server (which starts booting MATLAB) and wait
+        for the session handshake. Raises if the server could not be opened."""
+        if self._thread is not None:
+            if self._error is not None:
+                raise RuntimeError(f"MATLAB MCP session could not be opened: {self._error}") from self._error
+            return
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._thread_main, name="matlab-session", daemon=True)
+        self._thread.start()
+        self._ready.wait()
+        if self._error is not None:
+            raise RuntimeError(f"MATLAB MCP session could not be opened: {self._error}") from self._error
+
+    def _thread_main(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._serve())
+        except BaseException as e:  # surfaced to start()/run() callers
+            self._error = e
+        finally:
+            self._ready.set()
+            self._loop.close()
+
+    async def _serve(self) -> None:
+        self._closing = asyncio.Event()
+        async with get_mcp_client().session("matlab") as session:
+            self._tools = await load_mcp_tools(session)
+            self._ready.set()
+            await self._closing.wait()
+
+    @property
+    def tools(self) -> list[BaseTool]:
+        self.start()
+        return list(self._tools or [])
+
+    def run(self, coro):
+        """Run a coroutine on the session's loop and return its result. The
+        caller's context variables (observability recorder, step tracer) are
+        carried over so tool calls are logged under the right run."""
+        try:
+            self.start()
+        except BaseException:
+            coro.close()
+            raise
+        ctx = contextvars.copy_context()
+
+        async def in_context():
+            for var, value in ctx.items():
+                var.set(value)
+            return await coro
+
+        return asyncio.run_coroutine_threadsafe(in_context(), self._loop).result()
+
+    def close(self) -> None:
+        """Quit the MCP server (and so MATLAB) and stop the thread. Safe to
+        call when never started or after a failed start."""
+        if self._thread is None:
+            return
+        if self._closing is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._closing.set)
+        self._thread.join()
+
+
+_run_session: contextvars.ContextVar[MatlabSession | None] = contextvars.ContextVar("matlab_run_session", default=None)
+
+
+@contextmanager
+def shared_matlab_session() -> Iterator[MatlabSession]:
+    """Every TestVectorGenerator.generate() inside the block shares one MATLAB
+    session; it is opened on first use (or `.start()`) and closed on exit."""
+    session = MatlabSession()
+    token = _run_session.set(session)
+    try:
+        yield session
+    finally:
+        _run_session.reset(token)
+        session.close()
+
+
 class TestVectorGenerator:
     """Runs the MATLAB tool loop once: writes/runs the golden model in
     run_dir and returns the LLM's JSON summary. Never raises for a
@@ -110,10 +261,22 @@ class TestVectorGenerator:
 
     def generate(self, spec: dict, run_dir: str, skills: dict[str, str] | None = None,
                  previous_result: dict | None = None, validation_issues: list[dict] | None = None) -> dict:
-        return run_sync(self.agenerate(spec, run_dir, skills, previous_result, validation_issues))
+        """Inside `shared_matlab_session()` the attempt runs on the run's
+        shared MATLAB; otherwise it opens a session of its own."""
+        system, payload = self._prompt(spec, run_dir, skills, previous_result, validation_issues)
+        shared = _run_session.get()
+        if shared is None:
+            return run_sync(self._generate_in_own_session(system, payload))
+        return shared.run(self._tool_loop(shared.tools, system, payload))
 
     async def agenerate(self, spec: dict, run_dir: str, skills: dict[str, str] | None = None,
                         previous_result: dict | None = None, validation_issues: list[dict] | None = None) -> dict:
+        system, payload = self._prompt(spec, run_dir, skills, previous_result, validation_issues)
+        return await self._generate_in_own_session(system, payload)
+
+    @staticmethod
+    def _prompt(spec: dict, run_dir: str, skills: dict[str, str] | None,
+                previous_result: dict | None, validation_issues: list[dict] | None) -> tuple[str, dict]:
         system = TEST_VECTOR_AGENT_SYSTEM_PROMPT
         if skills:
             system += TEST_VECTOR_SKILLS_ADDENDUM + "\n\n".join(f"### {n}\n{c}" for n, c in skills.items())
@@ -122,19 +285,25 @@ class TestVectorGenerator:
             system += TEST_VECTOR_FIX_ADDENDUM
             payload["previous_result"] = previous_result
             payload["validation_issues"] = validation_issues
+        return system, payload
 
-        client = get_mcp_client()
-        async with client.session("matlab") as session:
-            tools = _guard_run_tool(await load_mcp_tools(session))
-            agent = create_agent(self.llm, tools, system_prompt=system)
-            handler = ObservabilityCallbackHandler(source=AGENT_NAME)
-            try:
-                result = await agent.ainvoke(
-                    {"messages": [HumanMessage(content=json.dumps(payload, indent=2))]},
-                    config={"callbacks": [handler], "recursion_limit": MAX_AGENT_STEPS},
-                )
-            except RunAttemptsExceeded as e:
-                return failure_result(f"Gave up after {MAX_RUN_FAILURES} failed MATLAB runs.", f"Last MATLAB error: {e}")
-            except GraphRecursionError:
-                return failure_result(f"Agent did not finish within {MAX_AGENT_STEPS} steps.")
+    async def _generate_in_own_session(self, system: str, payload: dict) -> dict:
+        async with get_mcp_client().session("matlab") as session:
+            return await self._tool_loop(await load_mcp_tools(session), system, payload)
+
+    async def _tool_loop(self, mcp_tools: list[BaseTool], system: str, payload: dict) -> dict:
+        """One attempt: the LLM writes/runs the script against the given MATLAB
+        tools until it succeeds or a cap trips. Caps are per attempt."""
+        tools = _guard_run_tool(mcp_tools)
+        agent = create_agent(self.llm, tools, system_prompt=system)
+        handler = ObservabilityCallbackHandler(source=AGENT_NAME)
+        try:
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage(content=json.dumps(payload, indent=2))]},
+                config={"callbacks": [handler], "recursion_limit": MAX_AGENT_STEPS},
+            )
+        except RunAttemptsExceeded as e:
+            return failure_result(f"Gave up after {MAX_RUN_FAILURES} failed MATLAB runs.", f"Last MATLAB error: {e}")
+        except GraphRecursionError:
+            return failure_result(f"Agent did not finish within {MAX_AGENT_STEPS} steps.")
         return parse_test_vector_response(result["messages"][-1].content)

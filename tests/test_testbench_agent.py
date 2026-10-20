@@ -211,6 +211,57 @@ end architecture;"""
     assert len(found) == 2 and "line" in found[0]
 
 
+def test_when_else_inside_a_process_is_caught_before_xelab_would_refuse_it():
+    from agents.testbench_agent.testbench_linter import _static_checks
+    code = """library ieee; use ieee.std_logic_1164.all;
+entity counter4_tb is end entity;
+architecture sim of counter4_tb is signal clk, rst : std_logic := '0'; signal count : std_logic_vector(3 downto 0);
+  signal done : boolean := false; begin
+  dut: entity work.counter4 port map (clk => clk, count => count);
+  clk <= not clk after 5 ns when not done else '0';          -- concurrent: fine
+  stimulus : process variable v_rst : integer := 1; begin
+    rst <= '1' when v_rst = 1 else '0';                      -- sequential: xelab 2020.1 refuses
+    wait for 10 ns; report "SIMULATION PASSED" severity note; done <= true; wait;
+  end process;
+end architecture;"""
+    found = [i for i in _static_checks(SPEC, RTL, {"entity_name": "counter4_tb", "code": code})
+             if i["code"] == "conditional_assignment_in_process"]
+    assert len(found) == 1 and "Line 8" in found[0]["detail"] and "if c then" in found[0]["detail"]
+
+    fixed = code.replace("rst <= '1' when v_rst = 1 else '0';", "if v_rst = 1 then rst <= '1'; else rst <= '0'; end if;")
+    assert not [i for i in _static_checks(SPEC, RTL, {"entity_name": "counter4_tb", "code": fixed})
+                if i["code"] == "conditional_assignment_in_process"]
+
+
+def test_replay_mistakes_that_compile_but_break_the_simulation_are_caught():
+    from agents.testbench_agent.testbench_linter import _replay_checks
+    spec = {"entity_name": "demap", "ports": [
+        {"name": "aclk", "direction": "input", "width": "1"},
+        {"name": "s_axis_tdata", "direction": "input", "width": "32"},
+        {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
+        {"name": "m_axis_tdata", "direction": "output", "width": "24"}]}
+    bad = """
+      variable v_cycle, v_aclk, v_s_axis_tdata : integer;   -- 32-bit port into an integer
+      variable v_m_axis_tdata : integer;
+      read(li, v_cycle); read(li, v_aclk); read(li, v_s_axis_tdata);
+      read(lo, v_cycle); read(lo, v_m_axis_tdata);          -- m_axis_tvalid column skipped
+      if v_cycle /= v_cycle then
+    """
+    codes = {i["code"] for i in _replay_checks(spec, bad)}
+    assert codes == {"wide_port_read_as_integer", "column_count_mismatch", "self_comparison"}
+
+    good = """
+      variable v_cycle, v_cycle_out, v_aclk, v_m_axis_tvalid, v_m_axis_tdata : integer;
+      variable v_s_axis_tdata : std_logic_vector(31 downto 0);
+      read(li, v_cycle); read(li, v_aclk); read_wide(li, v_s_axis_tdata);
+      read(lo, v_cycle_out); read(lo, v_m_axis_tvalid); read(lo, v_m_axis_tdata);
+      if v_cycle /= v_cycle_out then
+    """
+    assert _replay_checks(spec, good) == []
+    # no directions in the spec (older specs): the column count cannot be known, nothing is reported
+    assert _replay_checks(SPEC, bad) == [i for i in _replay_checks(SPEC, bad) if i["code"] == "self_comparison"]
+
+
 def test_agent_only_has_restricted_actions():
     assert {a.value for a in Action} == {"load_skills", "generate_testbench", "lint_testbench", "finalize_testbench"}
     nodes = set(make_agent([GOOD_TB], [CLEAN]).graph.get_graph().nodes) - {"__start__", "__end__"}

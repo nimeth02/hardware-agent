@@ -64,10 +64,10 @@ class FakeSkillLoader(RTLSkillLoader):
     def __init__(self, skills=SKILLS, error=None):
         self.skills, self.error = skills, error
 
-    def load(self):
+    def load(self, keep=None):
         if self.error:
             raise RuntimeError(self.error)
-        return dict(self.skills)
+        return {n: c for n, c in self.skills.items() if keep is None or keep(n)}
 
 
 def fake_linter(results):
@@ -95,6 +95,14 @@ def test_skills_are_loaded_first_and_passed_to_the_generator():
     assert agent.tools.generator.calls[0]["skills"] == SKILLS
     assert out["skills_used"] == ["vhdl_93_design_rules.md"]
     assert out["iteration"] == 3   # load_skills, generate(+lint), finalize
+
+
+def test_only_the_rulebook_for_the_spec_edition_is_loaded():
+    both = {"vhdl_93_design_rules.md": "93", "vhdl_2008_design_rules.md": "2008", "style.md": "shared"}
+    agent = make_agent([GOOD_RTL], [CLEAN], loader=FakeSkillLoader(both))
+    assert agent.run(SPEC)["skills_used"] == ["vhdl_93_design_rules.md", "style.md"]          # no field: 93
+    agent = make_agent([GOOD_RTL], [CLEAN], loader=FakeSkillLoader(both))
+    assert agent.run({**SPEC, "vhdl_version": "2008"})["skills_used"] == ["vhdl_2008_design_rules.md", "style.md"]
 
 
 def test_clean_lint_finalizes():

@@ -160,19 +160,54 @@ def ensure_vivado_env() -> dict:
     return {"ok": False, "reason": f"sourced {to_source} but 'vivado' still not on PATH"}
 
 
-def run_vivado_cmd(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a process and every descendant. On Windows the Vivado .BAT
+    wrapper spawns cmd.exe -> xsim.exe -> xsimk.exe; killing only cmd.exe
+    (what subprocess.run's timeout does) leaves the real simulator alive,
+    still holding xsim.dir/* locked and our stdout pipe open."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, text=True)
+    else:
+        proc.kill()
+
+
+def run_vivado_cmd(cmd: list, timeout: float | None = None, **kwargs) -> subprocess.CompletedProcess:
     """
-    subprocess.run() wrapper for invoking a resolved Vivado binary.
+    subprocess.run()-compatible wrapper for invoking a resolved Vivado binary.
 
     On Windows, xvhdl/xelab/xsim/vivado are .BAT wrapper scripts. Windows'
     CreateProcess (what subprocess uses with shell=False, the default)
     cannot execute a batch file directly — it must go through cmd.exe, or
     subprocess raises FileNotFoundError even though the file exists.
+
+    Two safeguards beyond plain subprocess.run:
+      * stdin is /dev/null, so a tool that drops to an interactive prompt
+        (xsim after a TCL error) sees EOF and exits instead of waiting
+        forever on the MCP server's stdin.
+      * on timeout the whole process tree is killed before collecting
+        output, so no orphaned xsim keeps the pipe (and xsim.dir) open.
+    Raises subprocess.TimeoutExpired like subprocess.run does.
     """
     exe = str(cmd[0])
     if os.name == "nt" and exe.lower().endswith((".bat", ".cmd")):
         cmd = ["cmd", "/c", *cmd]
-    return subprocess.run(cmd, **kwargs)
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    check = kwargs.pop("check", False)
+    with subprocess.Popen(cmd, **kwargs) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            stdout, stderr = proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    if check:
+        result.check_returncode()
+    return result
 
 
 def find_vivado_bin(name: str) -> str:

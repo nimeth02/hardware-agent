@@ -29,9 +29,8 @@ For every request:
    synchronous/asynchronous).
 4. Implement every item in "behavior" as RTL logic.
 5. Respect every item in "constraints".
-6. Write synthesizable VHDL-93 (xvhdl's default standard). Follow any
-   design rules (skills) given below exactly; they override your own
-   habits.
+6. Write synthesizable VHDL-{VHDL_VERSION}. Follow any design rules
+   (skills) given below exactly; they override your own habits.
 7. If "ambiguities" is non-empty or something needed is still missing,
    make the most conventional choice for that kind of hardware and record
    it in "notes" — never leave a TODO or invent unstated requirements.
@@ -75,6 +74,11 @@ with:
 Return the complete corrected design (same JSON structure). Fix every
 listed issue, keep everything that was already correct, and do not
 introduce new ports or behaviour.
+
+If an issue says "cannot read from 'out' object X": keep X as `out`,
+declare `signal X_i` of the same type, replace every read of X inside
+the architecture with X_i, and add `X <= X_i;`. Fix ALL such issues in
+this rewrite, before anything else.
 """
 
 

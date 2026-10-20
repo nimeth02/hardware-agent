@@ -76,6 +76,11 @@ REQUIRED PATTERNS
 - Signal assignment uses `<=`. Variable assignment uses `:=`. Never mix.
 - Every signal must be declared before use; every port must have a mode
   and a type.
+- Never read an `out` port inside the architecture (xvhdl: "cannot read
+  from 'out' object"). Do NOT change the port to `buffer` or `inout`.
+  Instead declare `signal <name>_i : <same type>;`, use `<name>_i`
+  everywhere inside (including handshake outputs such as tready/tvalid),
+  and add exactly one `<name> <= <name>_i;` in the architecture body.
 
 ═══════════════════════════════════════════════════════════════════
 PORT DECLARATION STYLE

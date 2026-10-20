@@ -39,7 +39,7 @@
       <label>Spec review (edit the JSON if needed, then approve)</label>
       <textarea id="pipeline-spec-json" rows="16"></textarea>
       <div class="row">
-        <button id="pipeline-approve-btn">Approve &amp; Generate RTL</button>
+        <button id="pipeline-approve-btn">Approve &amp; Generate</button>
         <span id="pipeline-approve-status" class="status"></span>
       </div>
     </div>
@@ -52,6 +52,22 @@
       <ul id="pipeline-rtl-lint" class="suggestions-list"></ul>
       <label>Notes</label>
       <ul id="pipeline-rtl-notes"></ul>
+    </div>
+
+    <div id="pipeline-tv-panel" class="panel hidden">
+      <label>Test vectors</label>
+      <p id="pipeline-tv-status" class="status"></p>
+      <p id="pipeline-tv-meta" class="status"></p>
+    </div>
+
+    <div id="pipeline-tb-panel" class="panel hidden">
+      <label>Testbench</label>
+      <p id="pipeline-tb-meta" class="status"></p>
+      <pre id="pipeline-tb-code" class="result-box"></pre>
+      <label>Lint</label>
+      <ul id="pipeline-tb-lint" class="suggestions-list"></ul>
+      <label>Notes</label>
+      <ul id="pipeline-tb-notes"></ul>
     </div>
   </section>
 
@@ -71,13 +87,15 @@
     <div id="agents-view-run" class="subtab active">
     <div class="panel">
       <div class="row" style="margin-top:12px;justify-content:flex-start">
-        <label for="agent-input" style="margin:0">Input (JSON)</label>
+        <label for="agent-input" style="margin:0">Input</label>
         <button id="agent-fill-btn" type="button" class="example-btn" title="Replace spec / rtl / testbench fields with the latest results of the producing agents">Fill from latest runs</button>
       </div>
       <div id="agent-examples-row" class="examples-row"></div>
-      <textarea id="agent-input" rows="12"></textarea>
-      <div class="row">
+      <textarea id="agent-input" rows="12" placeholder="Plain text for orchestrator / spec analyzer, or JSON for the other agents"></textarea>
+      <p id="agent-input-hint" class="status" style="margin:4px 0 0"></p>
+      <div class="row" style="justify-content:flex-start">
         <button id="agent-run-btn">Run agent</button>
+        <button id="agent-stop-btn" type="button" class="stop-btn hidden" title="Ask the running agent to stop at its next step">Stop</button>
         <span id="agent-run-status" class="status"></span>
       </div>
     </div>
@@ -88,8 +106,19 @@
         <span id="agent-run-meta" class="status" style="flex:1"></span>
       </div>
       <div id="agent-use-row" class="examples-row hidden" style="margin-top:10px"></div>
-      <label style="margin-top:12px">Timeline</label>
-      <table>
+      <div class="row" style="margin-top:12px; justify-content:flex-start; flex-wrap:wrap">
+        <label style="margin:0">Timeline</label>
+        <div id="agent-events-tools" class="examples-row" style="margin:0">
+          <button type="button" class="example-btn" id="agent-events-expand-all" title="Open the full payload of every row">Expand all details</button>
+          <button type="button" class="example-btn" id="agent-events-collapse-all">Collapse all details</button>
+        </div>
+        <div id="agent-orch-tl-tools" class="examples-row hidden" style="margin:0">
+          <button type="button" class="example-btn" id="agent-orch-expand-all" title="Show the nested events of every sub-agent call">Expand groups</button>
+          <button type="button" class="example-btn" id="agent-orch-collapse-all">Collapse groups</button>
+        </div>
+        <span class="status">Click a row to see what the tool or LLM did, in full.</span>
+      </div>
+      <table class="events-table">
         <thead><tr><th>#</th><th>Event</th><th>Detail</th><th>Status</th><th>Duration</th></tr></thead>
         <tbody id="agent-events"></tbody>
       </table>

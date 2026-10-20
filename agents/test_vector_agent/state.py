@@ -50,7 +50,8 @@ class TestVectorAgentState(TypedDict, total=False):
     # --- working data ---
     skills: dict[str, str]        # skill file name -> content, injected into the generator prompt
     skills_loaded: bool           # True once load_skills ran (even if the library was empty)
-    result: dict | None           # generator's JSON summary {script, csv_file, columns, num_vectors, scenarios, notes}
+    result: dict | None           # generator's JSON summary {script, input_csv, output_csv, input_columns,
+                                  # output_columns, num_vectors, scenarios, notes}
     validation: dict | None       # validator result for the CSV: {csv, num_vectors, columns, issues}; None until validated
 
     # --- stall detection (guardrail) ---

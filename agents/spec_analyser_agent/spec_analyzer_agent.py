@@ -216,5 +216,5 @@ def resume_spec_analysis(session_id: str, answer: str) -> dict:
 
 
 def call_spec_analyzer(spec_text: str) -> str:
-    """One-shot spec generation, raw LLM text (used by agents/pipeline.py)."""
+    """One-shot spec generation, raw LLM text (used by agents/pipeline_agent/pipeline.py)."""
     return get_agent().tools.generator.generate_raw(spec_text)

@@ -15,13 +15,15 @@ from agents.test_vector_agent.tools import TestVectorAgentTools
 
 SPEC = {"entity_name": "counter4", "ports": [{"name": "clk", "width": "1"}, {"name": "count", "width": "4"}],
         "behavior": ["count up"]}
-GOOD = {"script": "gen_test_vectors.m", "csv_file": "test_vectors.csv", "columns": ["cycle", "clk", "count"],
+GOOD = {"script": "gen_test_vectors.m", "input_csv": "test_vectors_in.csv", "output_csv": "test_vectors_out.csv",
+        "input_columns": ["cycle", "clk"], "output_columns": ["cycle", "count"],
         "num_vectors": 40, "scenarios": ["reset", "count"], "notes": []}
-BAD = {**GOOD, "columns": ["cycle", "clk"], "num_vectors": 0}
-SKILLS = {"matlab_golden_model_rules.md": "- preallocate one matrix"}
-CLEAN = {"csv": "x/test_vectors.csv", "num_vectors": 40, "columns": ["cycle", "clk", "count"], "issues": []}
-DIRTY = {"csv": "x/test_vectors.csv", "num_vectors": 0, "columns": ["cycle", "clk"],
-         "issues": [{"code": "port_column_missing", "detail": "No column for port 'count'."}]}
+BAD = {**GOOD, "output_columns": ["cycle"], "num_vectors": 0}
+SKILLS = {"matlab_golden_model_rules.md": "- preallocate two matrices"}
+CLEAN = {"csv": {"inputs": "x/test_vectors_in.csv", "outputs": "x/test_vectors_out.csv"}, "num_vectors": 40,
+         "columns": {"inputs": ["cycle", "clk"], "outputs": ["cycle", "count"]}, "issues": []}
+DIRTY = {**CLEAN, "num_vectors": 0, "columns": {"inputs": ["cycle", "clk"], "outputs": ["cycle"]},
+         "issues": [{"code": "port_column_missing", "detail": "test_vectors_out.csv: no column for output port 'count'."}]}
 
 
 class FakeGenerator(TestVectorGenerator):
@@ -160,7 +162,93 @@ def test_invalid_planner_output_falls_back_safely():
 def test_invalid_llm_output_becomes_a_failure_summary():
     out = parse_test_vector_response("not json")
     assert out["num_vectors"] == 0 and "did not return valid JSON" in out["notes"][0]
-    assert parse_test_vector_response('{"csv_file": "test_vectors.csv", "num_vectors": 3}')["num_vectors"] == 3
+    assert out["input_csv"] == "test_vectors_in.csv" and out["output_csv"] == "test_vectors_out.csv"
+    assert parse_test_vector_response('{"input_csv": "test_vectors_in.csv", "num_vectors": 3}')["num_vectors"] == 3
+
+
+def test_validator_checks_both_files_their_layout_and_that_they_line_up(monkeypatch):
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = {"ports": [{"name": "clk", "direction": "input", "width": "1"},
+                      {"name": "rst", "direction": "input", "width": "1"},
+                      {"name": "count", "direction": "output", "width": "4"}]}
+    files = {"test_vectors_in.csv": "cycle,clk,rst\n0,1,1\n1,1,0\n2,1,0\n",
+             "test_vectors_out.csv": "cycle,count\n0,0\n1,1\n2,2\n"}
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    out = v.validate_test_vectors(spec, "x", {})
+    assert out["issues"] == [] and out["num_vectors"] == 3
+    assert out["columns"] == {"inputs": ["cycle", "clk", "rst"], "outputs": ["cycle", "count"]}
+
+    files["test_vectors_in.csv"] = "cycle,rst,clk\n0,1,1\n1,0,1\n"           # wrong order + fewer rows
+    files["test_vectors_out.csv"] = "cycle,count\n0,0\n5,1\n2,16\n"          # cycle 5 != 1, 16 does not fit 4 bits
+    codes = [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]
+    assert "column_order" in codes and "row_count_mismatch" in codes and "cycle_mismatch" in codes
+    assert "out_of_range" in codes
+
+    del files["test_vectors_out.csv"]
+    codes = [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]
+    assert "csv_missing" in codes
+
+
+def test_run_guard_rejects_unknown_scripts_without_counting_a_failure():
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator import RunAttemptsExceeded, _guard_run_tool
+
+    runs: list[str] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        runs.append(script_name)
+        return '{"status": "error", "error": "boom"}'
+
+    tools = _guard_run_tool([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="write"),
+                             StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="run")],
+                            max_failures=2)
+    gen, run = {t.name: t for t in tools}["generate_matlab_script"], {t.name: t for t in tools}["run_matlab_script"]
+
+    async def scenario():
+        out = await run.ainvoke({"script_name": "dir", "project_dir": "x"})       # never written: misuse
+        assert "REJECTED" in out and runs == []
+        await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "x", "project_dir": "x"})
+        assert '"error"' in await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})   # failure 1
+        assert "REJECTED" in await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})  # unchanged
+        await gen.ainvoke({"filename": "gen_test_vectors", "code": "y", "project_dir": "x"})
+        with pytest.raises(RunAttemptsExceeded):                                                            # failure 2 = cap
+            await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})
+    asyncio.run(scenario())
+    assert runs == ["gen_test_vectors", "gen_test_vectors"]
+
+
+def test_scripts_using_integer_classes_are_rejected_before_being_written():
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator import _forbidden_matlab, _guard_run_tool
+
+    assert _forbidden_matlab("x = int16(a) + bitshift(b, -2); % uint8( in a comment is fine") == ["bitshift", "int16"]
+    assert _forbidden_matlab("v = mod(x, 2^12); if v >= 2^11, v = v - 2^12; end") == []
+
+    written: list[str] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        written.append(filename)
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok", "output": "wrote 40 rows"}'
+
+    tools = _guard_run_tool([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                             StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "y = uint32(5);", "project_dir": "x"})
+        assert "REJECTED" in out and "uint32" in out and written == []
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "y = mod(5, 2^32);", "project_dir": "x"})
+        assert "REJECTED" not in out and written == ["gen_test_vectors.m"]
+    asyncio.run(scenario())
 
 
 def test_agent_only_has_restricted_actions():

@@ -9,15 +9,24 @@ import re
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 from agents.mcp_utils import mcp_run_xvhdl, run_sync, tool_json
+from agents.vhdl_version import resolve_vhdl_version, xvhdl_std
 from services.mcp_client import get_mcp_client
 
 _SIM_TIME_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*$")
+_ERROR_LINE_RE = re.compile(r"^ERROR:", re.MULTILINE)
+
+
+def design_std(project: dict) -> str:
+    """The VHDL edition the project's design files were written in, read
+    from its spec.json (agents/vhdl_version.py decides the default)."""
+    return xvhdl_std(resolve_vhdl_version(project.get("spec")))
 
 
 def compile_design(project: dict) -> dict:
-    """xvhdl every src file (VHDL-93) into the project's work library, in
-    listing order. {status, results, error_class}."""
-    results = mcp_run_xvhdl(project["dir"], [(f, "93") for f in project["src_files"]])
+    """xvhdl every src file (in the spec's VHDL edition) into the project's
+    work library, in listing order. {status, results, error_class}."""
+    std = design_std(project)
+    results = mcp_run_xvhdl(project["dir"], [(f, std) for f in project["src_files"]])
     ok = bool(results) and all(r.get("status") == "ok" for r in results)
     return {
         "status": "ok" if ok else "error",
@@ -36,7 +45,9 @@ def outcome_of(sim: dict) -> str:
         return "passed"
     if "SIMULATION PASSED" in output:
         return "error"          # passed marker but the tool still flagged an error
-    if (sim.get("error_class") or "ERROR:" in output or output.lstrip().startswith("[")
+    # "ERROR:" counts only at the start of a line: xsim echoes the TCL script
+    # (which mentions ERROR: in its catch handler) as "## ..." lines.
+    if (sim.get("error_class") or _ERROR_LINE_RE.search(output) or output.lstrip().startswith("[")
             or "timed out" in output or "not found" in output or "not available" in output):
         return "error"
     return "no_marker"          # ran to sim_time without printing a verdict
@@ -49,6 +60,7 @@ async def _asimulate(project: dict, sim_time: str) -> dict:
         return tool_json(await run_simulation.ainvoke({
             "tb_file": project["tb_file"], "top_entity": project["top_entity"],
             "project_dir": project["dir"], "sim_time": sim_time,
+            "src_vhdl_std": design_std(project),
         }))
 
 
@@ -66,4 +78,7 @@ def double_sim_time(sim_time: str) -> str:
     if not m:
         return sim_time
     value = float(m.group(1)) * 2
-    return f"{int(value) if value.is_integer() else value}{m.group(2)}"
+    # Plain decimal only: f"{8e-05}" would give "8e-05us", which xsim's
+    # `run` rejects and which then hangs xsim at its prompt.
+    text = f"{value:.12f}".rstrip("0").rstrip(".")
+    return f"{text or '0'}{m.group(2)}"

@@ -121,11 +121,26 @@ async function initAgentsTab() {
   onAgentChange();
 }
 
+// xsim's `run <time>` wants a plain decimal plus unit ("10us", "2.5 ms");
+// anything else (scientific notation, bare numbers) hangs the simulator.
+// Same pattern as the server (app.py) and the Vivado MCP server.
+const SIM_TIME_RE = /^\s*\d+(\.\d+)?\s*(fs|ps|ns|us|ms|s)\s*$/i;
+const SIM_TIME_HINT = "sim_time must be a decimal number followed by fs/ps/ns/us/ms/s, e.g. 10us or 2.5ms";
+function simTimeError(input) {
+  if (!input || typeof input !== "object" || !("sim_time" in input)) return null;
+  const v = input.sim_time;
+  if (v == null || v === "") return null;  // the agent applies its default (10us)
+  return typeof v === "string" && SIM_TIME_RE.test(v) ? null : `Invalid sim_time ${JSON.stringify(v)}: ${SIM_TIME_HINT}.`;
+}
+
 function onAgentChange() {
   const a = agentCatalog.find((x) => x.name === $("#agent-select").value);
   if (!a) return;
   $("#agent-desc").textContent = a.description;
-  $("#agent-input").value = JSON.stringify(a.input_template, null, 2);
+  const template = { ...(a.input_template || {}) };
+  if ("sim_time" in template && !template.sim_time) template.sim_time = "10us";
+  $("#agent-input").value = JSON.stringify(template, null, 2);
+  $("#agent-input-hint").textContent = "sim_time" in template ? `${SIM_TIME_HINT} (default 10us).` : "";
   // "Fill from latest runs" only makes sense when the template has a field an
   // upstream agent produces (spec / rtl / testbench).
   const fillable = Object.keys(PRODUCERS).some((k) => k in (a.input_template || {}));
@@ -197,13 +212,40 @@ function runLabel(run) {
   return `run ${run.id.slice(0, 8)} (${new Date(run.started_at * 1000).toLocaleString()})`;
 }
 
-// Current textarea JSON if valid, else the selected agent's template.
-function currentAgentInput() {
+// Name of the single string field of an agent's template (orchestrator ->
+// requirement_text, spec_analyzer -> spec_text), or null when the agent
+// takes a richer input.
+function plainTextField(agent) {
+  const keys = Object.keys((agent && agent.input_template) || {});
+  return keys.length === 1 && typeof agent.input_template[keys[0]] === "string" ? keys[0] : null;
+}
+
+// Parse the input box for `agent`. Valid JSON is used as-is; anything else
+// is wrapped into the agent's single text field when it has one. Returns
+// { input } or { error }.
+function parseAgentInput(agent) {
+  const raw = $("#agent-input").value;
   try {
-    const v = JSON.parse($("#agent-input").value);
-    if (v && typeof v === "object" && !Array.isArray(v)) return v;
-  } catch (_) { /* fall back to template */ }
+    return { input: JSON.parse(raw) };
+  } catch (err) {
+    const field = plainTextField(agent);
+    const text = raw.trim();
+    if (field && text) return { input: { ...agent.input_template, [field]: text } };
+    if (field) return { error: `Input is empty: type the requirement text for ${agent.name}.` };
+    const fields = Object.keys((agent && agent.input_template) || {}).join(", ");
+    const textAgents = agentCatalog.filter(plainTextField).map((a) => a.name).join(", ");
+    return {
+      error: `Input must be JSON with fields: ${fields || "(none)"} — or pick an agent that takes plain text (${textAgents}). JSON error: ${err.message}`,
+    };
+  }
+}
+
+// Current textarea input if usable (JSON object or wrapped plain text), else
+// the selected agent's template.
+function currentAgentInput() {
   const a = agentCatalog.find((x) => x.name === $("#agent-select").value);
+  const v = parseAgentInput(a).input;
+  if (v && typeof v === "object" && !Array.isArray(v)) return v;
   return a ? { ...a.input_template } : {};
 }
 
@@ -295,15 +337,20 @@ function renderUseAsInput(run) {
 $("#agent-run-btn").addEventListener("click", async () => {
   const status = $("#agent-run-status");
   status.classList.remove("error");
-  let input;
-  try {
-    input = JSON.parse($("#agent-input").value);
-  } catch (err) {
-    status.textContent = "Input JSON is invalid: " + err.message;
+  const name = $("#agent-select").value;
+  const parsed = parseAgentInput(agentCatalog.find((x) => x.name === name));
+  if (parsed.error) {
+    status.textContent = parsed.error;
     status.classList.add("error");
     return;
   }
-  const name = $("#agent-select").value;
+  const input = parsed.input;
+  const simErr = simTimeError(input);
+  if (simErr) {
+    status.textContent = simErr;
+    status.classList.add("error");
+    return;
+  }
   status.textContent = `Starting ${name}...`;
   $("#agent-run-btn").disabled = true;
   try {
@@ -314,7 +361,7 @@ $("#agent-run-btn").addEventListener("click", async () => {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Request failed");
-    watchRun(data.run_id, status, $("#agent-run-btn"));
+    watchRun(data.run_id, status, $("#agent-run-btn"), name);
   } catch (err) {
     status.textContent = `Error: ${err.message}`;
     status.classList.add("error");
@@ -326,7 +373,7 @@ $("#agent-run-btn").addEventListener("click", async () => {
 // finish on `done`. Returns nothing; the status span/button are updated here.
 let runStream = null;
 
-function watchRun(runId, statusEl, buttonEl) {
+function watchRun(runId, statusEl, buttonEl, agentName) {
   if (runStream) runStream.close();
   const started = performance.now();
   let redrawPending = false;
@@ -339,19 +386,26 @@ function watchRun(runId, statusEl, buttonEl) {
   $("#agent-run-panel").classList.remove("hidden");
   redraw();
   statusEl.textContent = "running... (live)";
+  statusEl.classList.remove("cancelled");
+  showStopButton(runId);
   runStream = new EventSource(`/api/agent-runs/${runId}/stream`);
   runStream.addEventListener("step", (e) => {
     const ev = JSON.parse(e.data);
-    statusEl.textContent = `running... ${ev.event_type}${ev.data && ev.data.node ? " " + ev.data.node : ""}`;
+    const verb = stopRequested ? "stopping… finishing the current step:" : "running...";
+    statusEl.textContent = `${verb} ${ev.event_type}${ev.data && (ev.data.node || ev.data.stage) ? " " + (ev.data.node || ev.data.stage) : ""}` +
+      (ev.event_type === "llm_call" ? ` — ${ctxText(llmContext(ev))}` : "");
     redraw();
   });
   runStream.addEventListener("done", (e) => {
     const run = JSON.parse(e.data);
     runStream.close();
     runStream = null;
+    hideStopButton();
     const agent = run.final_result || {};
+    const stopped = run.status === "stopped";
     statusEl.textContent = `${run.status}${agent.status ? " · " + agent.status : ""} in ${((performance.now() - started) / 1000).toFixed(1)}s`;
-    statusEl.classList.toggle("error", run.status === "failed" || ["FAILED", "NEEDS_REVIEW"].includes(agent.status));
+    statusEl.classList.toggle("error", run.status === "failed" || (!stopped && ["FAILED", "NEEDS_REVIEW"].includes(agent.status)));
+    statusEl.classList.toggle("cancelled", stopped || agent.status === "CANCELLED");
     showAgentRun(runId).then(loadAgentRuns);
     buttonEl.disabled = false;
   });
@@ -359,11 +413,60 @@ function watchRun(runId, statusEl, buttonEl) {
     statusEl.textContent = "stream lost — click Refresh to reload";
     statusEl.classList.add("error");
     if (runStream) { runStream.close(); runStream = null; }
+    hideStopButton();
     buttonEl.disabled = false;
   });
 }
 
+// ── Stop button: visible only while watchRun follows a live run ───────
+// Stopping is cooperative: the server flips a flag the agent checks at its
+// next step (LLM call, tool call or graph node), so a step already in
+// flight finishes first; the run then ends with status "stopped".
+let stopRequested = false;
+
+function showStopButton(runId) {
+  const btn = $("#agent-stop-btn");
+  stopRequested = false;
+  btn.dataset.runId = runId;
+  btn.textContent = "Stop";
+  btn.disabled = false;
+  btn.classList.remove("hidden");
+}
+
+function hideStopButton() {
+  const btn = $("#agent-stop-btn");
+  btn.classList.add("hidden");
+  delete btn.dataset.runId;
+  stopRequested = false;
+}
+
+$("#agent-stop-btn").addEventListener("click", async () => {
+  const btn = $("#agent-stop-btn");
+  const runId = btn.dataset.runId;
+  if (!runId) return;
+  const status = $("#agent-run-status");
+  btn.disabled = true;
+  btn.textContent = "stopping…";
+  try {
+    const res = await fetch(`/api/agent-runs/${runId}/stop`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    stopRequested = true;
+    status.classList.remove("error");
+    status.textContent = "stopping… the current step finishes first";
+  } catch (err) {
+    status.textContent = `Could not stop: ${err.message}`;
+    status.classList.add("error");
+    btn.disabled = false;
+    btn.textContent = "Stop";
+  }
+});
+
 $("#agent-runs-refresh").addEventListener("click", loadAgentRuns);
+$("#agent-orch-expand-all").addEventListener("click", () => setAllOrchGroups(true));
+$("#agent-orch-collapse-all").addEventListener("click", () => setAllOrchGroups(false));
+$("#agent-events-expand-all").addEventListener("click", () => setAllEventDetails(true));
+$("#agent-events-collapse-all").addEventListener("click", () => setAllEventDetails(false));
 
 async function loadAgentRuns() {
   const name = $("#agent-select").value;
@@ -373,7 +476,10 @@ async function loadAgentRuns() {
   runs.forEach((r) => {
     const tr = document.createElement("tr");
     const agentBad = r.agent_status && ["FAILED", "NEEDS_REVIEW"].includes(r.agent_status);
-    const cls = r.status === "failed" || agentBad ? "badge-error" : r.status === "completed" ? "badge-ok" : "";
+    const stopped = r.status === "stopped" || r.agent_status === "CANCELLED";
+    const cls = stopped ? "badge-cancelled"
+      : r.status === "failed" || agentBad ? "badge-error"
+      : r.status === "completed" ? "badge-ok" : "";
     const statusText = r.agent_status ? `${r.status} · ${r.agent_status}` : r.status;
     const errorText = r.error || r.agent_error || "";
     tr.innerHTML = `
@@ -381,7 +487,7 @@ async function loadAgentRuns() {
       <td>${escapeHtml(r.agent_name)} v${escapeHtml(r.agent_version || "")}</td>
       <td><span class="${cls}">${escapeHtml(statusText)}</span></td>
       <td>${r.duration_ms != null ? formatMs(r.duration_ms) : "-"}</td>
-      <td class="${errorText ? "badge-error" : ""}">${escapeHtml(errorText.slice(0, 80))}</td>`;
+      <td class="${errorText ? (stopped ? "badge-cancelled" : "badge-error") : ""}">${escapeHtml(errorText.slice(0, 80))}</td>`;
     tr.dataset.runId = r.id;
     tr.addEventListener("click", async () => {
       await showAgentRun(r.id);
@@ -396,16 +502,52 @@ function markSelectedRun(runId) {
   $all("#agent-runs tr").forEach((tr) => tr.classList.toggle("selected", tr.dataset.runId === runId));
 }
 
+// The recorder stores short previews in the event itself ("... [truncated N
+// chars]"); the row's detail panel shows the full record, so the marker is
+// dropped from the one-line summary.
+function stripTruncMarker(s) { return String(s ?? "").replace(/\.{3} \[truncated \d+ chars\]\s*$/, "…"); }
+
+// Context size of an LLM call: how much the model was sent (input tokens),
+// how much it answered (output tokens) and how many chat messages went in.
+// New runs carry these on the llm_call event itself; older runs only have
+// them on the stored run.llm_calls record (evtCtx.llms), so fall back to it.
+const CTX_WARN_TOKENS = 16000, CTX_HIGH_TOKENS = 32000;
+function llmContext(e) {
+  const d = e.data || {};
+  const rec = (evtCtx.run && evtCtx.llms[e.step]) || {};
+  const pick = (a, b) => (a != null ? a : b != null ? b : null);
+  return {
+    input: pick(d.input_tokens, rec.input_tokens),
+    output: pick(d.output_tokens, rec.output_tokens),
+    messages: pick(d.messages, Array.isArray(rec.input) ? rec.input.length : null),
+  };
+}
+function fmtTok(n) { return n == null ? "?" : Number(n).toLocaleString(); }
+function ctxText(c) { return `ctx ${fmtTok(c.input)}${c.input != null ? " tok" : ""}`; }
+function ctxClass(c) {
+  return c.input == null ? "" : c.input > CTX_HIGH_TOKENS ? "ctx-high" : c.input > CTX_WARN_TOKENS ? "ctx-warn" : "";
+}
+function ctxBadgeHtml(e) {
+  const c = llmContext(e);
+  const parts = [ctxText(c)];
+  if (c.output != null) parts.push(`out ${fmtTok(c.output)}`);
+  if (c.messages != null) parts.push(`${fmtTok(c.messages)} msgs`);
+  return `<span class="ctx-badge ${ctxClass(c)}" title="context sent to the model (input tokens) | answer size | chat messages sent">${escapeHtml(parts.join(" | "))}</span>`;
+}
+
 function eventDetail(e) {
   const d = e.data || {};
   switch (e.event_type) {
     case "agent_step": return `node: ${d.node}`;
     case "llm_call": return (d.tool_calls && d.tool_calls.length ? `-> tools: ${d.tool_calls.join(", ")}` : "") +
-      (d.output_preview ? ` ${d.output_preview}` : "");
-    case "tool_call": return `${d.tool}(${JSON.stringify(d.input).slice(0, 120)})`;
-    case "tool_result": return `${d.tool}: ${d.output_preview || ""}`;
+      (d.output_preview ? ` ${stripTruncMarker(d.output_preview)}` : "");
+    case "tool_call": return `${d.tool}(${JSON.stringify(d.input).slice(0, 160)})`;
+    case "tool_result": return `${d.tool}: ${stripTruncMarker(d.output_preview)}`;
     case "error": return d.error || d.llm_error || "";
     case "run_resumed": return `answer: ${(d.input && d.input.answer) || ""}`;
+    case "agent_input":
+    case "agent_output":
+    case "state": return orchMetaSummary(e);
     default: return d.agent || d.error || "";
   }
 }
@@ -488,7 +630,9 @@ function appendCodeBlocks(box, result) {
 }
 
 // A titled, copyable code block (same head + Copy pattern as renderCodeBlocks).
-function copyableCodeBlock(title, text) {
+// `html`, when given, is the (already escaped) markup shown instead of the
+// plain text; Copy still copies `text`.
+function copyableCodeBlock(title, text, html) {
   const frag = document.createDocumentFragment();
   const head = document.createElement("div");
   head.className = "code-block-head";
@@ -507,7 +651,7 @@ function copyableCodeBlock(title, text) {
   head.appendChild(btn);
   const pre = document.createElement("pre");
   pre.className = "result-box code-block";
-  pre.textContent = text;
+  if (html != null) pre.innerHTML = html; else pre.textContent = text;
   frag.appendChild(head);
   frag.appendChild(pre);
   return frag;
@@ -939,6 +1083,23 @@ function fillProjectBody(body, fr) {
   add(panelList(Array.isArray(fr.files) ? fr.files : [], "No files listed"));
 }
 
+// One plain line per item the manager's helpers produced, as far as the run
+// got (final_result.results). Missing or null keys are skipped; code text is
+// never shown here — the collapsible sections below carry it.
+function producedItems(results) {
+  const r = results || {};
+  const obj = (v) => v && typeof v === "object";
+  const items = [];
+  if (obj(r.spec)) items.push(`Spec${r.spec.entity_name ? ` for ${r.spec.entity_name}` : ""}`);
+  if (obj(r.rtl)) items.push(`Chip code${r.rtl.entity_name ? ` (${r.rtl.entity_name})` : ""}`);
+  if (obj(r.testbench)) items.push(`Test program${r.testbench.entity_name ? ` (${r.testbench.entity_name})` : ""}`);
+  if (obj(r.test_vectors)) items.push(`Test vectors${r.test_vectors.num_vectors != null ? ` (${r.test_vectors.num_vectors} rows)` : ""}`);
+  if (typeof r.project_dir === "string" && r.project_dir) items.push(`Project folder: ${r.project_dir}`);
+  if (obj(r.simulation)) items.push(`Dry run: ${r.simulation.verdict || "no verdict"}`);
+  if (obj(r.implementation)) items.push(`Chip layout: ${r.implementation.verdict || "no verdict"}`);
+  return items;
+}
+
 // Order and renderer for each key the orchestrator may put in `results`.
 const ORCH_SECTIONS = [
   ["spec", "Spec", fillSpecBody],
@@ -981,6 +1142,11 @@ function renderOrchestratorPanel(run) {
   if (fr.error) add(panelLine(`Error: ${fr.error}`, "status error"));
 
   const results = fr.results && typeof fr.results === "object" ? fr.results : {};
+  const produced = producedItems(results);
+  if (produced.length) {
+    add(panelLabel("What was produced"));
+    add(panelList(produced, ""));
+  }
   const present = ORCH_SECTIONS.filter(([key]) => results[key] && typeof results[key] === "object");
   if (!present.length) add(panelLine("No agent results recorded.", "status"));
   present.forEach(([key, title, fill]) => {
@@ -1005,17 +1171,357 @@ function renderOrchestratorPanel(run) {
   block.classList.remove("hidden");
 }
 
-// One flat timeline row (#, event, detail, status, duration).
+// ── Event timeline rows (all agents and the orchestrator) ────────────
+// One compact row per event; a click opens a full-width detail row below it
+// holding the complete record: the event's own data plus the matching
+// run.tool_calls / run.llm_calls entry (full arguments, full tool output,
+// full prompt and response). Expansion state is keyed
+// "<run id>:<event type>:<step>:<ordinal>" and survives the table rebuilds
+// watchRun triggers on every SSE event.
+const evtOpen = new Map();
+let evtRows = [];                                   // rows on screen, for Expand/Collapse all
+let evtCtx = { run: null, tools: {}, llms: {}, seen: {} };
+
+function setEventContext(run) {
+  const tools = {}, llms = {};
+  (run.tool_calls || []).forEach((t) => { (tools[t.step] = tools[t.step] || []).push(t); });
+  (run.llm_calls || []).forEach((c) => { llms[c.step] = c; });
+  evtCtx = { run, tools, llms, seen: {} };
+  evtRows = [];
+}
+function setAllEventDetails(open) {
+  evtRows.forEach((r) => { evtOpen.set(r.key, open); r.refresh(); });
+}
+// Hide/show a timeline row together with its detail row (used by the
+// orchestrator's collapsible groups).
+function setRowHidden(tr, hidden) {
+  if (tr._evt) tr._evt.setHidden(hidden);
+  else tr.classList.toggle("hidden", hidden);
+}
+
 function eventRow(e, typeLabel, detail) {
   const tr = document.createElement("tr");
-  const cls = e.status === "ok" ? "badge-ok" : e.status === "error" ? "badge-error" : "";
+  tr.className = "evt-row";
+  const cls = ["ok", "COMPLETE"].includes(e.status) ? "badge-ok" : ["error", "FAILED"].includes(e.status) ? "badge-error"
+    : ["NEEDS_REVIEW", "WAITING_FOR_USER"].includes(e.status) ? "badge-warn"
+    : ["stopped", "requested"].includes(e.status) ? "badge-cancelled" : "";
   tr.innerHTML = `
-      <td>${e.step ?? ""}</td>
-      <td>${escapeHtml(typeLabel || e.event_type)}</td>
-      <td>${escapeHtml(detail != null ? detail : eventDetail(e))}</td>
-      <td><span class="${cls}">${escapeHtml(e.status || "")}</span></td>
-      <td>${e.duration_ms != null ? formatMs(e.duration_ms) : ""}</td>`;
+      <td data-label="#">${e.step ?? ""}</td>
+      <td data-label="Event">${escapeHtml(typeLabel || e.event_type)}</td>
+      <td data-label="Detail"><span class="evt-toggle">▸</span>${e.event_type === "llm_call" ? ctxBadgeHtml(e) : ""}<span class="evt-summary">${escapeHtml(detail != null ? detail : eventDetail(e))}</span></td>
+      <td data-label="Status"><span class="${cls}">${escapeHtml(e.status || "")}</span></td>
+      <td data-label="Duration">${e.duration_ms != null ? formatMs(e.duration_ms) : ""}</td>`;
+  const k = `${e.event_type}:${e.step}`;
+  const n = (evtCtx.seen[k] = (evtCtx.seen[k] || 0) + 1);
+  const key = `${evtCtx.run ? evtCtx.run.id : ""}:${k}:${n}`;
+  let detailRow = null;
+  const row = { key, tr, isOpen: () => evtOpen.get(key) === true };
+  // The detail row is built lazily on first open (LLM prompts can be large)
+  // and only once the summary row is in the table.
+  row.refresh = () => {
+    const open = row.isOpen();
+    tr.querySelector(".evt-toggle").textContent = open ? "▾" : "▸";
+    tr.classList.toggle("evt-open", open);
+    if (open && !detailRow && tr.parentNode) {
+      detailRow = document.createElement("tr");
+      detailRow.className = "evt-detail";
+      tr.classList.forEach((c) => { if (c.startsWith("orch-agent-") || c === "orch-nested") detailRow.classList.add(c); });
+      const td = document.createElement("td");
+      td.colSpan = 5;
+      td.appendChild(buildEventDetail(e));
+      detailRow.appendChild(td);
+      tr.insertAdjacentElement("afterend", detailRow);
+    }
+    if (detailRow) detailRow.classList.toggle("hidden", !open || tr.classList.contains("hidden"));
+  };
+  row.setHidden = (hidden) => {
+    tr.classList.toggle("hidden", hidden);
+    if (detailRow) detailRow.classList.toggle("hidden", hidden || !row.isOpen());
+  };
+  tr.addEventListener("click", (ev) => {
+    if (ev.target.closest("button, a") || (window.getSelection && String(window.getSelection()))) return;
+    evtOpen.set(key, !row.isOpen());
+    row.refresh();
+  });
+  tr._evt = row;
+  evtRows.push(row);
   return tr;
+}
+
+function prettyJson(v) { return typeof v === "string" ? v : JSON.stringify(v, null, 2); }
+function messageText(m) {
+  const c = m && m.content;
+  return typeof c === "string" ? c : (c == null ? "" : JSON.stringify(c, null, 2));
+}
+
+// Tool output as recorded from the LangChain ToolMessage: a plain string or
+// an MCP content list [{type:"text", text:...}]. Returns the joined text.
+function unwrapToolOutput(output) {
+  if (Array.isArray(output)) {
+    return output.map((p) => (p && typeof p === "object" && typeof p.text === "string") ? p.text
+      : (typeof p === "string" ? p : JSON.stringify(p, null, 2))).join("\n");
+  }
+  if (output && typeof output === "object") return JSON.stringify(output, null, 2);
+  return output == null ? "" : String(output);
+}
+// String fields of a tool result that are console logs (xsim / xvhdl / Vivado
+// batch output): shown as their own log blocks with real newlines.
+const LOG_FIELDS = ["sim_output", "stdout", "stderr", "log_excerpt", "log", "elaboration_output", "compile_output"];
+function collectLogFields(obj, path, out) {
+  if (!obj || typeof obj !== "object") return;
+  if (Array.isArray(obj)) { obj.forEach((v, i) => collectLogFields(v, `${path}[${i}]`, out)); return; }
+  Object.keys(obj).forEach((k) => {
+    const v = obj[k];
+    const p = path ? `${path}.${k}` : k;
+    if (LOG_FIELDS.includes(k) && typeof v === "string" && v.trim()) out.push({ path: p, text: v });
+    else if (v && typeof v === "object") collectLogFields(v, p, out);
+  });
+}
+const TRUNC_NOTE = "This text was cut when it was captured (marker in the text): the recorder stores at most 4000 chars " +
+  "of a tool output and the Vivado MCP server caps console output at 4000 chars. Raise those caps for new runs; old runs cannot be recovered.";
+function noteIfTruncated(box, text) {
+  if (/\[truncated[, ]/.test(text)) box.appendChild(panelLine(TRUNC_NOTE, "status warn"));
+}
+
+function renderToolOutput(box, output) {
+  const text = unwrapToolOutput(output);
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (_) { parsed = null; }
+  if (parsed && typeof parsed === "object") {
+    const logs = [];
+    collectLogFields(parsed, "", logs);
+    logs.forEach((l) => box.appendChild(copyableCodeBlock(`${l.path} (${l.text.length.toLocaleString()} chars)`, l.text)));
+    box.appendChild(copyableCodeBlock("result (JSON)", JSON.stringify(parsed, null, 2)));
+  } else {
+    box.appendChild(copyableCodeBlock(`output (${text.length.toLocaleString()} chars)`, text || "(empty)"));
+  }
+  noteIfTruncated(box, text);
+}
+
+// ── Orchestrator hand-off / notebook events ──────────────────────────
+// Around every helper call the orchestrator records exactly what it handed
+// over (agent_input), exactly what came back (agent_output) and its notebook
+// (state) before and after. One-line summaries for the timeline rows and
+// full panels below; long multi-line strings (VHDL, logs) are folded into
+// collapsed blocks so the JSON stays readable.
+const ORCH_META_EVENTS = ["agent_input", "agent_output", "state"];
+const toJson = (v) => (v === undefined ? "undefined" : JSON.stringify(v, null, 2));
+
+function isCodeString(v) { return typeof v === "string" && (v.split("\n").length >= 4 || v.length > 400); }
+function codeLabel(s) {
+  const n = s.split("\n").length;
+  const kind = /\b(entity|architecture|library\s+ieee|std_logic)\b/i.test(s) ? "VHDL code" : "text";
+  return `${kind}, ${n} line${n === 1 ? "" : "s"}`;
+}
+// Deep copy of `v` with every long string replaced by a short placeholder;
+// the strings themselves are pushed to `out` as {path, text}.
+function foldCode(v, path, out) {
+  if (isCodeString(v)) { out.push({ path, text: v }); return `<< ${codeLabel(v)} — expand below >>`; }
+  if (Array.isArray(v)) return v.map((x, i) => foldCode(x, `${path}[${i}]`, out));
+  if (v && typeof v === "object") {
+    const o = {};
+    Object.keys(v).forEach((k) => { o[k] = foldCode(v[k], path ? `${path}.${k}` : k, out); });
+    return o;
+  }
+  return v;
+}
+function dedupeFolded(list) {
+  const seen = new Set();
+  return list.filter((f) => !seen.has(f.path) && seen.add(f.path));
+}
+// Closed <details> holding a copyable code block.
+function collapsedCodeBlock(title, text) {
+  const det = document.createElement("details");
+  det.className = "msg-block code-fold";
+  const sum = document.createElement("summary");
+  sum.textContent = `${title} (click to expand)`;
+  det.appendChild(sum);
+  det.appendChild(copyableCodeBlock(title, text));
+  return det;
+}
+// Pretty JSON block followed by one collapsed block per folded string.
+function addJsonWithFoldedCode(box, title, value, rootPath) {
+  const folded = [];
+  const shown = foldCode(value, rootPath || "", folded);
+  box.appendChild(copyableCodeBlock(title, toJson(shown)));
+  dedupeFolded(folded).forEach((f) => box.appendChild(collapsedCodeBlock(`${f.path || title} — ${codeLabel(f.text)}`, f.text)));
+}
+// Short description of one value for a one-line summary.
+function describeValue(v) {
+  if (v == null) return "nothing";
+  if (isCodeString(v)) return codeLabel(v);
+  if (typeof v === "string") return `"${v.length > 40 ? v.slice(0, 40) + "…" : v}"`;
+  if (Array.isArray(v)) return `list of ${v.length}`;
+  if (typeof v === "object") {
+    const keys = Object.keys(v);
+    return `{${keys.slice(0, 5).join(", ")}${keys.length > 5 ? ", …" : ""}}`;
+  }
+  return String(v);
+}
+// Keys whose value differs between before and after; at the start (no
+// before) the keys that hold something.
+function stateChangedKeys(d) {
+  const before = d.before, after = d.after || {};
+  const empty = (v) => v == null || (Array.isArray(v) && !v.length) || (typeof v === "object" && !Object.keys(v).length);
+  if (!before || typeof before !== "object") return Object.keys(after).filter((k) => !empty(after[k]));
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  return [...keys].filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
+}
+function orchMetaSummary(e) {
+  const d = e.data || {};
+  const stage = d.stage || "?";
+  switch (e.event_type) {
+    case "agent_input": {
+      const items = Array.isArray(d.input) ? d.input : (d.input == null ? [] : [d.input]);
+      return `Handed to ${stage}: ${items.length ? items.map(describeValue).join(", ") : "nothing (reads the notebook)"}`;
+    }
+    case "agent_output": {
+      const out = (d.output && typeof d.output === "object") ? d.output : {};
+      const status = e.status || out.status || "done";
+      const err = out.error ? ` — error: ${String(out.error).slice(0, 120)}` : "";
+      const keys = Object.keys(out).filter((k) => !["status", "error"].includes(k) && out[k] != null);
+      return `${stage} answered: ${status}${err}${keys.length ? ` (${keys.join(", ")})` : ""}`;
+    }
+    case "state": {
+      const changed = stateChangedKeys(d);
+      const what = d.before ? "changed" : "set";
+      return `Notebook after ${stage} — ${changed.length ? `${what}: ${changed.join(", ")}` : "nothing changed"}`;
+    }
+    default: return "";
+  }
+}
+// Side-by-side before / after of the changed notebook fields.
+function stateDiffTable(before, after, keys, folded) {
+  const table = document.createElement("table");
+  table.className = "state-diff";
+  table.innerHTML = "<thead><tr><th>field</th><th>before</th><th>after</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  keys.forEach((k) => {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th");
+    th.textContent = k;
+    tr.appendChild(th);
+    [["before", before[k]], ["after", after[k]]].forEach(([side, v]) => {
+      const td = document.createElement("td");
+      const pre = document.createElement("pre");
+      pre.textContent = v === undefined ? "(not set)" : toJson(foldCode(v, `${side}.${k}`, folded));
+      td.appendChild(pre);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  return table;
+}
+// The whole notebook after the step, changed fields highlighted.
+function stateAfterBlock(after, changed, folded) {
+  const keys = Object.keys(after);
+  const lines = keys.map((k, i) => {
+    const text = `  ${JSON.stringify(k)}: ${toJson(foldCode(after[k], `after.${k}`, folded)).replace(/\n/g, "\n  ")}${i < keys.length - 1 ? "," : ""}`;
+    return changed.includes(k) ? `<mark class="state-changed">${escapeHtml(text)}</mark>` : escapeHtml(text);
+  });
+  return copyableCodeBlock("notebook after this step (JSON, changed fields highlighted)", toJson(after), `{\n${lines.join("\n")}\n}`);
+}
+function buildOrchMetaDetail(box, e) {
+  const d = e.data || {};
+  const stage = d.stage || "?";
+  const add = (n) => box.appendChild(n);
+  switch (e.event_type) {
+    case "agent_input": {
+      const items = Array.isArray(d.input) ? d.input : (d.input == null ? [] : [d.input]);
+      add(panelLine(`Handed to ${stage} — ${items.length} item(s)`, "evt-head"));
+      if (!items.length) add(panelLine("No arguments: the helper read what it needed from the notebook.", "status"));
+      items.forEach((v, i) => addJsonWithFoldedCode(box, `input ${i + 1} of ${items.length}: ${describeValue(v)}`, v, `input[${i}]`));
+      break;
+    }
+    case "agent_output": {
+      const out = d.output;
+      const status = e.status || (out && out.status) || "done";
+      add(panelLine(`${stage} answered — ${status}`, "evt-head"));
+      if (out && out.error) add(copyableCodeBlock("error", String(out.error)));
+      addJsonWithFoldedCode(box, "answer (JSON)", out === undefined ? null : out, "output");
+      break;
+    }
+    case "state": {
+      const after = (d.after && typeof d.after === "object") ? d.after : {};
+      const changed = stateChangedKeys(d);
+      const folded = [];
+      add(panelLine(`Notebook after ${stage}`, "evt-head"));
+      add(panelLine(changed.length ? `${d.before ? "Changed" : "Set"}: ${changed.join(", ")}` : "Nothing changed.", "status"));
+      if (d.before && typeof d.before === "object" && changed.length) add(stateDiffTable(d.before, after, changed, folded));
+      add(stateAfterBlock(after, changed, folded));
+      dedupeFolded(folded).forEach((f) => add(collapsedCodeBlock(`${f.path} — ${codeLabel(f.text)}`, f.text)));
+      break;
+    }
+    default: break;
+  }
+}
+
+function buildEventDetail(e) {
+  const d = e.data || {};
+  const box = document.createElement("div");
+  box.className = "evt-panel";
+  const add = (n) => box.appendChild(n);
+  const toolRec = (evtCtx.tools[e.step] || []).find((t) => !d.tool || t.tool_name === d.tool) || null;
+  try {
+    switch (e.event_type) {
+      case "tool_call": {
+        const input = toolRec ? toolRec.input : d.input;
+        add(panelLine(`${d.tool || "tool"} — arguments`, "evt-head"));
+        add(copyableCodeBlock("arguments (JSON)", prettyJson(input)));
+        if (typeof input === "string") noteIfTruncated(box, input);
+        break;
+      }
+      case "tool_result": {
+        add(panelLine(`${d.tool || "tool"} — result` + (toolRec ? ` | ${formatMs(toolRec.latency_ms || 0)} | ${toolRec.status}` : ""), "evt-head"));
+        if (!toolRec) {
+          add(panelLine("Full result not recorded yet (tool still running or record missing) — showing the event preview.", "status"));
+          add(copyableCodeBlock("output preview", String(d.output_preview || "")));
+          break;
+        }
+        if (toolRec.error) add(copyableCodeBlock("error", String(toolRec.error)));
+        renderToolOutput(box, toolRec.output);
+        break;
+      }
+      case "llm_call": {
+        const rec = evtCtx.llms[e.step];
+        if (!rec) {
+          add(panelLine("Full LLM record not stored yet — showing the event preview.", "status"));
+          add(copyableCodeBlock("output preview", String(d.output_preview || "")));
+          break;
+        }
+        add(panelLine(`${rec.model || ""} | ${formatMs(rec.latency_ms || 0)} | tokens in ${rec.input_tokens ?? "?"} / out ${rec.output_tokens ?? "?"}` +
+          ` | prompt ${rec.prompt_version || "-"} | ${rec.status}`, "status"));
+        add(panelLabel(`Prompt — ${(rec.input || []).length} message(s)`));
+        (rec.input || []).forEach((m, i) => {
+          const calls = m.tool_calls && m.tool_calls.length ? ` — calls ${m.tool_calls.map((t) => t.name).join(", ")}` : "";
+          const body = messageText(m) + (m.tool_calls && m.tool_calls.length ? "\n\n[tool_calls]\n" + JSON.stringify(m.tool_calls, null, 2) : "");
+          add(copyableCodeBlock(`[${i + 1}] ${m.role}${calls}`, body || "(empty)"));
+        });
+        add(panelLabel("Response"));
+        const out = rec.output || {};
+        if (rec.error) add(copyableCodeBlock("error", String(rec.error)));
+        add(copyableCodeBlock("content", messageText(out) || "(empty)"));
+        if (out.tool_calls && out.tool_calls.length) add(copyableCodeBlock("tool calls (JSON)", JSON.stringify(out.tool_calls, null, 2)));
+        break;
+      }
+      case "error":
+        add(copyableCodeBlock("error", String(d.error || d.llm_error || "")));
+        if (toolRec && toolRec.output != null) renderToolOutput(box, toolRec.output);
+        break;
+      case "agent_input":
+      case "agent_output":
+      case "state":
+        buildOrchMetaDetail(box, e);
+        break;
+      default:
+        break;
+    }
+  } catch (err) {
+    add(panelLine(`Could not render: ${err.message}`, "status error"));
+  }
+  add(detailsBlock("event record (raw JSON)", JSON.stringify(e, null, 2)));
+  return box;
 }
 
 // ── Orchestrator timeline ────────────────────────────────────────────
@@ -1037,8 +1543,16 @@ const ORCH_TOOL_AGENTS = {
 function isOrchTool(name) { return Object.prototype.hasOwnProperty.call(ORCH_TOOL_AGENTS, name); }
 
 // Expansion state of tool-call groups, keyed "<run id>:<step>"; kept across
-// the redraws watchRun triggers on every SSE event.
+// the redraws watchRun triggers on every SSE event. Groups are open unless
+// the user collapsed them (or pressed "Collapse all").
 const orchGroupOpen = new Map();
+// Groups of the timeline currently on screen, for Expand all / Collapse all.
+let orchGroups = [];
+function setAllOrchGroups(open) {
+  orchGroups.forEach((g) => { orchGroupOpen.set(g.key, open); g.refresh(); });
+}
+// CSS class carrying the per-agent colour band; "write_project" has no agent.
+function orchAgentClass(agent) { return `orch-agent-${agent || "none"}`; }
 
 // Is `e` the orchestrator's own event (vs. one nested in the open sub-agent
 // call `parent`)? Events come sorted by step, and a tool_result shares the
@@ -1055,6 +1569,9 @@ function isOrchestratorEvent(e, parent) {
       // Text-only reply: the orchestrator's final answer when no sub-agent
       // call is in progress, otherwise a sub-agent's structured output.
       return !parent || (parent.endTs != null && e.timestamp > parent.endTs);
+    case "agent_input":   // what the orchestrator handed to a helper
+    case "agent_output":  // what the helper answered
+    case "state": return true; // the orchestrator's notebook before/after
     default: return true; // run_started / run_completed / error / run_resumed
   }
 }
@@ -1093,37 +1610,43 @@ function orchToolOutcome(e, rec) {
 function renderOrchestratorTimeline(tbody, run) {
   const records = {};
   (run.tool_calls || []).forEach((t) => { if (isOrchTool(t.tool_name)) records[`${t.step}:${t.tool_name}`] = t; });
+  orchGroups = [];
 
   const startGroup = (e) => {
     const d = e.data || {};
     const agent = ORCH_TOOL_AGENTS[d.tool];
     const key = `${run.id}:${e.step}`;
+    const agentCls = orchAgentClass(agent);
     const tr = document.createElement("tr");
-    tr.className = "orch-group";
+    tr.className = `orch-group ${agentCls}`;
     tr.innerHTML = `
-      <td>${e.step ?? ""}</td>
-      <td>tool_call</td>
-      <td><span class="orch-toggle"></span><strong>${escapeHtml(d.tool)}</strong> → ${escapeHtml(agent || "file writes, no agent")}<span class="orch-count"></span></td>
-      <td><span class="orch-status">running...</span></td>
-      <td class="orch-ms"></td>`;
+      <td data-label="#">${e.step ?? ""}</td>
+      <td data-label="Event">tool_call</td>
+      <td data-label="Detail"><span class="orch-toggle"></span><strong>${escapeHtml(d.tool)}</strong> →
+        <span class="orch-agent-badge ${agentCls}">${escapeHtml(agent || "write_project (file writes, no agent)")}</span><span class="orch-count"></span></td>
+      <td data-label="Status"><span class="orch-status">running...</span></td>
+      <td data-label="Duration" class="orch-ms"></td>`;
     tbody.appendChild(tr);
-    const g = { tool: d.tool, step: e.step, endTs: null, tr, children: [] };
-    // Default: open while the call is in progress, collapsed once finished;
-    // a click overrides that for the rest of the session.
-    g.isOpen = () => (orchGroupOpen.has(key) ? orchGroupOpen.get(key) : g.endTs == null);
+    const g = { key, tool: d.tool, agentCls, step: e.step, endTs: null, tr, children: [] };
+    // Default: expanded so the sub-agent's inner work is visible; a click (or
+    // Expand/Collapse all) overrides that for the rest of the session.
+    g.isOpen = () => (orchGroupOpen.has(key) ? orchGroupOpen.get(key) : true);
     g.refresh = () => {
       const open = g.isOpen();
       tr.querySelector(".orch-toggle").textContent = open ? "▾" : "▸";
       tr.querySelector(".orch-count").textContent = ` (${g.children.length} nested event${g.children.length === 1 ? "" : "s"})`;
-      g.children.forEach((c) => c.classList.toggle("hidden", !open));
+      tr.classList.toggle("orch-group-open", open);
+      g.children.forEach((c) => setRowHidden(c, !open));
     };
     g.addChild = (child) => {
       g.children.push(child);
-      child.classList.toggle("hidden", !g.isOpen());
+      child.classList.add(agentCls);
+      setRowHidden(child, !g.isOpen());
       tr.querySelector(".orch-count").textContent = ` (${g.children.length} nested event${g.children.length === 1 ? "" : "s"})`;
     };
     tr.addEventListener("click", () => { orchGroupOpen.set(key, !g.isOpen()); g.refresh(); });
     g.refresh();
+    orchGroups.push(g);
     return g;
   };
   const finishGroup = (g, e) => {
@@ -1141,8 +1664,10 @@ function renderOrchestratorTimeline(tbody, run) {
     const d = e.data || {};
     const orch = isOrchestratorEvent(e, parent);
     // An orchestrator event recorded after the open call returned closes it
-    // (the `tools` wrapper step and the tool_result itself do not).
+    // (the `tools` wrapper step, the tool_result itself and the hand-off /
+    // notebook events written from inside the tool call do not).
     if (parent && orch && e.event_type !== "tool_result" && !(e.event_type === "agent_step" && d.node === "tools") &&
+        !ORCH_META_EVENTS.includes(e.event_type) &&
         (parent.endTs == null || e.timestamp > parent.endTs)) parent = null;
 
     if (orch && e.event_type === "tool_call") { parent = startGroup(e); return; }
@@ -1156,44 +1681,72 @@ function renderOrchestratorTimeline(tbody, run) {
       if (e.event_type === "llm_call") {
         const detail = d.tool_calls && d.tool_calls.length
           ? `call ${d.tool_calls.join(", ")}`
-          : `final answer: ${d.output_preview || "(empty)"}`;
+          : `final answer: ${stripTruncMarker(d.output_preview) || "(empty)"}`;
         tr = eventRow(e, "decision", detail);
       } else {
         tr = eventRow(e);
+        if (ORCH_META_EVENTS.includes(e.event_type)) tr.classList.add("orch-meta");
       }
       tr.classList.add("orch-top");
       tbody.appendChild(tr);
       return;
     }
-    const tr = eventRow(e);
+    // Sub-agent event: graph nodes show their node name ("decide",
+    // "generate_rtl", ...) as the detail, like the standalone timelines.
+    const tr = e.event_type === "agent_step" ? eventRow(e, "node", d.node || "") : eventRow(e);
     tbody.appendChild(tr);
     if (parent) { tr.classList.add("orch-nested"); parent.addChild(tr); }
   });
 }
 
+// Only the latest showAgentRun call may touch the DOM: a redraw from an SSE
+// step and the final refetch on `done` can overlap (each awaits the run and
+// the live state), and two callers appending after their awaits rendered the
+// timeline twice.
+let showRunSeq = 0;
+// " | largest context N tok, total input M tok" from the stored LLM records
+// (empty when no call reported its token counts).
+function contextSummary(llmCalls) {
+  const sizes = (llmCalls || []).map((c) => c.input_tokens).filter((n) => n != null);
+  if (!sizes.length) return "";
+  const max = Math.max(...sizes), total = sizes.reduce((a, b) => a + b, 0);
+  return ` | largest context ${fmtTok(max)} tok, total input ${fmtTok(total)} tok`;
+}
 async function showAgentRun(runId) {
+  const seq = ++showRunSeq;
   const res = await fetch(`/api/agent-runs/${runId}`);
-  if (!res.ok) return;
+  if (!res.ok || seq !== showRunSeq) return;
   const run = await res.json();
+  if (seq !== showRunSeq) return;
   $("#agent-run-panel").classList.remove("hidden");
   markSelectedRun(runId);
   $("#agent-run-meta").textContent =
     `run ${run.id.slice(0, 8)} | ${new Date(run.started_at * 1000).toLocaleString()} | ` +
     `${run.agent_name} v${run.agent_version || ""} | ${run.status} | ${run.duration_ms != null ? formatMs(run.duration_ms) : "-"}` +
     ` | model ${run.model || ""} | ${run.llm_calls.length} LLM call(s), ${run.tool_calls.length} tool call(s)` +
+    contextSummary(run.llm_calls) +
     (run.error ? ` | error: ${run.error}` : "");
   const agentResult = run.final_result || {};
   const agentError = run.error || agentResult.error;
   const meta = $("#agent-run-meta");
-  meta.classList.toggle("error", Boolean(agentError));
+  const cancelled = agentResult.status === "CANCELLED" || run.status === "stopped";
+  meta.classList.toggle("error", Boolean(agentError) && !cancelled);
+  meta.classList.toggle("cancelled", cancelled);
   if (agentResult.status) {
     meta.textContent += ` | agent: ${agentResult.status}` + (agentResult.error && !run.error ? ` — ${agentResult.error}` : "");
   }
 
+  const isOrch = run.agent_name === "orchestrator";
+  $("#agent-orch-tl-tools").classList.toggle("hidden", !isOrch);
+  // Clear and refill the timeline in one synchronous pass (no await between),
+  // so every render replaces the rows rather than adding to them.
   const tbody = $("#agent-events");
   tbody.innerHTML = "";
-  if (run.agent_name === "orchestrator") renderOrchestratorTimeline(tbody, run);
-  else run.events.forEach((e) => tbody.appendChild(eventRow(e)));
+  setEventContext(run);
+  if (isOrch) renderOrchestratorTimeline(tbody, run);
+  else { orchGroups = []; run.events.forEach((e) => tbody.appendChild(eventRow(e))); }
+  // Rows are in the table now: reopen the detail panels the user had open.
+  evtRows.forEach((r) => r.refresh());
 
   const llm = $("#agent-llm-calls");
   llm.innerHTML = "";
@@ -1270,7 +1823,7 @@ $("#agent-answer-btn").addEventListener("click", async () => {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Request failed");
     $("#agent-clarify").classList.add("hidden");
-    watchRun(data.run_id, $("#agent-run-status"), $("#agent-answer-btn"));
+    watchRun(data.run_id, $("#agent-run-status"), $("#agent-answer-btn"), agentSession.agent);
   } catch (err) {
     status.textContent = `Error: ${err.message}`;
     status.classList.add("error");
@@ -1342,8 +1895,65 @@ function resetPipelinePanels() {
   $("#pipeline-timings-panel").classList.add("hidden");
   $("#pipeline-review-panel").classList.add("hidden");
   $("#pipeline-rtl-panel").classList.add("hidden");
+  $("#pipeline-tv-panel").classList.add("hidden");
+  $("#pipeline-tb-panel").classList.add("hidden");
   $("#pipeline-approve-status").textContent = "";
   $("#pipeline-approve-status").classList.remove("error");
+}
+
+function fillNotesList(list, notes) {
+  list.innerHTML = "";
+  (notes || []).forEach((n) => {
+    const li = document.createElement("li");
+    li.textContent = n;
+    list.appendChild(li);
+  });
+}
+
+function pipelineBadgeClass(status) {
+  if (status === "COMPLETE") return "badge-ok";
+  if (status === "NEEDS_REVIEW") return "badge-warn";
+  return "badge-error";
+}
+
+// Test-vectors panel: one line when it worked, plain-words fallback otherwise
+// (MATLAB missing is normal — the testbench falls back to hand-written checks).
+function renderPipelineTestVectors(tv) {
+  tv = tv || {};
+  const st = tv.status || "FAILED";
+  const statusEl = $("#pipeline-tv-status");
+  statusEl.textContent = `Status: ${st}`;
+  statusEl.className = `status ${pipelineBadgeClass(st)}`;
+  const metaEl = $("#pipeline-tv-meta");
+  const v = tv.validation || {};
+  const csv = (tv.result && tv.result.csv_file) || "";
+  const csvName = csv ? csv.split(/[\\/]/).pop() : "";
+  if (st === "COMPLETE") {
+    const cols = (v.columns || []).join(", ");
+    metaEl.textContent =
+      `${v.num_vectors ?? "?"} rows, columns: ${cols || "?"}` + (csvName ? ` (${csvName})` : "");
+  } else {
+    const reasons = [tv.error, ...(tv.warnings || []), ...(v.issues || [])].filter(Boolean);
+    metaEl.textContent =
+      "Not generated — the testbench will use hand-written checks instead." +
+      (reasons.length ? ` ${reasons.join(" | ")}` : "");
+  }
+  $("#pipeline-tv-panel").classList.remove("hidden");
+}
+
+function renderPipelineTestbench(tbRes) {
+  tbRes = tbRes || {};
+  const st = tbRes.status || "FAILED";
+  const tb = tbRes.testbench || {};
+  const metaEl = $("#pipeline-tb-meta");
+  metaEl.textContent =
+    `Status: ${st} — Entity: ${tb.entity_name || "?"}` +
+    (tbRes.error ? ` — Error: ${tbRes.error}` : "");
+  metaEl.className = `status ${pipelineBadgeClass(st)}`;
+  $("#pipeline-tb-code").textContent = tb.code || "(no code returned)";
+  renderLint("#pipeline-tb-lint", tbRes.lint);
+  fillNotesList($("#pipeline-tb-notes"), [...(tb.notes || []), ...(tbRes.warnings || [])]);
+  $("#pipeline-tb-panel").classList.remove("hidden");
 }
 
 $("#pipeline-start-btn").addEventListener("click", async () => {
@@ -1410,7 +2020,7 @@ $("#pipeline-approve-btn").addEventListener("click", async () => {
     return;
   }
 
-  status.textContent = "Generating RTL...";
+  status.textContent = "Generating RTL, test vectors and testbench...";
   $("#pipeline-approve-btn").disabled = true;
 
   try {
@@ -1444,15 +2054,11 @@ $("#pipeline-approve-btn").addEventListener("click", async () => {
         });
       }
       renderTimings("#pipeline-timings", timings);
-      const notesList = $("#pipeline-rtl-notes");
-      notesList.innerHTML = "";
-      (rtl.notes || []).forEach((n) => {
-        const li = document.createElement("li");
-        li.textContent = n;
-        notesList.appendChild(li);
-      });
+      fillNotesList($("#pipeline-rtl-notes"), rtl.notes);
       $("#pipeline-rtl-panel").classList.remove("hidden");
-      status.textContent = "RTL generated.";
+      renderPipelineTestVectors(data.test_vectors);
+      renderPipelineTestbench(data.testbench);
+      status.textContent = "RTL, test vectors and testbench generated.";
     } else {
       status.textContent = "Unexpected pipeline status: " + data.status;
       status.classList.add("error");

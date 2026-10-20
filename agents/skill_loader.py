@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 from pathlib import Path
+from typing import Callable
 
 from langchain_mcp_adapters.tools import load_mcp_tools
 
@@ -41,12 +42,14 @@ class SkillLoader:
         self.skills_dir = skills_dir
         self.project_dir = str(project_dir)
 
-    def load(self) -> dict[str, str]:
-        """{file name: content} for every file in skills_dir. Raises
-        RuntimeError when the directory cannot be listed or a file read."""
-        return _run(self.aload())
+    def load(self, keep: Callable[[str], bool] | None = None) -> dict[str, str]:
+        """{file name: content} for every file in skills_dir, or only those
+        whose name passes `keep` (decided from the listing, so unwanted files
+        are never read). Raises RuntimeError when the directory cannot be
+        listed or a file read."""
+        return _run(self.aload(keep))
 
-    async def aload(self) -> dict[str, str]:
+    async def aload(self, keep: Callable[[str], bool] | None = None) -> dict[str, str]:
         client = get_mcp_client()
         async with client.session("files") as session:
             tools = {t.name: t for t in await load_mcp_tools(session)}
@@ -54,8 +57,11 @@ class SkillLoader:
                 {"path": self.skills_dir, "project_dir": self.project_dir}))
             if listing.startswith("ERROR"):
                 raise RuntimeError(f"cannot list {self.skills_dir}: {listing}")
+            names = [n.strip() for n in listing.splitlines() if n.strip()]
+            if keep is not None:
+                names = [n for n in names if keep(n)]
             skills: dict[str, str] = {}
-            for name in (n.strip() for n in listing.splitlines() if n.strip()):
+            for name in names:
                 content = _text(await tools["read_file"].ainvoke(
                     {"path": f"{self.skills_dir}/{name}", "project_dir": self.project_dir}))
                 if content.startswith("ERROR"):

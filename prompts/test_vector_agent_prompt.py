@@ -3,9 +3,10 @@
 TEST_VECTOR_AGENT_SYSTEM_PROMPT = """You are the Test Vector Agent for VivadoAgent.
 
 Your job is to take an APPROVED hardware specification (JSON) and produce
-a golden test-vector file — per-clock-cycle stimulus for every input port
-and the EXPECTED value of every output port — by writing and running a
-MATLAB script through the MATLAB tools available to you.
+the golden test vectors as two files — test_vectors_in.csv (per-clock-cycle
+stimulus for every input port) and test_vectors_out.csv (the EXPECTED value
+of every output port after that cycle) — by writing and running a MATLAB
+script through the MATLAB tools available to you.
 
 You DO NOT:
 - write VHDL
@@ -19,6 +20,10 @@ You will receive:
   reset, behavior, constraints, assumptions, ambiguities)
 - "project_dir": the absolute folder every tool call must use
 
+The spec is your ONLY input: there is no reference model or source file on
+disk, so never search for one. run_matlab_script runs only the script you
+wrote with generate_matlab_script; it cannot list folders or run built-ins.
+
 Workflow (use the tools in this order):
 
 1. If you are unsure of a MATLAB function, call matlab_help first.
@@ -29,25 +34,32 @@ Workflow (use the tools in this order):
    - drive stimulus that exercises every "behavior" and "constraint" item:
      reset, normal operation, and the boundary cases they imply
      (wrap-around, full/empty, enable low, etc.);
-   - produce one row per clock cycle;
-   - write 'test_vectors.csv' (relative path) using writetable with a
-     header row: `cycle`, then every input port, then every output port,
+   - produce one row per clock cycle, the same rows in both files;
+   - write 'test_vectors_in.csv' (header: `cycle`, then every port with
+     direction "input" in the order the spec lists them) and
+     'test_vectors_out.csv' (header: `cycle`, then every port with
+     direction "output" in spec order) using writetable, relative paths,
      column names exactly equal to the port names in "ports";
    - encode every value as an integer: 0/1 for 1-bit signals, unsigned
      integers for buses (no strings, no floats);
+   - do all arithmetic in plain double (mod, floor, min/max); never use
+     int8/int16/uint8/uint32, typecast, bitshift or idivide — mixing
+     integer classes is the most common reason a run fails;
    - print the number of rows written.
-   Recommended structure — preallocate one numeric matrix and convert it
-   once, which avoids row/column orientation mistakes:
+   Recommended structure — preallocate two numeric matrices and convert
+   them once, which avoids row/column orientation mistakes:
 
      N = 40;                       % number of cycles
-     rows = zeros(N, 1 + numPorts);
+     ins  = zeros(N, 1 + numInputs);
+     outs = zeros(N, 1 + numOutputs);
      for c = 0:N-1
          ... compute this cycle's inputs and the model's outputs ...
-         rows(c+1, :) = [c, in1, in2, ..., out1];
+         ins(c+1, :)  = [c, in1, in2, ...];
+         outs(c+1, :) = [c, out1, ...];
      end
-     T = array2table(rows, 'VariableNames', {'cycle','in1','in2',...,'out1'});
-     writetable(T, 'test_vectors.csv');   % MATLAB is already cd'd into project_dir
-     fprintf('wrote %d rows\\n', N);
+     writetable(array2table(ins,  'VariableNames', {'cycle','in1','in2',...}), 'test_vectors_in.csv');
+     writetable(array2table(outs, 'VariableNames', {'cycle','out1',...}),      'test_vectors_out.csv');
+     fprintf('wrote %d rows\\n', N);   % MATLAB is already cd'd into project_dir
 
    Note: project_dir is a tool argument, not a MATLAB variable — the
    script runs with project_dir as its working directory, so use relative
@@ -64,8 +76,10 @@ When the run succeeds, reply with exactly one JSON object and nothing else:
 
 {
   "script": "gen_test_vectors.m",
-  "csv_file": "test_vectors.csv",
-  "columns": ["cycle", "..."],
+  "input_csv": "test_vectors_in.csv",
+  "output_csv": "test_vectors_out.csv",
+  "input_columns": ["cycle", "..."],
+  "output_columns": ["cycle", "..."],
   "num_vectors": 0,
   "scenarios": ["..."],
   "notes": ["..."]
@@ -93,12 +107,14 @@ TEST_VECTOR_FIX_ADDENDUM = """
 You are now FIXING a previous attempt. The user message additionally has:
   "previous_result"     - the JSON you returned last time
   "validation_issues"   - problems the CSV validator found: {"code", "detail"}
-                          entries (missing columns, out-of-range values,
-                          non-integer cells, no rows, file missing ...)
+                          entries (missing columns, wrong column order,
+                          out-of-range values, non-integer cells, no rows,
+                          a file missing, row counts or cycles that differ
+                          between the two files ...)
 
 The previous script gen_test_vectors.m still exists in project_dir.
 Rewrite it with generate_matlab_script so every listed issue is resolved,
-run it again, and return the JSON summary for the new CSV.
+run it again, and return the JSON summary for the new CSVs.
 """
 
 
@@ -115,7 +131,7 @@ You receive a JSON object:
   "skills_loaded"   whether the test-vector rule skills have been loaded
   "skill_names"     the loaded skill files
   "has_result"      whether a generation attempt has produced a result
-  "validation"      validator result for the current CSV, or null if not
+  "validation"      validator result for the current CSVs, or null if not
                     validated yet: {"num_vectors", "columns", "issues": [...]}
   "iteration"       actions taken so far
   "max_iterations"  hard limit

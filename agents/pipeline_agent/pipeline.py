@@ -1,11 +1,18 @@
-# agents/pipeline.py — spec_analyzer -> human review -> rtl_agent, with a
-# human-in-the-loop pause between the two agents.
+# agents/pipeline_agent/pipeline.py — the fixed-order pipeline:
+#   spec_analyzer -> human review -> rtl_agent -> test_vector_agent -> testbench_agent
+# with a human-in-the-loop pause between the first two steps.
 #
 # Follows LangGraph's documented human-in-the-loop pattern: interrupt()
 # pauses the "human_review" node and surfaces a payload to the caller.
 # Resuming requires a checkpointer (here, SQLite, so a pause survives a
 # server restart) and happens via graph.invoke(Command(resume=...), config)
 # against the same thread_id that was used to start the run.
+#
+# The testbench replays test_vectors_in.csv / test_vectors_out.csv at
+# simulation time (fixed layout: cycle, then the spec's input ports / output
+# ports, in spec order), so the test-vector step
+# must deliver a usable CSV before the project is simulated. The testbench
+# agent itself never receives the vectors.
 
 from __future__ import annotations
 
@@ -22,6 +29,8 @@ from agents.rtl_agent.rtl_linter import lint_rtl
 from agents.spec_analyser_agent.spec_analyzer_agent import call_spec_analyzer
 from agents.spec_analyser_agent.spec_evaluator import evaluate_spec
 from agents.spec_analyser_agent.spec_suggester import generate_suggestions
+from agents.test_vector_agent.test_vector_agent import run_test_vector_generation
+from agents.testbench_agent.testbench_agent import run_testbench_generation
 from services.checkpointer import checkpoints
 
 
@@ -33,6 +42,8 @@ class PipelineState(TypedDict):
     human_decision: str
     rtl: dict
     lint: dict
+    test_vectors: dict  # full result of run_test_vector_generation()
+    testbench: dict     # full result of run_testbench_generation()
 
 
 def analyze_spec_node(state: PipelineState) -> dict:
@@ -74,15 +85,32 @@ def generate_rtl_node(state: PipelineState) -> dict:
     return {"rtl": rtl, "lint": lint_rtl(state["spec"], rtl)}
 
 
+def generate_test_vectors_node(state: PipelineState) -> dict:
+    """Spec -> golden test-vector CSV via the test-vector agent (MATLAB).
+    The agent never raises: an unreachable LLM/MATLAB ends as status FAILED
+    with an error message, kept in the result for the human to see."""
+    return {"test_vectors": run_test_vector_generation(state["spec"])}
+
+
+def generate_testbench_node(state: PipelineState) -> dict:
+    """Spec + RTL -> testbench that replays the two test-vector CSVs, via the
+    testbench agent (lints its own output and retries)."""
+    return {"testbench": run_testbench_generation(state["spec"], state["rtl"])}
+
+
 def _build_graph() -> StateGraph:
     graph = StateGraph(PipelineState)
     graph.add_node("analyze_spec", analyze_spec_node)
     graph.add_node("human_review", human_review_node)
     graph.add_node("generate_rtl", generate_rtl_node)
+    graph.add_node("generate_test_vectors", generate_test_vectors_node)
+    graph.add_node("generate_testbench", generate_testbench_node)
     graph.add_edge(START, "analyze_spec")
     graph.add_edge("analyze_spec", "human_review")
     graph.add_edge("human_review", "generate_rtl")
-    graph.add_edge("generate_rtl", END)
+    graph.add_edge("generate_rtl", "generate_test_vectors")
+    graph.add_edge("generate_test_vectors", "generate_testbench")
+    graph.add_edge("generate_testbench", END)
     return graph
 
 
@@ -102,6 +130,8 @@ def _summarize(thread_id: str, result: dict) -> dict:
         "spec": result.get("spec"),
         "rtl": result.get("rtl"),
         "lint": result.get("lint"),
+        "test_vectors": result.get("test_vectors"),
+        "testbench": result.get("testbench"),
     }
 
 

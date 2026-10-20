@@ -23,6 +23,7 @@ from agents.rtl_agent.state import (
     MAX_ITERATIONS, MAX_STALLED_FIXES, Action, RTLAgentState, RTLStatus, initial_state,
 )
 from agents.rtl_agent.tools import RTLAgentTools
+from agents.vhdl_version import resolve_vhdl_version, skill_matches_version
 
 
 class RTLAgent:
@@ -55,8 +56,11 @@ class RTLAgent:
         }
 
     def load_skills_node(self, state: RTLAgentState) -> dict:
+        # skills/RTL holds one rulebook per VHDL edition; read only the one
+        # matching the spec so the two can never contradict each other.
+        version = resolve_vhdl_version(state["spec"])
         try:
-            skills = self.tools.skill_loader.load()
+            skills = self.tools.skill_loader.load(keep=lambda name: skill_matches_version(name, version))
         except Exception as e:  # skills improve quality but their absence must not kill the run
             return {"skills": {}, "skills_loaded": True,
                     "warnings": [*state.get("warnings", []), f"skills not loaded: {e}"]}
@@ -165,13 +169,14 @@ def run_rtl_generation(spec: dict) -> dict:
 
 
 def call_rtl_agent(spec: dict) -> str:
-    """One-shot generation, raw LLM text, with the skills applied (used by agents/pipeline.py)."""
+    """One-shot generation, raw LLM text, with the skills applied (used by agents/pipeline_agent/pipeline.py)."""
     tools = get_agent().tools
+    version = resolve_vhdl_version(spec)
     try:
-        skills = tools.skill_loader.load()
+        skills = tools.skill_loader.load(keep=lambda name: skill_matches_version(name, version))
     except Exception:
         skills = {}
     return tools.generator.generate_raw(spec, skills)
 
 
-from agents.rtl_agent.rtl_generator import parse_rtl_response  # noqa: E402,F401  re-export for agents/pipeline.py
+from agents.rtl_agent.rtl_generator import parse_rtl_response  # noqa: E402,F401  re-export for agents/pipeline_agent/pipeline.py

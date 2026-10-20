@@ -12,8 +12,35 @@ import tempfile
 
 from agents.lint_utils import compiler_errors
 from agents.mcp_utils import mcp_run_xvhdl, mcp_write_files
+from agents.vhdl_version import VHDL_93, resolve_vhdl_version, xvhdl_std
 
 _ENTITY_RE = re.compile(r"\bentity\s+(\w+)\s+is", re.IGNORECASE)
+
+# Constructs the rulebooks forbid, caught before the compiler so the model
+# gets a plain "forbidden" message instead of a cryptic VRFC error.
+_FORBIDDEN_EVERYWHERE = [
+    (re.compile(r"\buse\s+ieee\.std_logic_(arith|unsigned|signed)\b", re.IGNORECASE),
+     "deprecated Synopsys library ieee.std_logic_{0}; use ieee.numeric_std"),
+]
+_FORBIDDEN_IN_93 = [
+    (re.compile(r"\bprocess\s*\(\s*all\s*\)", re.IGNORECASE),
+     "process(all) is VHDL-2008 only; list the signals explicitly"),
+    (re.compile(r"\bstd_ulogic_vector\b", re.IGNORECASE),
+     "std_ulogic_vector is VHDL-2008 only; use std_logic_vector"),
+]
+
+
+def _forbidden_constructs(code: str, version: str) -> list[dict]:
+    rules = list(_FORBIDDEN_EVERYWHERE) + (list(_FORBIDDEN_IN_93) if version == VHDL_93 else [])
+    issues = []
+    for n, line in enumerate(code.splitlines(), 1):
+        stripped = line.split("--", 1)[0]          # ignore comments
+        for pattern, message in rules:
+            m = pattern.search(stripped)
+            if m:
+                issues.append({"code": "forbidden_construct",
+                               "detail": f"line {n}: {message.format(*m.groups())} >> {line.strip()}"})
+    return issues
 
 
 def _static_checks(spec: dict, rtl: dict) -> list[dict]:
@@ -53,14 +80,15 @@ def _static_checks(spec: dict, rtl: dict) -> list[dict]:
     return issues
 
 
-def _compile(code: str, entity: str | None) -> tuple[str | None, list[dict]]:
+def _compile(code: str, entity: str | None, version: str) -> tuple[str | None, list[dict]]:
     """Write the design through the file-server MCP and compile it with the
-    Vivado MCP server's run_xvhdl. Returns (compiler, issues); compiler is
-    None when Vivado is unavailable (static checks only)."""
+    Vivado MCP server's run_xvhdl in the spec's VHDL edition. Returns
+    (compiler, issues); compiler is None when Vivado is unavailable (static
+    checks only)."""
     name = f"{entity or 'design'}.vhd"
     with tempfile.TemporaryDirectory() as tmp:
         mcp_write_files(tmp, {name: code})
-        result = mcp_run_xvhdl(tmp, [(name, "93")])[0]
+        result = mcp_run_xvhdl(tmp, [(name, xvhdl_std(version))])[0]
     if result.get("error_class") == "environment":
         return None, []
     output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
@@ -71,11 +99,14 @@ def lint_rtl(spec: dict, rtl: dict) -> dict:
     """Returns {"compiler": "xvhdl" | None, "issues": [{code, detail}]}.
     compiler is None when only the static checks could run (Vivado or the
     MCP servers unavailable)."""
+    version = resolve_vhdl_version(spec)
     issues = _static_checks(spec, rtl)
     compiler = None
     if rtl.get("code"):
+        issues += _forbidden_constructs(rtl["code"], version)
         try:
-            compiler, compile_issues = _compile(rtl["code"], spec.get("entity_name") or rtl.get("entity_name"))
+            compiler, compile_issues = _compile(rtl["code"], spec.get("entity_name") or rtl.get("entity_name"),
+                                                version)
             issues += compile_issues
         except Exception as e:  # MCP server could not start / write failed
             issues.append({"code": "compiler_failed", "detail": f"Compiler could not run: {e}"})

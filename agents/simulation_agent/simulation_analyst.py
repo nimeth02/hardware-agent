@@ -47,6 +47,31 @@ def parse_analysis_response(raw: str, sim: dict | None) -> dict:
             "summary": "", "suggested_fix": None}
 
 
+# The Vivado MCP server now returns logs up to 200 KB so the UI can show the
+# whole xsim/xvhdl output. The LLM only needs the tail (assert messages and
+# the PASSED/FAILED marker come last), so trim at this boundary.
+LLM_LOG_TAIL = 6000
+
+
+def _tail(text, limit: int = LLM_LOG_TAIL):
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    return f"... [first {len(text) - limit} chars omitted for the LLM; full log in the run record]\n" + text[-limit:]
+
+
+def _trim_for_llm(compile_result: dict | None, sim: dict | None) -> tuple[dict | None, dict | None]:
+    """Copies of the compile/sim dicts with long log fields cut to a tail."""
+    compile_trimmed = None
+    if compile_result:
+        compile_trimmed = dict(compile_result)
+        compile_trimmed["results"] = [
+            {**r, "stdout": _tail(r.get("stdout")), "stderr": _tail(r.get("stderr"))}
+            for r in (compile_result.get("results") or [])
+        ]
+    sim_trimmed = {**sim, "sim_output": _tail(sim.get("sim_output"))} if sim else None
+    return compile_trimmed, sim_trimmed
+
+
 class SimulationAnalyst:
     def __init__(self, llm=None):
         self._llm = llm
@@ -61,12 +86,13 @@ class SimulationAnalyst:
         verdict = deterministic_verdict(compile_result, sim)
         if verdict is not None:
             return verdict
+        compile_for_llm, sim_for_llm = _trim_for_llm(compile_result, sim)
         payload = {
             "spec": project.get("spec"),
             "testbench_code": project.get("testbench_code"),
             "stage": "simulate" if (compile_result or {}).get("status") == "ok" else "compile",
-            "compile": compile_result,
-            "sim": sim,
+            "compile": compile_for_llm,
+            "sim": sim_for_llm,
         }
         handler = ObservabilityCallbackHandler(source=AGENT_NAME)
         response = self.llm.invoke(

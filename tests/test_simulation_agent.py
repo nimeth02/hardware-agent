@@ -15,7 +15,7 @@ from agents.simulation_agent.tools import SimulationAgentTools
 from services.config import REPO_ROOT
 
 PROJECT = {"name": "counter4", "dir": "C:/x/counter4", "src_files": ["src/counter4.vhd"], "tb_file": "tb/counter4_tb.vhd",
-           "top_entity": "counter4_tb", "spec": {"entity_name": "counter4"}, "test_vectors": "test_vectors.csv",
+           "top_entity": "counter4_tb", "spec": {"entity_name": "counter4"}, "test_vectors": ["test_vectors_in.csv", "test_vectors_out.csv"],
            "testbench_code": "entity counter4_tb is end;"}
 COMPILE_OK = {"status": "ok", "results": [{"status": "ok"}], "error_class": None}
 COMPILE_BAD = {"status": "error", "results": [{"status": "error", "stderr": "ERROR: syntax"}], "error_class": None}
