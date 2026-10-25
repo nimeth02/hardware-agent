@@ -74,6 +74,16 @@ the hardware, set:
 and put the missing information in "ambiguities".
 
 Do not invent requirements that the user did not provide.
+
+Packed fields: when one port carries several fields (for example a data
+word holding I, Q and a noise value), the behaviour must state the exact
+bit positions of every field, e.g. "I = bits 31:20, Q = bits 19:8,
+ns = bits 7:0", plus the signedness and format of each. Widths alone
+("I[11:0]") are not enough, because the RTL and the test vectors would each
+guess a different order. If the request does not give the positions, do NOT
+invent them: add a question to "ambiguities" asking for them and set
+"status" to "needs_clarification". The same applies to any bit-level layout
+(flags, status words, output packing order).
 """
 
 

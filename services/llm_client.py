@@ -41,3 +41,24 @@ def get_llm(**overrides) -> ChatOpenAI:
             temperature=0,
         )
     return _llm
+
+
+def get_llm_for_loop(**overrides) -> ChatOpenAI:
+    """A client with its OWN async HTTP connection pool, for code that runs
+    on a short-lived or private event loop (asyncio.run, a session thread).
+
+    The cached client — and every ChatOpenAI built with default settings —
+    shares one async httpx pool; a keep-alive connection opened on one loop
+    raises "Event loop is closed" when first reused on another. Observed as
+    the test-vector agent's first MATLAB attempt failing every run."""
+    import httpx
+
+    config = require_llm_config()
+    return ChatOpenAI(
+        base_url=f"{config['ollama_api_base']}/v1",
+        api_key="ollama",
+        model=config["model"],
+        temperature=0,
+        http_async_client=httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)),
+        **overrides,
+    )

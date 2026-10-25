@@ -30,9 +30,10 @@ class FakeGenerator(TestbenchGenerator):
         self.tbs = list(tbs)
         self.calls: list[dict] = []
 
-    def generate(self, spec, rtl, skills=None, previous_testbench=None, lint_issues=None):
+    def generate(self, spec, rtl, skills=None, previous_testbench=None, lint_issues=None, attempt=1, attempt_history=None):
         self.calls.append({"rtl": rtl, "skills": dict(skills or {}), "previous": previous_testbench,
-                           "lint_issues": list(lint_issues or [])})
+                           "lint_issues": list(lint_issues or []), "attempt": attempt,
+                           "attempt_history": list(attempt_history or [])})
         return self.tbs.pop(0) if len(self.tbs) > 1 else self.tbs[0]
 
 
@@ -92,6 +93,42 @@ def test_clean_lint_finalizes():
     out = make_agent([GOOD_TB], [CLEAN]).run(SPEC, RTL)
     assert out["status"] == TestbenchStatus.COMPLETE.value
     assert out["testbench"] == GOOD_TB and out["lint"] == CLEAN and out["error"] is None
+    assert out["requirement_id"] is None and out["attempt"] == 1            # called on its own: no orchestrator note
+
+
+EARLIER = [{"attempt": 1, "status": "COMPLETE", "error": None, "issues": None, "likely_cause": None,
+            "downstream": [{"stage": "simulate", "verdict": "fail", "failures": ["cannot open test_vectors_out.csv"],
+                            "summary": "wrong file name", "suggested_fix": "open test_vectors_out.csv"}]}]
+
+
+def test_the_agent_knows_which_orchestrator_call_it_is_and_tells_the_generator():
+    agent = make_agent([GOOD_TB], [CLEAN])
+    out = agent.run(SPEC, RTL, requirement_id="counter_T-11.35_D-16.10.2026", attempt=2, attempt_history=EARLIER)
+    assert out["requirement_id"] == "counter_T-11.35_D-16.10.2026" and out["attempt"] == 2
+    assert agent.tools.generator.calls[0]["attempt"] == 2                   # the writer is told it is the 2nd call
+    assert agent.tools.generator.calls[0]["attempt_history"] == EARLIER      # and how the 1st one went
+    first_call = make_agent([GOOD_TB], [CLEAN])
+    first_call.run(SPEC, RTL)                                               # called on its own: 1st call, no history
+    assert first_call.tools.generator.calls[0]["attempt"] == 1
+    assert first_call.tools.generator.calls[0]["attempt_history"] == []
+
+
+def test_on_a_later_attempt_the_generator_prompt_carries_the_orchestrator_feedback():
+    class Spy(FakeListChatModel):
+        seen: list = []
+
+        def _call(self, messages, *args, **kwargs):
+            Spy.seen.append(messages)
+            return super()._call(messages, *args, **kwargs)
+
+    Spy.seen = []
+    gen = TestbenchGenerator(llm=Spy(responses=['{"entity_name": "counter4_tb", "code": "x"}'] * 2))
+    gen.generate(SPEC, RTL)                                                 # 1st call: prompt unchanged
+    gen.generate(SPEC, RTL, attempt=2, attempt_history=EARLIER)             # 2nd call: told what went wrong before
+    first, second = Spy.seen
+    assert "attempt 2" not in first[0].content and "attempt_history" not in first[1].content
+    assert "This is attempt 2 for this requirement" in second[0].content and '"downstream"' in second[0].content
+    assert "cannot open test_vectors_out.csv" in second[1].content and '"rtl"' in second[1].content
 
 
 def test_lint_issues_trigger_a_fix_regeneration_with_feedback():
@@ -262,6 +299,61 @@ def test_replay_mistakes_that_compile_but_break_the_simulation_are_caught():
     assert _replay_checks(SPEC, bad) == [i for i in _replay_checks(SPEC, bad) if i["code"] == "self_comparison"]
 
 
+def test_right_number_of_reads_in_the_wrong_column_order_is_caught():
+    """The LLR demapper run: s_axis_tready sounds like an input, so the testbench
+    read it from the inputs file. Six reads per row (correct count), but the 32-bit
+    tdata landed in the integer meant for tready -> 'integer value is out of range'."""
+    from agents.testbench_agent.testbench_linter import _replay_checks
+    spec = {"entity_name": "llr", "ports": [
+        {"name": "aclk", "direction": "input", "width": "1"},
+        {"name": "aresetn", "direction": "input", "width": "1"},
+        {"name": "s_axis_tvalid", "direction": "input", "width": "1"},
+        {"name": "s_axis_tready", "direction": "output", "width": "1"},
+        {"name": "s_axis_tdata", "direction": "input", "width": "32"},
+        {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
+        {"name": "m_axis_tready", "direction": "input", "width": "1"},
+        {"name": "m_axis_tdata", "direction": "output", "width": "24"}]}
+    swapped = """
+      read(li, v_cycle); read(li, v_aclk); read(li, v_aresetn); read(li, v_s_axis_tvalid);
+      read(li, v_s_axis_tready); read_wide(li, v_s_axis_tdata);
+      read(lo, v_cycle_out); read(lo, v_m_axis_tvalid); read(lo, v_m_axis_tready); read_wide(lo, v_m_axis_tdata);
+    """
+    issues = [i for i in _replay_checks(spec, swapped) if i["code"] == "column_order_mismatch"]
+    assert len(issues) == 2                               # both files are read in the wrong order
+    assert "s_axis_tready is an OUTPUT" in issues[0]["detail"]
+
+    right = """
+      read(li, v_cycle); read(li, v_aclk); read(li, v_aresetn); read(li, v_s_axis_tvalid);
+      read_wide(li, v_s_axis_tdata); read(li, v_m_axis_tready);
+      read(lo, v_cycle_out); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+    """
+    assert _replay_checks(spec, right) == []
+
+
+def test_std_logic_val_on_a_csv_value_is_caught():
+    from agents.testbench_agent.testbench_linter import _static_checks
+    code = "entity counter4_tb is end; architecture a of counter4_tb is begin process begin wait; " \
+           "if detected /= std_logic'val(v_detected) then report \"x\"; end if; end process; end;"
+    found = [i for i in _static_checks(SPEC, RTL, {"entity_name": "counter4_tb", "code": code})
+             if i["code"] == "std_logic_val"]
+    assert len(found) == 1 and "'U' for 0" in found[0]["detail"]
+    ok = code.replace("detected /= std_logic'val(v_detected)", "(detected = '1') /= (v_detected = 1)")
+    assert not [i for i in _static_checks(SPEC, RTL, {"entity_name": "counter4_tb", "code": ok})
+                if i["code"] == "std_logic_val"]
+
+
+def test_treating_a_one_bit_port_as_a_bus_is_caught():
+    from agents.testbench_agent.testbench_linter import _static_checks
+    spec = {**SPEC, "ports": [{"name": "clk", "width": "1"}, {"name": "detected", "width": "1"},
+                              {"name": "count", "width": "4"}]}
+    code = "entity counter4_tb is end; architecture a of counter4_tb is begin process begin wait; " \
+           "report integer'image(to_integer(unsigned(detected))); " \
+           "report integer'image(to_integer(unsigned(count))); end process; end;"
+    found = [i for i in _static_checks(spec, RTL, {"entity_name": "counter4_tb", "code": code})
+             if i["code"] == "scalar_to_unsigned"]
+    assert len(found) == 1 and "'detected'" in found[0]["detail"]      # the 4-bit count is fine
+
+
 def test_agent_only_has_restricted_actions():
     assert {a.value for a in Action} == {"load_skills", "generate_testbench", "lint_testbench", "finalize_testbench"}
     nodes = set(make_agent([GOOD_TB], [CLEAN]).graph.get_graph().nodes) - {"__start__", "__end__"}
@@ -270,3 +362,37 @@ def test_agent_only_has_restricted_actions():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_streaming_designs_must_be_compared_in_beat_order_not_per_cycle():
+    """The LLR demapper runs: the vectors put the expected output on the row of
+    the input beat, the testbench compared on that same cycle, and the pipeline
+    answered later -> 'cycle 2: m_axis_tdata expected 24_50_141 got 0_0_0'."""
+    from agents.testbench_agent.testbench_linter import _streaming_checks
+    stream = {"entity_name": "llr", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+        ("aclk", "input", "1"), ("aresetn", "input", "1"),
+        ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
+        ("m_axis_tvalid", "output", "1"), ("m_axis_tready", "input", "1"), ("m_axis_tdata", "output", "24")]]}
+    per_cycle = """
+      wait until rising_edge(aclk); wait for 1 ns;
+      -- compare outputs only when output is valid
+      if v_m_axis_tvalid = 1 then
+        if m_axis_tdata /= v_m_axis_tdata then report "cycle mismatch" severity error; end if;
+      end if;
+    """
+    codes = [i["code"] for i in _streaming_checks(stream, per_cycle)]
+    assert codes == ["streaming_cycle_compare", "streaming_no_handshake_compare"]
+
+    beat_order = """
+      if v_m_axis_tvalid = 1 then exp_beats(n_exp) := v_m_axis_tdata; n_exp := n_exp + 1; end if;
+      ...
+      wait until rising_edge(aclk); wait for 1 ns;
+      if m_axis_tvalid = '1' and m_axis_tready = '1' then
+        if m_axis_tdata /= exp_beats(k_exp) then report "beat mismatch" severity error; end if;
+        k_exp := k_exp + 1;
+      end if;
+    """
+    assert _streaming_checks(stream, beat_order) == []
+
+    # a plain counter has no handshake ports: nothing to enforce
+    assert _streaming_checks(SPEC, per_cycle) == []

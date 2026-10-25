@@ -1,6 +1,6 @@
 # agents/testbench_agent/testbench_guard.py — deterministic guardrails
-# applied to every planner decision before the graph acts on it. The
-# planner (LLM) suggests; these rules, using only facts from the state,
+# applied to every decider decision before the graph acts on it. The
+# decider (LLM) suggests; these rules, using only facts from the state,
 # have the final say. Rules run in order; the first one that objects
 # replaces the decision.
 
@@ -39,7 +39,7 @@ def lint_before_finalize(decision: Decision, state: TestbenchAgentState) -> Deci
 
 
 def no_finalize_with_issues(decision: Decision, state: TestbenchAgentState) -> Decision | None:
-    """The linter decides when the testbench is done, not the planner."""
+    """The linter decides when the testbench is done, not the decider."""
     if decision.action is Action.FINALIZE_TESTBENCH and (state.get("lint") or {}).get("issues"):
         return Decision(Action.GENERATE_TESTBENCH, "guard: cannot finalize while the linter reports issues; fixing")
     return None

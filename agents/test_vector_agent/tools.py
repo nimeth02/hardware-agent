@@ -2,7 +2,7 @@
 # the Test Vector agent, bundled so tests can inject fakes:
 #
 #   generator     test_vector_generator.TestVectorGenerator     (LLM + MATLAB MCP tool loop)
-#   decider       test_vector_decider.TestVectorDecider         (LLM planner)
+#   decider       test_vector_decider.TestVectorDecider         (LLM, picks the next action)
 #   skill_loader  test_vector_skill_loader.TestVectorSkillLoader (file-server MCP, read-only)
 #   validator     test_vector_validator.validate_test_vectors   (deterministic)
 #

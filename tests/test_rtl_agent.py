@@ -4,6 +4,8 @@ are real."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
@@ -36,8 +38,10 @@ class FakeGenerator(RTLGenerator):
         self.rtls = list(rtls)
         self.calls: list[dict] = []
 
-    def generate(self, spec, skills=None, previous_rtl=None, lint_issues=None):
-        self.calls.append({"skills": dict(skills or {}), "previous": previous_rtl, "lint_issues": list(lint_issues or [])})
+    def generate(self, spec, skills=None, previous_rtl=None, lint_issues=None, attempt=1, attempt_history=None,
+                 starting_rtl=None):
+        self.calls.append({"skills": dict(skills or {}), "previous": previous_rtl, "lint_issues": list(lint_issues or []),
+                           "attempt": attempt, "attempt_history": list(attempt_history or []), "starting": starting_rtl})
         return self.rtls.pop(0) if len(self.rtls) > 1 else self.rtls[0]
 
 
@@ -110,6 +114,93 @@ def test_clean_lint_finalizes():
     assert out["status"] == RTLStatus.COMPLETE.value
     assert out["rtl"] == GOOD_RTL and out["lint"] == CLEAN
     assert out["error"] is None and out["warnings"] == []
+    assert out["requirement_id"] is None and out["attempt"] == 1            # called on its own: no orchestrator note
+
+
+EARLIER = [{"attempt": 1, "status": "NEEDS_REVIEW", "error": "lint issues remain",
+            "issues": [{"code": "name_mismatch", "detail": "Entity is 'wrong'"}]}]
+
+
+def test_the_agent_knows_which_orchestrator_call_it_is_and_tells_the_generator():
+    agent = make_agent([GOOD_RTL], [CLEAN])
+    out = agent.run(SPEC, requirement_id="counter_T-11.35_D-16.10.2026", attempt=2, attempt_history=EARLIER)
+    assert out["requirement_id"] == "counter_T-11.35_D-16.10.2026" and out["attempt"] == 2
+    assert agent.tools.generator.calls[0]["attempt"] == 2                   # the writer is told it is the 2nd call
+    assert agent.tools.generator.calls[0]["attempt_history"] == EARLIER      # and how the 1st one went
+    first_call = make_agent([GOOD_RTL], [CLEAN])
+    first_call.run(SPEC)                                                    # called on its own: 1st call, no history
+    assert first_call.tools.generator.calls[0]["attempt"] == 1
+    assert first_call.tools.generator.calls[0]["attempt_history"] == []
+
+
+def test_on_a_retry_the_generator_prompt_carries_the_earlier_attempts():
+    class Spy(FakeListChatModel):
+        seen: list = []
+
+        def _call(self, messages, *args, **kwargs):
+            Spy.seen.append(messages)
+            return super()._call(messages, *args, **kwargs)
+
+    Spy.seen = []
+    gen = RTLGenerator(llm=Spy(responses=['{"entity_name": "counter4", "code": "x"}'] * 2))
+    gen.generate(SPEC)                                                      # 1st call: prompt unchanged
+    gen.generate(SPEC, attempt=2, attempt_history=EARLIER)                  # 2nd call: told what went wrong before
+    first, second = Spy.seen
+    assert "attempt 2" not in first[0].content and first[1].content.startswith("{\n  \"entity_name\"")
+    assert "This is attempt 2 for this requirement" in second[0].content
+    assert "name_mismatch" in second[1].content and '"spec"' in second[1].content
+
+
+def test_on_a_retry_the_generator_is_told_what_the_simulation_blamed_on_the_rtl():
+    class Spy(FakeListChatModel):
+        seen: list = []
+
+        def _call(self, messages, *args, **kwargs):
+            Spy.seen.append(messages)
+            return super()._call(messages, *args, **kwargs)
+
+    Spy.seen = []
+    blamed = [{"attempt": 1, "status": "COMPLETE", "error": None, "issues": None, "likely_cause": None,
+               "downstream": [{"stage": "simulate", "verdict": "fail", "failures": ["cycle 3: count expected 0011 got 0010"],
+                               "summary": "count skips a value", "suggested_fix": "increment on every rising edge"}]}]
+    RTLGenerator(llm=Spy(responses=['{"entity_name": "counter4", "code": "x"}'])).generate(
+        SPEC, attempt=2, attempt_history=blamed)
+    system, user = Spy.seen[0]
+    assert '"downstream"' in system.content and "blamed this RTL" in system.content
+    assert "cycle 3: count expected 0011 got 0010" in user.content and "increment on every rising edge" in user.content
+
+
+def test_on_a_retry_the_generator_revises_the_previous_calls_rtl_instead_of_starting_over():
+    class Spy(FakeListChatModel):
+        seen: list = []
+
+        def _call(self, messages, *args, **kwargs):
+            Spy.seen.append(messages)
+            return super()._call(messages, *args, **kwargs)
+
+    Spy.seen = []
+    blamed = [{"attempt": 1, "status": "COMPLETE", "error": None, "issues": None, "likely_cause": None,
+               "downstream": [{"stage": "simulate", "verdict": "fail", "failures": ["cycle 3: count expected 0011 got 0010"],
+                               "summary": "count skips a value", "suggested_fix": "increment on every rising edge"}]}]
+    gen = RTLGenerator(llm=Spy(responses=['{"entity_name": "counter4", "code": "x"}'] * 3))
+    gen.generate(SPEC, attempt=2, attempt_history=blamed, starting_rtl=GOOD_RTL)
+    system, user = Spy.seen[0]
+    assert "REVISE that code" in system.content                              # told to edit, not rewrite
+    assert json.loads(user.content)["previous_code"] == GOOD_RTL["code"]     # and handed the code to edit
+    gen.generate(SPEC, attempt=2, attempt_history=blamed, starting_rtl=GOOD_RTL,
+                 previous_rtl=BAD_RTL, lint_issues=DIRTY["issues"])          # this run's own lint fix wins
+    system, user = Spy.seen[1]
+    assert "REVISE that code" not in system.content and "You are now FIXING" in system.content
+    assert json.loads(user.content)["previous_code"] == BAD_RTL["code"]
+    gen.generate(SPEC, attempt=1, starting_rtl=GOOD_RTL)                     # 1st call: nothing to revise
+    assert "previous_code" not in Spy.seen[2][1].content
+
+
+def test_the_agent_hands_the_previous_calls_rtl_to_the_generator_without_linting_it_first():
+    agent = make_agent([GOOD_RTL], [CLEAN])
+    agent.run(SPEC, attempt=2, attempt_history=EARLIER, previous_rtl=BAD_RTL)
+    assert agent.tools.generator.calls[0]["starting"] == BAD_RTL           # revise this
+    assert agent.tools.generator.calls[0]["previous"] is None              # but it is not this run's design yet
 
 
 # ── lint-driven fix loop ─────────────────────────────────────────────────
@@ -191,6 +282,16 @@ def test_invalid_llm_rtl_output_is_kept_as_code():
     assert parse_rtl_response(SPEC, '{"entity_name": "counter4", "code": "x"}')["code"] == "x"
 
 
+def test_comparing_with_an_others_aggregate_is_caught_before_xelab_would_refuse_it():
+    from agents.rtl_agent.rtl_linter import _forbidden_constructs
+    bad = "if count_next = (others => '0') then\nif v /= (others => '1') then"
+    found = _forbidden_constructs(bad, "93")
+    assert [i["code"] for i in found] == ["forbidden_construct"] * 2
+    assert "line 1" in found[0]["detail"] and "xelab" in found[0]["detail"]
+    ok = "count_reg <= (others => '0');\nv := (others => '1');\nif count_reg = 0 then\nif v = \"0000\" then"
+    assert _forbidden_constructs(ok, "93") == [] and _forbidden_constructs(ok, "2008") == []
+
+
 def test_agent_only_has_restricted_actions():
     assert {a.value for a in Action} == {"load_skills", "generate_rtl", "lint_rtl", "finalize_rtl"}
     nodes = set(make_agent([GOOD_RTL], [CLEAN]).graph.get_graph().nodes) - {"__start__", "__end__"}
@@ -199,3 +300,84 @@ def test_agent_only_has_restricted_actions():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_linter_flags_multiplier_width_and_double_writers():
+    from agents.rtl_agent.rtl_linter import _multiple_driver_issues, _multiplier_width_issues
+
+    narrow = ("signal d : signed(28 downto 0);\nsignal n : unsigned(7 downto 0);\n"
+              "signal p : signed(36 downto 0);\n"
+              "p <= d * resize(signed('0' & n), 37);\n")
+    assert _multiplier_width_issues(narrow)[0]["code"] == "multiplier_width"
+    assert not _multiplier_width_issues(narrow.replace("36 downto", "65 downto"))
+
+    two_writers = ("a: process(clk) begin if rising_edge(clk) then x <= y; end if; end process;\n"
+                   "b: process(clk) begin if rising_edge(clk) then\n"
+                   "  if y <= z then x <= z; end if; end if; end process;\n")
+    assert _multiple_driver_issues(two_writers)[0]["code"] == "multiple_drivers"
+    one_writer = two_writers.replace("then x <= z;", "then w <= z;")
+    assert not _multiple_driver_issues(one_writer)
+    assert _multiple_driver_issues("a: process(clk) begin x <= y; end process;\nx <= z;\n")
+
+
+def test_linter_catches_a_process_declaration_without_the_variable_keyword():
+    from agents.rtl_agent.rtl_linter import _process_declaration_issues
+    bad = ("signal sat_i : signed(11 downto 0);\n"                       # architecture signal: fine
+           "farrow: process(clk)\n"
+           "  temp_i : signed(47 downto 0);\n"                           # line 3: missing `variable`
+           "  variable temp_q : signed(47 downto 0);\n"
+           "  constant ONE : integer := 1;\n"
+           "  v2_mid_i, v2_mid_q : signed(15 downto 0);\n"               # line 6: missing `variable`
+           "begin\n  temp_i := (others => '0');\nend process;\n")
+    found = _process_declaration_issues(bad)
+    assert [i["code"] for i in found] == ["missing_variable_keyword"] * 2
+    assert "line 3" in found[0]["detail"] and "variable temp_i : ...;" in found[0]["detail"]
+    assert "line 6" in found[1]["detail"] and "v2_mid_i, v2_mid_q" in found[1]["detail"]
+    assert _process_declaration_issues(bad.replace("  temp_i :", "  variable temp_i :")
+                                       .replace("  v2_mid_i,", "  variable v2_mid_i,")) == []
+
+
+def test_linter_catches_unbalanced_parentheses_per_statement():
+    from agents.rtl_agent.rtl_linter import _unbalanced_parentheses_issues
+    bad = ("v0_i <= resize(signed('0' & x_0_i), 16);\n"                  # balanced: fine
+           "v1_i <= resize((-signed('0' & x_p2_i) + shift_left(signed('0' & x_p1_i), 1)\n"
+           "         - signed('0' & x_m1_i), COEF_WIDTH);\n"             # one ')' short
+           "report \"unbalanced ( in a string is fine\";\n")
+    found = _unbalanced_parentheses_issues(bad)
+    assert len(found) == 1 and found[0]["code"] == "unbalanced_parentheses"
+    assert "line 2" in found[0]["detail"] and "6 '(' but 5 ')'" in found[0]["detail"]
+    assert _unbalanced_parentheses_issues(bad.replace("COEF_WIDTH);", "COEF_WIDTH));")) == []
+
+    entity = ("entity counter_4bit_up is\n  port (\n    clk : in  std_logic;\n    rst : in  std_logic;\n"
+              "    count : out std_logic_vector(3 downto 0)\n  );\nend entity counter_4bit_up;\n"
+              "architecture rtl of counter_4bit_up is\n  signal count_reg : unsigned(3 downto 0) := (others => '0');\n"
+              "begin\n  count <= std_logic_vector(count_reg);\nend architecture rtl;\n")
+    assert _unbalanced_parentheses_issues(entity) == []                       # ';' inside port ( ... ) is not a split
+    broken = entity.replace("std_logic_vector(3 downto 0)\n", "std_logic_vector(3 downto 0\n")   # one ')' lost
+    found = _unbalanced_parentheses_issues(broken)
+    assert len(found) == 1 and "line 1" in found[0]["detail"] and "entity counter_4bit_up is" in found[0]["detail"]
+
+
+def test_compiler_follow_on_errors_are_hidden_so_the_root_causes_stand_out():
+    from agents.lint_utils import compiler_errors
+    src = "\n".join(f"line{n}" for n in range(1, 340))
+    out = "\n".join([
+        "ERROR: [VRFC 10-4982] syntax error near ';' [C:/tmp/tmpab12cd/timing_recovery.vhd:241]",
+        "ERROR: [VRFC 10-4982] syntax error near ')' [C:/tmp/tmpab12cd/timing_recovery.vhd:242]",
+        "ERROR: [VRFC 10-4982] syntax error near 'temp_i' [C:/tmp/tmpab12cd/timing_recovery.vhd:279]",
+        "ERROR: [VRFC 10-4982] syntax error near 'begin' [C:/tmp/tmpab12cd/timing_recovery.vhd:283]",
+        "ERROR: [VRFC 10-2977] 'temp_i' is not a variable [C:/tmp/tmpab12cd/timing_recovery.vhd:285]",
+        "ERROR: [VRFC 10-2977] 'temp_q' is not a variable [C:/tmp/tmpab12cd/timing_recovery.vhd:286]",
+        "ERROR: [VRFC 10-2977] 'result_i' is not a variable [C:/tmp/tmpab12cd/timing_recovery.vhd:293]",
+        "ERROR: [VRFC 10-2942] 'result_i' is illegal in an expression [C:/tmp/tmpab12cd/timing_recovery.vhd:301]",
+        "ERROR: [VRFC 10-4982] syntax error near ';' [C:/tmp/tmpab12cd/timing_recovery.vhd:316]",
+        "ERROR: [VRFC 10-4982] syntax error near 'if' [C:/tmp/tmpab12cd/timing_recovery.vhd:321]",
+        "ERROR: [VRFC 10-4982] syntax error near 'v2_mid_i' [C:/tmp/tmpab12cd/timing_recovery.vhd:337]",
+    ])
+    details = [i["detail"] for i in compiler_errors(out, src, 1)]
+    assert [d.split("[timing_recovery.vhd:")[1].split("]")[0] for d in details[:-1]] == ["241", "279", "337"]
+    assert details[-1].startswith("8 follow-on error(s) hidden")
+    assert all(i["code"] == "compile_error" for i in compiler_errors(out, src, 1))
+    independent = ("ERROR: [VRFC 10-1] 'a' is not declared [x.vhd:10]\n"
+                   "ERROR: [VRFC 10-1] 'b' is not declared [x.vhd:200]")       # far apart: both are roots
+    assert len(compiler_errors(independent, src, 1)) == 2

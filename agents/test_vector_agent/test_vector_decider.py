@@ -1,6 +1,7 @@
-# agents/test_vector_agent/test_vector_decider.py — LLM planner: state
-# summary -> next Action. It never judges the CSV (the validator does); the
-# agent's guardrails validate whatever it returns.
+# agents/test_vector_agent/test_vector_decider.py — the decider: the LLM
+# that picks the next Action from dto.decider_input_dto(state). It never
+# judges the CSV (the validator does); the agent's guardrails validate
+# whatever it returns.
 
 from __future__ import annotations
 
@@ -32,28 +33,29 @@ class TestVectorDecider:
             self._llm = get_llm()
         return self._llm
 
-    def decide(self, summary: dict) -> Decision:
+    def decide(self, decider_input: dict) -> Decision:
+        """decider_input: dto.decider_input_dto(state)."""
         handler = ObservabilityCallbackHandler(source=AGENT_NAME)
         response = self.llm.invoke(
-            [SystemMessage(content=TEST_VECTOR_DECISION_PROMPT), HumanMessage(content=json.dumps(summary, indent=2))],
+            [SystemMessage(content=TEST_VECTOR_DECISION_PROMPT), HumanMessage(content=json.dumps(decider_input, indent=2))],
             config={"callbacks": [handler]},
         )
-        return self.parse(response.content, summary)
+        return self.parse(response.content, decider_input)
 
     @staticmethod
-    def parse(raw: str, summary: dict) -> Decision:
+    def parse(raw: str, decider_input: dict) -> Decision:
         try:
             data = extract_json(raw)
             return Decision(Action(str(data.get("action", "")).strip().lower()), str(data.get("reason", "")))
         except (json.JSONDecodeError, ValueError, AttributeError):
-            # Unusable planner output: fall back to the obvious safe choice.
-            if not summary.get("skills_loaded"):
-                return Decision(Action.LOAD_SKILLS, "planner output invalid; loading skills")
-            if not summary.get("has_result"):
-                return Decision(Action.GENERATE_VECTORS, "planner output invalid; generating")
-            validation = summary.get("validation")
+            # Unusable decider output: fall back to the obvious safe choice.
+            if not decider_input.get("skills_loaded"):
+                return Decision(Action.LOAD_SKILLS, "decider output invalid; loading skills")
+            if not decider_input.get("has_result"):
+                return Decision(Action.GENERATE_VECTORS, "decider output invalid; generating")
+            validation = decider_input.get("validation")
             if validation is None:
-                return Decision(Action.VALIDATE_VECTORS, "planner output invalid; validating")
+                return Decision(Action.VALIDATE_VECTORS, "decider output invalid; validating")
             if validation.get("issues"):
-                return Decision(Action.GENERATE_VECTORS, "planner output invalid; fixing validation issues")
-            return Decision(Action.FINALIZE_VECTORS, "planner output invalid; vectors are clean")
+                return Decision(Action.GENERATE_VECTORS, "decider output invalid; fixing validation issues")
+            return Decision(Action.FINALIZE_VECTORS, "decider output invalid; vectors are clean")

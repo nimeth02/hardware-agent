@@ -9,3 +9,6 @@ mcp<2
 langchain-mcp-adapters
 matlabengine
 pytest
+streamlit
+httpx
+pandas

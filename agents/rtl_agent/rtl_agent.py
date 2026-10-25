@@ -7,7 +7,7 @@
 #                    +- finalize_rtl -> END (COMPLETE)
 #                    +- limit / fixes not converging -> END (NEEDS_REVIEW | FAILED)
 #
-# `decide` asks the LLM policy (RTLDecider) for the next action, then applies
+# `decide` asks the decider (RTLDecider, an LLM) for the next action, then applies
 # deterministic guardrails (rtl_guard): skills first, no finalize while the
 # linter reports issues, etc. Every generation is followed by the linter;
 # lint issues feed the next generation as fix instructions.
@@ -22,6 +22,7 @@ from agents.rtl_agent.rtl_guard import guard
 from agents.rtl_agent.state import (
     MAX_ITERATIONS, MAX_STALLED_FIXES, Action, RTLAgentState, RTLStatus, initial_state,
 )
+from agents.rtl_agent.dto import agent_result_dto, decider_input_dto
 from agents.rtl_agent.tools import RTLAgentTools
 from agents.vhdl_version import resolve_vhdl_version, skill_matches_version
 
@@ -48,7 +49,7 @@ class RTLAgent:
                 "last_action": None,
                 "error": stop_reason,
             }
-        decision = guard(self.tools.decider.decide(self.summary(state)), state)
+        decision = guard(self.tools.decider.decide(decider_input_dto(state)), state)
         return {
             "iteration": iteration + 1,
             "last_action": decision.action.value,
@@ -69,7 +70,10 @@ class RTLAgent:
     def generate_node(self, state: RTLAgentState) -> dict:
         lint_issues = (state.get("lint") or {}).get("issues") or []
         try:
-            rtl = self.tools.generator.generate(state["spec"], state.get("skills"), state.get("rtl"), lint_issues)
+            rtl = self.tools.generator.generate(state["spec"], state.get("skills"), state.get("rtl"), lint_issues,
+                                                attempt=state.get("attempt", 1),
+                                                attempt_history=state.get("attempt_history"),
+                                                starting_rtl=state.get("previous_rtl"))
         except Exception as e:  # LLM/transport failure: end the run, don't crash the caller
             return {"status": RTLStatus.FAILED.value, "error": f"RTL generation failed: {e}"}
         return {"rtl": rtl, "lint": None, "error": None}
@@ -119,34 +123,16 @@ class RTLAgent:
         return g
 
     # ── public API ───────────────────────────────────────────────────────
-    def run(self, spec: dict) -> dict:
-        return self.summarize(self.graph.invoke(initial_state(spec)))
-
-    @staticmethod
-    def summary(state: RTLAgentState) -> dict:
-        """Compact view handed to the planner."""
-        return {
-            "spec": state.get("spec"),
-            "skills_loaded": state.get("skills_loaded", False),
-            "skill_names": list((state.get("skills") or {}).keys()),
-            "has_rtl": state.get("rtl") is not None,
-            "lint": state.get("lint"),
-            "iteration": state.get("iteration", 0),
-            "max_iterations": MAX_ITERATIONS,
-        }
-
-    @staticmethod
-    def summarize(state: dict) -> dict:
-        return {
-            "status": state.get("status", RTLStatus.RUNNING.value),
-            "rtl": state.get("rtl"),
-            "lint": state.get("lint"),
-            "skills_used": list((state.get("skills") or {}).keys()),
-            "iteration": state.get("iteration", 0),
-            "decision_reason": state.get("decision_reason"),
-            "warnings": state.get("warnings", []),
-            "error": state.get("error"),
-        }
+    def run(self, spec: dict, requirement_id: str | None = None, attempt: int = 1,
+            attempt_history: list[dict] | None = None, previous_rtl: dict | None = None) -> dict:
+        """requirement_id / attempt / attempt_history: the orchestrator's note saying
+        which run this call belongs to, whether it is the 1st, 2nd, ... call for it,
+        and how the earlier calls went ({attempt, status, error, issues} each).
+        previous_rtl: the design the earlier call delivered; a retry revises it
+        instead of starting from the spec alone. It is NOT seeded as `rtl`:
+        the planner would lint and finalize it as-is instead of regenerating."""
+        return agent_result_dto(self.graph.invoke(
+            initial_state(spec, requirement_id, attempt, attempt_history, previous_rtl)))
 
 
 # ── module-level API (kept for existing callers) ───────────────────────────
@@ -163,9 +149,11 @@ def get_agent() -> RTLAgent:
         return _default_agent
 
 
-def run_rtl_generation(spec: dict) -> dict:
-    """Returns {"status", "rtl", "lint", "skills_used", "iteration", "decision_reason", "warnings", "error"}."""
-    return get_agent().run(spec)
+def run_rtl_generation(spec: dict, requirement_id: str | None = None, attempt: int = 1,
+                       attempt_history: list[dict] | None = None, previous_rtl: dict | None = None) -> dict:
+    """Returns {"status", "requirement_id", "attempt", "rtl", "lint", "skills_used", "iteration",
+    "decision_reason", "warnings", "error"}."""
+    return get_agent().run(spec, requirement_id, attempt, attempt_history, previous_rtl)
 
 
 def call_rtl_agent(spec: dict) -> str:

@@ -41,6 +41,8 @@ class EventType(str, Enum):
     AGENT_INPUT = "agent_input"        # orchestrator -> agent: exactly what it handed over
     AGENT_OUTPUT = "agent_output"      # agent -> orchestrator: exactly what came back
     STATE = "state"                    # orchestrator's state (notebook) before and after a step
+    QUESTION = "question"              # a running orchestrator is waiting for the user's answer
+    ANSWER = "answer"                  # the user's answer reached the waiting orchestrator
 
 
 class RunFinished(Exception):

@@ -2,7 +2,7 @@
 # Testbench agent, bundled so tests can inject fakes:
 #
 #   generator     testbench_generator.TestbenchGenerator       (LLM)
-#   decider       testbench_decider.TestbenchDecider           (LLM planner)
+#   decider       testbench_decider.TestbenchDecider           (LLM, picks the next action)
 #   skill_loader  testbench_skill_loader.TestbenchSkillLoader  (file-server MCP, read-only)
 #   linter        testbench_linter.lint_testbench              (deterministic)
 #

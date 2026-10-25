@@ -34,13 +34,15 @@ def _port_bits(port: dict) -> int | None:
 def _check_file(label: str, run_dir: str, name: str, ports: list[dict], issue) -> tuple[list[str], list[list[str]]]:
     """Header + data rows of one CSV, with its structural and value issues
     recorded. ([], []) when the file is missing or empty."""
+    expected = ["cycle"] + [p["name"] for p in ports]
+    layout = f"header must be exactly {expected} (cycle, then the {label} ports in spec order)"
     content = mcp_read_file(run_dir, name)
     if content is None:
-        issue("csv_missing", f"{name} was not created in {run_dir}.")
+        issue("csv_missing", f"{name} was not created in {run_dir}; {layout}.")
         return [], []
     rows = list(csv.reader(io.StringIO(content)))
     if not rows:
-        issue("csv_empty", f"{name} is empty.")
+        issue("csv_empty", f"{name} is empty; {layout}.")
         return [], []
     header, data = [h.strip() for h in rows[0]], rows[1:]
 
@@ -48,11 +50,9 @@ def _check_file(label: str, run_dir: str, name: str, ports: list[dict], issue) -
         issue("no_cycle_column", f"{name}: first column must be 'cycle'.")
     for p in ports:
         if p["name"] not in header:
-            issue("port_column_missing", f"{name}: no column for {label} port '{p['name']}'.")
-    expected = ["cycle"] + [p["name"] for p in ports]
+            issue("port_column_missing", f"{name}: no column for {label} port '{p['name']}'; {layout}; got {header}.")
     if ports and set(expected) <= set(header) and header != expected:
-        issue("column_order", f"{name}: columns must be exactly {expected} (cycle, then the {label} ports "
-                              f"in spec order); got {header}.")
+        issue("column_order", f"{name}: {layout}; got {header}.")
     if not data:
         issue("no_rows", f"{name}: header only — no test vectors.")
 
@@ -94,6 +94,15 @@ def validate_test_vectors(spec: dict, run_dir: str, result: dict) -> dict:
         if direction(p) not in ("input", "output"):
             issue("port_direction_unknown", f"Port '{p['name']}' has no direction in the spec; "
                                             f"cannot tell which file it belongs to.")
+
+    # The generator records how the LAST MATLAB run went in
+    # result["last_matlab_run"] = {"status": "ok" | "error" | "never_ran", "error": "..."}.
+    # The key is absent when an older caller (or a test fake) built the result.
+    # TODO(human): when the key is present and the status is not "ok", refuse the
+    # CSVs: call issue("matlab_run_failed", <plain message that includes the
+    # MATLAB error text so the next attempt can fix it>). Without this, a script
+    # that crashed after an earlier success leaves an old CSV that would pass.
+    last_run = result.get("last_matlab_run")
 
     in_name = result.get("input_csv") or INPUT_CSV
     out_name = result.get("output_csv") or OUTPUT_CSV

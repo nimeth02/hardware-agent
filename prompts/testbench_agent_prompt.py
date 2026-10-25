@@ -43,7 +43,9 @@ For every request:
    and width.
 3. Generate the clock as specified (use "frequency_mhz" if given, else
    100 MHz). The reset comes from the vectors (its column), not from you.
-4. REPLAY the CSVs (see the TEST-VECTOR REPLAY rule): derive each file's
+4. REPLAY the CSVs (see the TEST-VECTOR REPLAY rule; for a design with
+   s_axis_tvalid/m_axis_tvalid handshakes use the STREAMING DESIGNS rule
+   instead: compare output beats in order, not cycle by cycle): derive each file's
    column order from the spec's ports; per cycle read one row from each
    file (check their cycle numbers agree), drive the inputs, and after the
    rising edge compare every output with the outputs row. The CSVs are
@@ -108,6 +110,33 @@ object with:
 Return the complete corrected testbench (same JSON structure). Fix every
 listed issue, keep the checks that were already correct, and do not
 change the DUT's ports or behaviour expectations beyond what the spec says.
+"""
+
+
+# Appended when the orchestrator calls the agent again for the same
+# requirement (attempt 2, 3, ...) and hands over how the earlier calls went.
+TESTBENCH_RETRY_ADDENDUM = """
+
+This is attempt {ATTEMPT} for this requirement: your earlier attempt(s)
+were not accepted. The user message carries "attempt_history", one entry
+per earlier attempt: {"attempt", "status", "error", "issues"} — "issues"
+are the lint/compiler problems that remained when that attempt stopped.
+
+An entry may also have "downstream": a later simulation failed and blamed
+this testbench. Its "failures" quote what went wrong ("cycle N: port
+expected X got Y", a file that could not be opened, a missing PASSED/FAILED
+marker) and "suggested_fix" says what to change. Fix that first — a clean
+lint was not enough last time. Remember the expected values come from
+test_vectors_out.csv: fix how the testbench reads, times and compares them,
+not the values themselves.
+A "downstream" note with "second_opinion": true means the RTL was blamed
+first and rewritten without effect, so the fault may be in this testbench
+after all: check what its "summary" asks for (compare order, latency,
+handshake inputs). An entry may also have "human_note": what the person
+running the flow said to do. Follow it.
+
+Avoid every listed problem from the start of this testbench. A testbench
+that repeats any of them will be rejected again.
 """
 
 

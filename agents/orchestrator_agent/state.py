@@ -60,6 +60,10 @@ PRODUCES = {
     Stage.IMPLEMENT: "implementation",
 }
 
+# simulate / implement analysis "likely_cause" -> the stage whose work is blamed
+# ("environment", "constraints" and None blame nobody)
+BLAMED_STAGE = {"rtl": Stage.GENERATE_RTL, "testbench": Stage.GENERATE_TESTBENCH, "spec": Stage.ANALYZE_SPEC}
+
 
 class StageRecord(TypedDict, total=False):
     """How one helper went, kept per stage so the manager (and the UI) can
@@ -68,6 +72,7 @@ class StageRecord(TypedDict, total=False):
     status: str | None            # the helper's own status: COMPLETE / NEEDS_REVIEW / FAILED / WAITING_FOR_USER
     attempts: int                 # how many times this helper has been run in this run
     error: str | None             # the helper's "error" text from its last run, if any
+    attempt_history: list[dict]   # one entry per run of this helper, oldest first: {attempt, status, error, issues}
     issues: list | None           # the helper's remaining problems (lint issues, analysis), if any
     result: dict | None           # the helper's full last answer (the artifact is also copied to its field)
 

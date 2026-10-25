@@ -163,7 +163,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   color: var(--muted);
   font-family: ui-monospace, Consolas, monospace;
 }
-.code-block { margin-top: 6px; white-space: pre; }
+.code-block { margin-top: 6px; white-space: pre; overflow: auto; word-break: normal; tab-size: 4; }
 .copy-btn { padding: 3px 10px; font-size: 12px; }
 .vectors-table-wrap { max-height: 360px; overflow: auto; margin-bottom: 10px; }
 .vectors-table-wrap table { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
@@ -297,6 +297,7 @@ tr.evt-detail.orch-nested > td { font-size: 13px; font-family: inherit; }
 .evt-panel { min-width: 0; max-width: 100%; }
 .evt-panel .code-block-head { margin-top: 10px; }
 .evt-panel .result-box { margin: 0; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.evt-panel .result-box.vhdl-code { white-space: pre; overflow-wrap: normal; }
 .evt-panel .msg-block { margin-top: 10px; }
 .evt-head { font-size: 13px; font-weight: 600; color: var(--text); margin: 8px 0 0; }
 /* Orchestrator hand-off / notebook rows (agent_input, agent_output, state):
@@ -385,6 +386,9 @@ table.state-diff td pre { margin: 0; max-height: 220px; overflow: auto; white-sp
   border-radius: 0 4px 4px 0;
 }
 
+.answer-options li { cursor: pointer; }
+.answer-options li:hover { background: rgba(47, 111, 237, 0.18); }
+
 .suggestions-list .empty {
   border-left-color: var(--ok);
   background: rgba(30, 158, 106, 0.08);
@@ -425,3 +429,39 @@ details.msg-block summary { cursor: pointer; font-family: -apple-system, Segoe U
 .timings-list .t-ms { width: 90px; text-align: right; font-family: ui-monospace, Consolas, monospace; }
 .timings-list .t-total { font-weight: 600; border-bottom: none; }
 .timings-list .empty { color: var(--muted); border-bottom: none; }
+
+/* ── Errors for the FPGA engineer ── */
+.errors-panel { margin-top: 12px; border: 1px solid var(--border); border-left: 4px solid var(--error); border-radius: 6px; padding: 12px; background: var(--panel); }
+.errors-panel.clean { border-left-color: var(--ok); }
+.errors-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.err-req { margin-top: 10px; font-weight: 600; }
+.err-step { margin: 6px 0 0 8px; }
+.err-step summary { cursor: pointer; font-weight: 600; }
+.err-step.zero summary { color: var(--muted); font-weight: 400; }
+.err-attempt { margin: 4px 0 0 16px; font-size: 13px; }
+.err-attempt ul { margin: 2px 0 4px; padding-left: 20px; }
+.err-attempt li { color: var(--error); white-space: pre-wrap; word-break: break-word; }
+.err-attempt li.note { color: var(--muted); }
+.err-attempt li.lint { list-style: none; margin-left: -18px; margin-bottom: 6px; }
+.err-code { display: inline-block; padding: 0 6px; border-radius: 4px; background: var(--code-bg); border: 1px solid var(--border); font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--text); }
+.err-loc { display: inline-block; padding: 0 6px; border-radius: 4px; background: var(--error); color: #fff; font-family: ui-monospace, Consolas, monospace; font-size: 12px; margin-left: 4px; }
+.err-detail { display: block; margin-top: 2px; }
+.err-explain { margin: 4px 0 6px; padding: 6px 8px; border-left: 3px solid var(--border); color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.err-ok { color: var(--ok); font-weight: 600; }
+.err-badge { display: inline-block; min-width: 18px; padding: 0 6px; border-radius: 9px; background: var(--error); color: #fff; font-size: 12px; text-align: center; }
+.err-badge.zero { background: var(--ok); }
+.req-card { margin: 4px 0 6px 8px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--code-bg); font-size: 13px; }
+.req-card.folded .req-body { max-height: 120px; overflow: hidden; }
+.req-label { font-weight: 600; margin-right: 4px; }
+.req-line { margin: 2px 0; }
+.req-card ul { margin: 2px 0 4px; padding-left: 20px; }
+.req-text { white-space: pre-wrap; word-break: break-word; }
+.req-toggle { margin-top: 4px; border: none; background: none; color: #2563eb; cursor: pointer; padding: 0; font-size: 13px; }
+.err-tag { display: inline-block; padding: 0 6px; margin-left: 4px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+.err-tag.fixed { background: var(--ok); color: #fff; }
+.err-tag.open { background: var(--error); color: #fff; }
+.err-tag.carried { background: var(--border); color: var(--muted); font-weight: 400; }
+.err-attempt li.fixed, .err-attempt li.fixed .err-detail { color: var(--muted); text-decoration: line-through; }
+.err-attempt li.fixed .err-tag { text-decoration: none; }
+.errors-ask { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+.errors-ask textarea { width: 100%; margin-top: 8px; }

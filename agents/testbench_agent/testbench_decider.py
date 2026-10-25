@@ -1,6 +1,7 @@
-# agents/testbench_agent/testbench_decider.py — LLM planner: state summary
-# -> next Action. It never judges the testbench (the linter does); the
-# agent's guardrails validate whatever it returns.
+# agents/testbench_agent/testbench_decider.py — the decider: the LLM that
+# picks the next Action from dto.decider_input_dto(state). It never judges
+# the testbench (the linter does); the agent's guardrails validate whatever
+# it returns.
 
 from __future__ import annotations
 
@@ -32,28 +33,29 @@ class TestbenchDecider:
             self._llm = get_llm()
         return self._llm
 
-    def decide(self, summary: dict) -> Decision:
+    def decide(self, decider_input: dict) -> Decision:
+        """decider_input: dto.decider_input_dto(state)."""
         handler = ObservabilityCallbackHandler(source=AGENT_NAME)
         response = self.llm.invoke(
-            [SystemMessage(content=TESTBENCH_DECISION_PROMPT), HumanMessage(content=json.dumps(summary, indent=2))],
+            [SystemMessage(content=TESTBENCH_DECISION_PROMPT), HumanMessage(content=json.dumps(decider_input, indent=2))],
             config={"callbacks": [handler]},
         )
-        return self.parse(response.content, summary)
+        return self.parse(response.content, decider_input)
 
     @staticmethod
-    def parse(raw: str, summary: dict) -> Decision:
+    def parse(raw: str, decider_input: dict) -> Decision:
         try:
             data = extract_json(raw)
             return Decision(Action(str(data.get("action", "")).strip().lower()), str(data.get("reason", "")))
         except (json.JSONDecodeError, ValueError, AttributeError):
-            # Unusable planner output: fall back to the obvious safe choice.
-            if not summary.get("skills_loaded"):
-                return Decision(Action.LOAD_SKILLS, "planner output invalid; loading skills")
-            if not summary.get("has_testbench"):
-                return Decision(Action.GENERATE_TESTBENCH, "planner output invalid; generating")
-            lint = summary.get("lint")
+            # Unusable decider output: fall back to the obvious safe choice.
+            if not decider_input.get("skills_loaded"):
+                return Decision(Action.LOAD_SKILLS, "decider output invalid; loading skills")
+            if not decider_input.get("has_testbench"):
+                return Decision(Action.GENERATE_TESTBENCH, "decider output invalid; generating")
+            lint = decider_input.get("lint")
             if lint is None:
-                return Decision(Action.LINT_TESTBENCH, "planner output invalid; linting")
+                return Decision(Action.LINT_TESTBENCH, "decider output invalid; linting")
             if lint.get("issues"):
-                return Decision(Action.GENERATE_TESTBENCH, "planner output invalid; fixing lint issues")
-            return Decision(Action.FINALIZE_TESTBENCH, "planner output invalid; testbench is clean")
+                return Decision(Action.GENERATE_TESTBENCH, "decider output invalid; fixing lint issues")
+            return Decision(Action.FINALIZE_TESTBENCH, "decider output invalid; testbench is clean")

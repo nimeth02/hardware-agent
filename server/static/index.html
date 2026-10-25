@@ -47,7 +47,7 @@
     <div id="pipeline-rtl-panel" class="panel hidden">
       <label>Generated RTL</label>
       <p id="pipeline-rtl-meta" class="status"></p>
-      <pre id="pipeline-rtl-code" class="result-box"></pre>
+      <pre id="pipeline-rtl-code" class="result-box code-block"></pre>
       <label>Lint</label>
       <ul id="pipeline-rtl-lint" class="suggestions-list"></ul>
       <label>Notes</label>
@@ -63,7 +63,7 @@
     <div id="pipeline-tb-panel" class="panel hidden">
       <label>Testbench</label>
       <p id="pipeline-tb-meta" class="status"></p>
-      <pre id="pipeline-tb-code" class="result-box"></pre>
+      <pre id="pipeline-tb-code" class="result-box code-block"></pre>
       <label>Lint</label>
       <ul id="pipeline-tb-lint" class="suggestions-list"></ul>
       <label>Notes</label>
@@ -106,6 +106,29 @@
         <span id="agent-run-meta" class="status" style="flex:1"></span>
       </div>
       <div id="agent-use-row" class="examples-row hidden" style="margin-top:10px"></div>
+      <div id="agent-errors-block" class="errors-panel hidden">
+        <div class="errors-head">
+          <strong>Errors for the FPGA engineer</strong>
+          <span id="agent-errors-summary" class="status"></span>
+        </div>
+        <div id="agent-errors-body"></div>
+        <div class="errors-ask">
+          <label for="agent-errors-step">What should happen next?</label>
+          <div class="row" style="margin-top:6px; justify-content:flex-start; flex-wrap:wrap; gap:8px">
+            <span class="status">Step:</span>
+            <select id="agent-errors-step"></select>
+            <button type="button" class="example-btn" data-err-action="retry-req">Retry this requirement</button>
+            <button type="button" class="example-btn" data-err-action="retry-step">Retry from this step</button>
+            <button type="button" class="example-btn" data-err-action="skip">Skip it</button>
+            <button type="button" class="example-btn" data-err-action="manual">I will fix it by hand, then continue</button>
+          </div>
+          <textarea id="agent-errors-text" rows="2" placeholder="Instructions for the AI (optional)..."></textarea>
+          <div class="row" style="margin-top:6px; justify-content:flex-start; gap:8px">
+            <button type="button" id="agent-errors-send">Send instructions</button>
+            <span id="agent-errors-status" class="status"></span>
+          </div>
+        </div>
+      </div>
       <div class="row" style="margin-top:12px; justify-content:flex-start; flex-wrap:wrap">
         <label style="margin:0">Timeline</label>
         <div id="agent-events-tools" class="examples-row" style="margin:0">
@@ -129,6 +152,8 @@
       <div id="agent-clarify" class="hidden" style="margin-top:14px">
         <label>The agent is waiting for you</label>
         <p id="agent-question" class="msg-block"></p>
+        <label id="agent-answer-options-label" class="hidden">Click a suggestion to use it as your answer (you can edit it)</label>
+        <ul id="agent-answer-options" class="suggestions-list answer-options"></ul>
         <textarea id="agent-answer" rows="3" placeholder="Your answer..."></textarea>
         <div class="row">
           <button id="agent-answer-btn">Answer &amp; resume session</button>

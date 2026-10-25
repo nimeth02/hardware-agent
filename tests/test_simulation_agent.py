@@ -251,3 +251,17 @@ def test_agent_only_has_restricted_actions():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_the_llm_sees_the_first_mismatches_and_the_end_of_a_long_log():
+    from agents.simulation_agent.simulation_analyst import _tail
+    warnings = "WARNING: HDL object x is of a type not supported\n" * 100
+    errors = "".join(f"Error: cycle {n}: m_axis_tdata expected 1 got 0\n" for n in range(3, 400))
+    log = warnings + errors + "Note: SIMULATION FAILED\n"
+    cut = _tail(log, head=500, tail=300)
+    assert cut.startswith(f"... [first {len(warnings)} chars omitted")      # the warnings before the first error go
+    assert "Error: cycle 3:" in cut and "Error: cycle 4:" in cut               # the earliest mismatches stay
+    assert cut.rstrip().endswith("SIMULATION FAILED")                          # and so does the marker
+    assert "chars omitted for the LLM" in cut[len(warnings) // 10:]            # the middle is cut
+    assert _tail("short log", head=500, tail=300) == "short log"
+    assert _tail(None) is None

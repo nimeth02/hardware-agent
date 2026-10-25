@@ -118,7 +118,21 @@ run it again, and return the JSON summary for the new CSVs.
 """
 
 
-# The planner: decides the next action from the current state. It never
+# Appended when the orchestrator calls the agent again for the same
+# requirement (attempt 2, 3, ...) and hands over how the earlier calls went.
+TEST_VECTOR_RETRY_ADDENDUM = """
+
+This is attempt {ATTEMPT} for this requirement: your earlier attempt(s)
+were not accepted. The user message carries "attempt_history", one entry
+per earlier attempt: {"attempt", "status", "error", "issues"} — "issues"
+are the CSV validation problems that remained when that attempt stopped.
+
+Avoid every listed problem from the start of this golden model. A result
+that repeats any of them will be rejected again.
+"""
+
+
+# The decider: picks the next action from the current state. It never
 # judges the CSV itself — the deterministic validator does.
 TEST_VECTOR_DECISION_PROMPT = """You are the planner of the Test Vector agent for VivadoAgent.
 

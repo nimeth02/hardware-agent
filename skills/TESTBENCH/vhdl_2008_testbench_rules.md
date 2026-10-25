@@ -53,6 +53,12 @@ of your input:
 The simulator stages both files in its working directory, so open them by
 their bare names.
 
+- Which file a port is in comes from its "direction" in the spec, NOT from
+  its name. On an AXI-Stream: `s_axis_tready` is an OUTPUT of the design
+  (outputs file), `m_axis_tready` is an INPUT (inputs file). List the
+  spec's ports once, keep only direction "input" for the inputs file and
+  only "output" for the outputs file, in the spec's order, and read in
+  exactly that order. One port in the wrong file shifts every later column.
 - The CSVs are the ONLY reference: never invent stimulus, expected values
   or extra checkpoints — the vectors already cover reset, normal operation
   and the boundary cases.
@@ -128,7 +134,18 @@ their bare names.
                 & integer'image(to_integer(unsigned(count))) severity error;
               errors := errors + 1;
             end if;
-            -- 1-bit output: if (flag = '1') /= (v_flag = 1) then ... end if;
+            -- 1-bit output (std_logic), complete form:
+            if (flag = '1') /= (v_flag = 1) then
+              report "cycle " & integer'image(v_cycle) & ": flag expected "
+                & integer'image(v_flag) & " got " & std_logic'image(flag) severity error;
+              errors := errors + 1;
+            end if;
+            --   NEVER std_logic'val(v_flag): position 0 is 'U' and 1 is 'X',
+            --   so every expected value is wrong ("expected 'U' got '0'").
+            --   NEVER unsigned(flag) / to_integer(unsigned(flag)) on a 1-bit
+            --   port: xvhdl "cannot convert type 'std_logic' to type
+            --   'unsigned'". NEVER "& flag &" in a report: a bare std_logic in
+            --   a string is "ambiguous &". Print it with std_logic'image(flag).
           end loop;
           file_close(in_file);
           file_close(out_file);
@@ -152,6 +169,61 @@ their bare names.
   value into the wrong variable. The cycle numbers go into two different
   variables (v_cycle, v_cycle_out); comparing a variable with itself
   checks nothing.
+
+═══════════════════════════════════════════════════════════════════
+STREAMING DESIGNS (spec has s_axis_tvalid/s_axis_tready/m_axis_tvalid/m_axis_tready)
+═══════════════════════════════════════════════════════════════════
+
+A pipelined stream design answers several cycles AFTER the input beat
+(the spec only bounds the latency, e.g. "<= 8 cycles"), and it may stall
+when m_axis_tready = '0'. The vectors cannot know the exact delay, so for
+these designs compare in BEAT ORDER, not cycle by cycle:
+
+- Still read both files row by row, every column, as above. A row of the
+  outputs file with m_axis_tvalid = 1 is one EXPECTED BEAT; collect them in
+  order (the k-th such row is the k-th expected output beat). Ignore the
+  `cycle` alignment of the outputs rows and ignore the s_axis_tready and
+  m_axis_tvalid columns as cycle-exact values.
+- Drive each inputs row for one cycle, except: a row with s_axis_tvalid = 1
+  is held (do not read the next row) until the rising edge at which the
+  DUT's s_axis_tready = '1', so the beat is really accepted.
+- On EVERY rising edge where m_axis_tvalid = '1' and m_axis_tready = '1',
+  compare m_axis_tdata with the next expected beat and advance to the
+  following one. A beat with nothing left to expect is an error
+  ("unexpected output beat").
+- After the last inputs row, keep clocking with s_axis_tvalid = '0' and
+  m_axis_tready = '1' for 16 more cycles so the pipeline drains; then any
+  expected beat not yet seen is an error ("missing output beat k").
+- While m_axis_tready = '0' and m_axis_tvalid = '1', m_axis_tdata must not
+  change between edges; report it if it does.
+- Report mismatches as "beat k (input cycle N): m_axis_tdata expected ...
+  got ..." where N is the cycle of the inputs row that carried that beat.
+
+Implementation sketch (inside the single stimulus process; the expected
+beats are read first into an array, then the inputs are replayed):
+
+    type beat_array is array (0 to 1023) of std_logic_vector(23 downto 0);
+    variable exp_beats : beat_array;  variable n_exp, k_exp : integer := 0;
+    -- pass 1: read ALL outputs rows, keep rows with m_axis_tvalid = 1
+    while not endfile(out_file) loop
+      readline(out_file, lo); commas_to_blanks(lo);
+      read(lo, v_cycle_out); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+      if v_m_axis_tvalid = 1 then exp_beats(n_exp) := v_m_axis_tdata; n_exp := n_exp + 1; end if;
+    end loop;
+    -- pass 2: replay inputs; check every accepted output beat against exp_beats(k_exp)
+    ...
+      wait until rising_edge(aclk); wait for 1 ns;
+      if m_axis_tvalid = '1' and m_axis_tready = '1' then
+        if k_exp >= n_exp then report "unexpected output beat" severity error; errors := errors + 1;
+        elsif m_axis_tdata /= exp_beats(k_exp) then report "beat " & integer'image(k_exp) & ...; errors := errors + 1;
+        end if;
+        k_exp := k_exp + 1;
+      end if;
+    ...
+    if k_exp < n_exp then report "missing output beats" severity error; errors := errors + 1; end if;
+
+Designs WITHOUT a stream handshake (counters, plain registered logic) keep
+the cycle-exact comparison of the pattern above.
 
 ═══════════════════════════════════════════════════════════════════
 WIDE PORTS (32 bits or more)
@@ -236,3 +308,17 @@ ASCII-ONLY RULE
 ═══════════════════════════════════════════════════════════════════
 
 xvhdl rejects bytes >= 0x80. Use ASCII hyphens and straight quotes only.
+
+═══════════════════════════════════════════════════════════════════
+CHECK YOURSELF BEFORE ANSWERING (these are the mistakes that repeat)
+═══════════════════════════════════════════════════════════════════
+
+[ ] No `<= ... when ... else ...` inside any process; use if/else there.
+    Search your code for the word `when` and check each one.
+[ ] One `read(...)` per column of each CSV row, in header order: the
+    inputs row has 1 + (input ports) values, the outputs row 1 + (output
+    ports). Count them against the header lines in the spec, including
+    columns you do not use (clock, outputs you do not compare).
+[ ] Ports of 32 bits or more use read_wide, never an integer variable.
+[ ] Exactly one "SIMULATION PASSED" or "SIMULATION FAILED" report.
+[ ] No to_string / to_hstring on vectors.

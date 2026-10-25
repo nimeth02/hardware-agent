@@ -17,7 +17,8 @@ from langchain_core.messages import HumanMessage
 
 from agents.json_utils import extract_json
 from agents.orchestrator_agent.requirement_id import new_requirement_id
-from agents.orchestrator_agent.state import AGENT_NAME, PRODUCES, OrchestratorState, initial_state
+from agents.orchestrator_agent.state import AGENT_NAME, MAX_ITERATIONS, PRODUCES, OrchestratorState, initial_state
+from agents.orchestrator_agent.stop_reason import stop_reason
 from agents.orchestrator_agent.tools import make_tools
 from agents.orchestrator_agent.tracing import log_state, snapshot
 from observability.callback import ObservabilityCallbackHandler
@@ -53,7 +54,8 @@ def ask_manager(agent, requirement_text: str, requirement_id: str) -> tuple[dict
     state["messages"] = [requirement_message(state)]
     log_state("start", None, snapshot(state))
     handler = ObservabilityCallbackHandler(source=AGENT_NAME)
-    out = agent.invoke(state, config={"callbacks": [handler]})
+    # one tool call = an LLM step + a tool step; +1 for the final answer
+    out = agent.invoke(state, config={"callbacks": [handler], "recursion_limit": 2 * MAX_ITERATIONS + 1})
     return extract_json(out["messages"][-1].content), out
 
 
@@ -64,6 +66,7 @@ def make_report(final: dict, requirement_id: str, state: dict, error: str | None
     the manager used a known word."""
     status = final.get("status") if error is None and final.get("status") in FINAL_STATUSES else "FAILED"
     return {"status": status, "summary": final.get("summary"), "next_steps": final.get("next_steps"),
+            "stop_reason": stop_reason(final, state, error),                        # why the run ended, in plain words
             "requirement_id": requirement_id,
             "results": {field: state.get(field) for field in PRODUCES.values()},   # what the helpers produced
             "stages": state.get("stages", {}),                                      # how each helper went

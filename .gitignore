@@ -46,6 +46,7 @@ webtalk*
 
 # ── Third-party reference code (170 MB, not part of the product) ──────
 reference/
+references/
 
 # ── Editors / OS ──────────────────────────────────────────────────────
 .vscode/

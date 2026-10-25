@@ -480,8 +480,11 @@ async function loadAgentRuns() {
     const cls = stopped ? "badge-cancelled"
       : r.status === "failed" || agentBad ? "badge-error"
       : r.status === "completed" ? "badge-ok" : "";
-    const statusText = r.agent_status ? `${r.status} · ${r.agent_status}` : r.status;
-    const errorText = r.error || r.agent_error || "";
+    // A run that "completed" but whose report says FAILED is shown as FAILED, not completed.
+    const statusText = r.agent_status
+      ? (r.status === "completed" && r.agent_status === "FAILED" ? r.agent_status : `${r.status} · ${r.agent_status}`)
+      : r.status;
+    const errorText = r.error || r.agent_error || r.stop_reason || "";
     tr.innerHTML = `
       <td>${new Date(r.started_at * 1000).toLocaleString()}</td>
       <td>${escapeHtml(r.agent_name)} v${escapeHtml(r.agent_version || "")}</td>
@@ -545,6 +548,9 @@ function eventDetail(e) {
     case "tool_result": return `${d.tool}: ${stripTruncMarker(d.output_preview)}`;
     case "error": return d.error || d.llm_error || "";
     case "run_resumed": return `answer: ${(d.input && d.input.answer) || ""}`;
+    case "question": return `The AI asks: ${d.question || ""}` +
+      (d.suggestions && d.suggestions.length ? `  [suggested: ${d.suggestions.join(" | ")}]` : "");
+    case "answer": return `You answered: ${d.answer || ""}`;
     case "agent_input":
     case "agent_output":
     case "state": return orchMetaSummary(e);
@@ -621,7 +627,7 @@ function appendCodeBlocks(box, result) {
     head.appendChild(title);
     head.appendChild(btn);
     const pre = document.createElement("pre");
-    pre.className = "result-box code-block";
+    pre.className = "result-box code-block vhdl-code";
     pre.textContent = v.code;
     box.appendChild(head);
     box.appendChild(pre);
@@ -632,7 +638,7 @@ function appendCodeBlocks(box, result) {
 // A titled, copyable code block (same head + Copy pattern as renderCodeBlocks).
 // `html`, when given, is the (already escaped) markup shown instead of the
 // plain text; Copy still copies `text`.
-function copyableCodeBlock(title, text, html) {
+function copyableCodeBlock(title, text, html, extraClass) {
   const frag = document.createDocumentFragment();
   const head = document.createElement("div");
   head.className = "code-block-head";
@@ -650,7 +656,7 @@ function copyableCodeBlock(title, text, html) {
   head.appendChild(span);
   head.appendChild(btn);
   const pre = document.createElement("pre");
-  pre.className = "result-box code-block";
+  pre.className = "result-box code-block" + (extraClass ? " " + extraClass : "");
   if (html != null) pre.innerHTML = html; else pre.textContent = text;
   frag.appendChild(head);
   frag.appendChild(pre);
@@ -1111,6 +1117,15 @@ const ORCH_SECTIONS = [
   ["implementation", "Implementation", fillImplementationBody],
 ];
 
+// Plain-words reason a run ended: the report's stop_reason, or "you pressed Stop"
+// for a stopped run with no saved report. Empty string for old runs.
+function stopReasonOf(run) {
+  const fr = run && run.final_result;
+  if (fr && typeof fr === "object" && typeof fr.stop_reason === "string" && fr.stop_reason) return fr.stop_reason;
+  if (run && run.status === "stopped" && !(fr && typeof fr === "object" && Object.keys(fr).length)) return "you pressed Stop";
+  return "";
+}
+
 // Orchestrator: status badge, summary, next steps, error, then one
 // collapsible section per sub-agent result present in `results`.
 function renderOrchestratorPanel(run) {
@@ -1131,6 +1146,8 @@ function renderOrchestratorPanel(run) {
   badge.textContent = status;
   head.appendChild(badge);
   add(head);
+  const why = stopReasonOf(run);
+  if (why) add(panelLine(`Why it stopped: ${why}`, "status"));
   if (fr.summary) {
     add(panelLabel("Summary"));
     add(panelLine(fr.summary, "sim-text"));
@@ -1283,6 +1300,10 @@ function noteIfTruncated(box, text) {
   if (/\[truncated[, ]/.test(text)) box.appendChild(panelLine(TRUNC_NOTE, "status warn"));
 }
 
+// True when a tool result carries generated VHDL (rtl / testbench `code` strings).
+function hasGeneratedCode(v) {
+  return Boolean(v && typeof v === "object" && Object.values(v).some((x) => x && typeof x === "object" && typeof x.code === "string" && x.code.length));
+}
 function renderToolOutput(box, output) {
   const text = unwrapToolOutput(output);
   let parsed = null;
@@ -1291,7 +1312,8 @@ function renderToolOutput(box, output) {
     const logs = [];
     collectLogFields(parsed, "", logs);
     logs.forEach((l) => box.appendChild(copyableCodeBlock(`${l.path} (${l.text.length.toLocaleString()} chars)`, l.text)));
-    box.appendChild(copyableCodeBlock("result (JSON)", JSON.stringify(parsed, null, 2)));
+    if (hasGeneratedCode(parsed)) addJsonWithFoldedCode(box, "result (JSON)", parsed, "", true);
+    else box.appendChild(copyableCodeBlock("result (JSON)", JSON.stringify(parsed, null, 2)));
   } else {
     box.appendChild(copyableCodeBlock(`output (${text.length.toLocaleString()} chars)`, text || "(empty)"));
   }
@@ -1340,11 +1362,14 @@ function collapsedCodeBlock(title, text) {
   return det;
 }
 // Pretty JSON block followed by one collapsed block per folded string.
-function addJsonWithFoldedCode(box, title, value, rootPath) {
+function addJsonWithFoldedCode(box, title, value, rootPath, openCode) {
   const folded = [];
   const shown = foldCode(value, rootPath || "", folded);
   box.appendChild(copyableCodeBlock(title, toJson(shown)));
-  dedupeFolded(folded).forEach((f) => box.appendChild(collapsedCodeBlock(`${f.path || title} — ${codeLabel(f.text)}`, f.text)));
+  dedupeFolded(folded).forEach((f) => {
+    if (openCode && /(^|\.)code$/.test(f.path)) box.appendChild(copyableCodeBlock(`${f.path} — ${codeLabel(f.text)}`, f.text, null, "vhdl-code"));
+    else box.appendChild(collapsedCodeBlock(`${f.path || title} — ${codeLabel(f.text)}`, f.text));
+  });
 }
 // Short description of one value for a one-line summary.
 function describeValue(v) {
@@ -1439,7 +1464,7 @@ function buildOrchMetaDetail(box, e) {
       const status = e.status || (out && out.status) || "done";
       add(panelLine(`${stage} answered — ${status}`, "evt-head"));
       if (out && out.error) add(copyableCodeBlock("error", String(out.error)));
-      addJsonWithFoldedCode(box, "answer (JSON)", out === undefined ? null : out, "output");
+      addJsonWithFoldedCode(box, "answer (JSON)", out === undefined ? null : out, "output", true);
       break;
     }
     case "state": {
@@ -1735,6 +1760,8 @@ async function showAgentRun(runId) {
   if (agentResult.status) {
     meta.textContent += ` | agent: ${agentResult.status}` + (agentResult.error && !run.error ? ` — ${agentResult.error}` : "");
   }
+  const whyStopped = stopReasonOf(run);
+  if (whyStopped) meta.textContent += ` | Why it stopped: ${whyStopped}`;
 
   const isOrch = run.agent_name === "orchestrator";
   $("#agent-orch-tl-tools").classList.toggle("hidden", !isOrch);
@@ -1767,7 +1794,15 @@ async function showAgentRun(runId) {
     const title = `#${t.step} ${t.tool_name} | ${formatMs(t.latency_ms || 0)} | ${t.status}`;
     const body = "── INPUT ──\n" + JSON.stringify(t.input, null, 2) + "\n\n── OUTPUT ──\n" +
       (t.error ? `ERROR: ${t.error}` : (typeof t.output === "string" ? t.output : JSON.stringify(t.output, null, 2)));
-    tools.appendChild(detailsBlock(title, body));
+    let parsedOut = null;
+    if (!t.error) { try { parsedOut = JSON.parse(unwrapToolOutput(t.output)); if (typeof parsedOut === "string") parsedOut = JSON.parse(parsedOut); } catch (_) { parsedOut = null; } }
+    if (hasGeneratedCode(parsedOut)) {       // generator tools: the VHDL as a real code block
+      const det = detailsBlock(title, "── INPUT ──\n" + JSON.stringify(t.input, null, 2));
+      appendCodeBlocks(det, parsedOut);
+      const rest = {}; Object.keys(parsedOut).forEach((k) => { rest[k] = (parsedOut[k] && typeof parsedOut[k] === "object" && typeof parsedOut[k].code === "string") ? { ...parsedOut[k], code: "(shown above)" } : parsedOut[k]; });
+      det.appendChild(detailsBlock("rest of the output (JSON)", JSON.stringify(rest, null, 2)));
+      tools.appendChild(det);
+    } else tools.appendChild(detailsBlock(title, body));
   });
   if (!run.tool_calls.length) tools.textContent = "none";
 
@@ -1797,11 +1832,273 @@ async function showAgentRun(runId) {
     $("#agent-question").textContent = fr.pending_question || "";
     $("#agent-answer").value = "";
     $("#agent-answer-status").textContent = "";
+    // Clickable suggestions: the agent's suggested answers if it sends them,
+    // otherwise its fix hints. Clicking copies the text into the answer box.
+    fillAnswerOptions((Array.isArray(fr.suggested_answers) && fr.suggested_answers.length
+      ? fr.suggested_answers : (fr.suggestions || [])));
+    $("#agent-answer-btn").textContent = "Answer & resume session";
     clarify.classList.remove("hidden");
+  } else if (run.status === "running") {
+    // A live run may be paused on a question (orchestrator + spec analyzer).
+    let pending = null;
+    try { pending = (await (await fetch(`/api/agent-runs/${runId}/question`)).json()).pending; } catch (_) {}
+    if (seq !== showRunSeq) return;
+    if (pending) {
+      const fresh = !agentSession || !agentSession.live || agentSession.runId !== runId || agentSession.question !== pending.question;
+      agentSession = { live: true, runId, question: pending.question };
+      $("#agent-question").textContent = pending.question || "";
+      if (fresh) {
+        $("#agent-answer").value = "";
+        $("#agent-answer-status").textContent = "";
+        fillAnswerOptions(pending.suggestions);
+      }
+      $("#agent-answer-btn").disabled = false;
+      $("#agent-answer-btn").textContent = "Send answer";
+      clarify.classList.remove("hidden");
+    } else {
+      agentSession = null;
+      clarify.classList.add("hidden");
+    }
   } else {
     agentSession = null;
     clarify.classList.add("hidden");
   }
+  renderRunErrors(runId, run, seq);
+}
+
+// ── Errors for the FPGA engineer ─────────────────────────────────────
+// Every problem the run recorded (GET /api/agent-runs/{id}/errors), grouped
+// by requirement, then step, then attempt. Redrawn on every live update and
+// shown for every ending (done, needs review, failed, stopped, crashed).
+let errCtx = null;   // {runId, run, data, waiting}
+
+// Green "Fixed in ..." tag, red "Still open" tag, grey "Continues" for an error that is still there next round.
+function stateTag(i) {
+  if (i.state === "fixed") return ` <span class="err-tag fixed">${escapeHtml(i.fixed_label || "Fixed")}</span>`;
+  if (i.state === "open") return ' <span class="err-tag open">Still open</span>';
+  if (i.state === "carried") return ' <span class="err-tag carried">Continues</span>';
+  return "";
+}
+
+function specList(items) {
+  return `<ul>${items.map((t) => `<li>${escapeHtml(typeof t === "string" ? t : JSON.stringify(t))}</li>`).join("")}</ul>`;
+}
+
+// The requirement as a title plus labelled parts, folded when long.
+function renderRequirementBody(req) {
+  const sp = req.spec;
+  let parts = "";
+  const line = (label, value) => value === undefined || value === null || value === "" ? "" :
+    `<div class="req-line"><span class="req-label">${escapeHtml(label)}</span> ${escapeHtml(String(value))}</div>`;
+  const listBlock = (label, v) => `<div class="req-line"><span class="req-label">${escapeHtml(label)} (${v.length})</span></div>${specList(v)}`;
+  if (sp) {
+    const used = new Set(["status"]);
+    const take = (k) => { used.add(k); return sp[k]; };
+    parts += line("Name", take("entity_name"));
+    parts += line("What it must do", take("description"));
+    parts += line("VHDL version", take("vhdl_version"));
+    const clk = take("clock"), rst = take("reset");
+    if (clk && typeof clk === "object") parts += line("Clock", `${clk.name || ""}${clk.frequency_mhz ? `, ${clk.frequency_mhz} MHz` : ""}${clk.required === false ? " (not used)" : ""}`);
+    if (rst && typeof rst === "object") parts += line("Restart", `${rst.name || ""}${rst.type ? `, ${rst.type}` : ""}${rst.active ? `, active ${rst.active}` : ""}`);
+    const ports = take("ports");
+    if (Array.isArray(ports) && ports.length) {
+      parts += listBlock("Inputs and outputs", ports.map((p) =>
+        typeof p === "object" ? `${p.name} - ${p.direction || ""}, ${p.width || "?"} bit${p.type ? `, ${p.type}` : ""}` : p));
+    }
+    [["behavior", "Behaviour"], ["constraints", "Limits"], ["assumptions", "Assumptions"], ["ambiguities", "Unclear points"]].forEach(([k, label]) => {
+      const v = take(k);
+      if (Array.isArray(v) && v.length) parts += listBlock(label, v);
+    });
+    Object.keys(sp).filter((k) => !used.has(k) && sp[k] !== null && sp[k] !== "").forEach((k) => {
+      const v = sp[k];
+      parts += Array.isArray(v) ? (v.length ? listBlock(k, v) : "") : line(k, typeof v === "object" ? JSON.stringify(v) : v);
+    });
+  } else if (req.text) {
+    parts = `<div class="req-text">${escapeHtml(req.text)}</div>`;
+  }
+  if (!parts) return "";
+  const long = parts.length > 900;
+  return `<div class="req-card ${long ? "folded" : ""}"><div class="req-body">${parts}</div>` +
+    (long ? '<button type="button" class="req-toggle" data-req-toggle>Show more</button>' : "") + "</div>";
+}
+
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-req-toggle]");
+  if (!b) return;
+  const card = b.closest(".req-card");
+  card.classList.toggle("folded");
+  b.textContent = card.classList.contains("folded") ? "Show more" : "Show less";
+});
+
+async function renderRunErrors(runId, run, seq) {
+  const block = $("#agent-errors-block");
+  let data;
+  try {
+    const res = await fetch(`/api/agent-runs/${runId}/errors`);
+    if (!res.ok) throw new Error("no data");
+    data = await res.json();
+  } catch (_) { block.classList.add("hidden"); return; }
+  if (seq !== showRunSeq) return;
+  const running = run.status === "running";
+  const waiting = Boolean(agentSession && agentSession.live && agentSession.runId === runId);
+  errCtx = { runId, run, data, waiting };
+  block.classList.remove("hidden");
+  block.classList.toggle("clean", data.total === 0);
+  const fixedTotal = data.fixed_total || 0;
+  $("#agent-errors-summary").textContent =
+    (data.total === 0 ? "No open errors" : `${data.total} open error${data.total === 1 ? "" : "s"}`) +
+    (fixedTotal ? `, ${fixedTotal} fixed` : "") +
+    (running ? " so far (updating live)" : ` | run ${run.status}${data.requirements[0].status ? " · " + data.requirements[0].status : ""}`);
+
+  let html = "";
+  const stepsWithErrors = [];
+  if (data.stop_reason) html += `<div class="status"><b>Why it stopped:</b> ${escapeHtml(data.stop_reason)}</div>`;
+  data.requirements.forEach((req) => {
+    const badge = `<span class="err-badge ${req.count ? "" : "zero"}">${req.count} open</span>` +
+      (req.fixed_count ? ` <span class="err-badge zero">${req.fixed_count} fixed</span>` : "");
+    html += `<div class="err-req">Requirement: ${escapeHtml(req.title)} ${badge} ${req.count ? "" : '<span class="err-ok">no open errors</span>'}</div>`;
+    html += renderRequirementBody(req);
+    req.notes.forEach((n) => { html += `<div class="status" style="margin-left:8px">${escapeHtml(n)}</div>`; });
+    if (req.run_level.length) {
+      html += `<details class="err-step" open><summary>Whole run (manager level) <span class="err-badge">${req.run_level.length}</span></summary><div class="err-attempt"><ul>` +
+        req.run_level.map((t) => `<li>${escapeHtml(t)}</li>`).join("") + "</ul></div></details>";
+    }
+    req.steps.forEach((st) => {
+      if (st.count) stepsWithErrors.push(st);
+      const found = st.found_count || 0;
+      html += `<details class="err-step ${st.count ? "" : "zero"}" ${st.count ? "open" : ""}><summary>${escapeHtml(st.label)} ` +
+        `<span class="err-badge ${st.count ? "" : "zero"}">${st.count}</span>` +
+        (found ? ` <span class="status">${found} found, ${st.fixed_count || 0} fixed, ${st.count} still open</span>` : "") +
+        `${st.status ? ` <span class="status">(${escapeHtml(st.status)})</span>` : ""}</summary>`;
+      st.attempts.forEach((a) => {
+        const lint = a.lint || [];
+        const issues = a.issues || [];
+        const issueItems = issues.map((i) =>
+          `<li class="lint ${i.state === "fixed" ? "fixed" : ""}"><span class="err-code">${escapeHtml(i.code)}</span>${stateTag(i)}<span class="err-detail">${escapeHtml(i.detail)}</span></li>`);
+        const lintLi = (i) => i.note
+          ? `<li class="note lint"><b>Note, not an error:</b> ${escapeHtml(i.detail)}</li>`
+          : `<li class="lint ${i.state === "fixed" ? "fixed" : ""}"><span class="err-code">${escapeHtml(i.code)}</span>` +
+            `${i.location ? ` <span class="err-loc">${escapeHtml(i.location)}</span>` : ""}${stateTag(i)}` +
+            `<span class="err-detail">${escapeHtml(i.detail)}</span></li>`;
+        const lintItems = lint.map(lintLi);
+        const rounds = a.rounds || [];
+        const roundHtml = rounds.map((r) =>
+          `<div class="err-explain"><b>Fix round ${escapeHtml(String(r.round))}${r.max ? ` of ${escapeHtml(String(r.max))}` : ""}` +
+          `${r.compiler ? ` (${escapeHtml(r.compiler)})` : ""}:</b><ul>${r.lint.map(lintLi).join("")}</ul></div>`).join("");
+        const items = a.errors.map((t, k) => {
+          const es = (a.error_states || [])[k] || {};
+          return `<li class="${es.state === "fixed" ? "fixed" : ""}">${stateTag(es)}${escapeHtml(t)}</li>`;
+        }).concat(issueItems, lintItems, a.notes.map((t) => `<li class="note">${escapeHtml(t)}</li>`));
+        const realCount = a.errors.length + issues.length + lint.filter((i) => !i.note).length +
+          rounds.reduce((n, r) => n + r.lint.filter((i) => !i.note).length, 0);
+        html += `<div class="err-attempt">${a.attempt != null ? `Attempt ${a.attempt}` : "During the run"}` +
+          `${a.status ? ` (${escapeHtml(a.status)})` : ""}: ${realCount ? "" : '<span class="err-ok">no errors</span>'}` +
+          (items.length ? `<ul>${items.join("")}</ul>` : "") + roundHtml +
+          (a.explanation ? `<div class="err-explain"><b>The AI's own explanation:</b> ${escapeHtml(a.explanation)}</div>` : "") +
+          (a.suggested_fix ? `<div class="err-explain"><b>The AI suggests:</b> ${escapeHtml(a.suggested_fix)}</div>` : "") + "</div>";
+      });
+      html += "</details>";
+    });
+  });
+  $("#agent-errors-body").innerHTML = html;
+
+  // Step chooser for "Retry from this step": keep the engineer's choice across redraws.
+  const sel = $("#agent-errors-step");
+  const previous = sel.value;
+  const options = stepsWithErrors.length ? stepsWithErrors : data.requirements.flatMap((r) => r.steps);
+  const seenStages = new Set();   // RTL and RTL lint retry from the same step: list it once
+  const uniqueOptions = options.filter((s) => !seenStages.has(s.stage) && seenStages.add(s.stage));
+  sel.innerHTML = uniqueOptions.map((s) => `<option value="${escapeHtml(s.stage)}">${escapeHtml(s.label)}</option>`).join("");
+  if (uniqueOptions.some((s) => s.stage === previous)) sel.value = previous;
+
+  const canAct = waiting || !running;
+  $all("#agent-errors-block [data-err-action], #agent-errors-send").forEach((b) => { b.disabled = !canAct; });
+  const st = $("#agent-errors-status");
+  if (!canAct) {
+    st.textContent = "The AI is still working. These buttons switch on when it asks you something or when the run ends.";
+    st.classList.remove("error");
+  } else if (st.textContent.startsWith("The AI is still working")) {
+    st.textContent = waiting ? "The AI is waiting for your answer: your choice is sent to it." : "";
+  }
+}
+
+// What each button tells the AI: the answer to a waiting run, or the extra
+// instruction added to a fresh run.
+function errorsInstruction(action) {
+  const stepEl = $("#agent-errors-step");
+  const stepName = stepEl.value || "";
+  const stepLabel = stepEl.selectedOptions[0] ? stepEl.selectedOptions[0].textContent : stepName;
+  const extra = $("#agent-errors-text").value.trim();
+  const base = {
+    "retry-req": "Retry this requirement from the beginning.",
+    "retry-step": `Retry starting from the step "${stepName}" (${stepLabel}); keep what came before it.`,
+    "skip": "Skip this requirement: stop working on it and report what you have.",
+    "manual": "The FPGA engineer will fix this by hand. Stop now and report what is left to fix.",
+    "send": "",
+  }[action];
+  return [base, extra && `Instructions from the FPGA engineer: ${extra}`].filter(Boolean).join(" ");
+}
+
+$("#agent-errors-block").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-err-action], #agent-errors-send");
+  if (!btn || !errCtx) return;
+  const action = btn.id === "agent-errors-send" ? "send" : btn.dataset.errAction;
+  const status = $("#agent-errors-status");
+  status.classList.remove("error");
+  const text = errorsInstruction(action);
+  if (!text) { status.textContent = "Type instructions first, or press one of the buttons."; status.classList.add("error"); return; }
+  const { runId, run, waiting } = errCtx;
+  try {
+    if (waiting) {                       // the AI is paused on a question: answer it
+      const res = await fetch(`/api/agent-runs/${runId}/answer`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answer: text }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Request failed");
+      agentSession = null;
+      $("#agent-clarify").classList.add("hidden");
+      status.textContent = "Sent to the AI. The run continues.";
+      return;
+    }
+    if (action === "skip" || action === "manual") {   // run is over: nothing on the server to change
+      status.textContent = action === "skip"
+        ? "Noted here only: the system keeps no 'skipped' flag for finished runs, nothing was changed."
+        : "Noted here only. Fix the files by hand, then press 'Retry this requirement' to run again.";
+      return;
+    }
+    const input = { ...(run.input || {}) };      // finished run: start a new run with the same input
+    if (run.agent_name === "orchestrator" && input.requirement_text && (action !== "retry-req" || $("#agent-errors-text").value.trim())) {
+      input.requirement_text += `\n\n--- Instructions from the FPGA engineer (previous run ${runId.slice(0, 8)}) ---\n${text}`;
+    }
+    const res = await fetch(`/api/agents/${run.agent_name}/run`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ input }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+    status.textContent = `Started a new run ${data.run_id.slice(0, 8)}.`;
+    $("#agent-run-btn").disabled = true;
+    watchRun(data.run_id, $("#agent-run-status"), $("#agent-run-btn"), run.agent_name);
+  } catch (err) {
+    status.textContent = `Error: ${err.message}`;
+    status.classList.add("error");
+  }
+});
+
+// Clickable suggested answers: clicking copies the text into the answer box.
+function fillAnswerOptions(suggestions) {
+  const options = (suggestions || []).filter((s) => typeof s === "string" && s.trim());
+  const optList = $("#agent-answer-options");
+  optList.innerHTML = "";
+  options.forEach((text) => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    li.title = "Click to put this in the answer box";
+    li.addEventListener("click", () => {
+      const box = $("#agent-answer");
+      box.value = text;
+      box.focus();
+    });
+    optList.appendChild(li);
+  });
+  $("#agent-answer-options-label").classList.toggle("hidden", !options.length);
 }
 
 let agentSession = null;
@@ -1812,6 +2109,27 @@ $("#agent-answer-btn").addEventListener("click", async () => {
   status.classList.remove("error");
   if (!agentSession) { status.textContent = "No session waiting."; status.classList.add("error"); return; }
   if (!answer.trim()) { status.textContent = "Type an answer first."; status.classList.add("error"); return; }
+  if (agentSession.live) {
+    // The run is still going and waiting: hand it the answer, same timeline.
+    $("#agent-answer-btn").disabled = true;
+    try {
+      const res = await fetch(`/api/agent-runs/${agentSession.runId}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Request failed");
+      agentSession = null;
+      $("#agent-clarify").classList.add("hidden");
+      $("#agent-run-status").textContent = "answer sent — the run continues...";
+    } catch (err) {
+      status.textContent = `Error: ${err.message}`;
+      status.classList.add("error");
+      $("#agent-answer-btn").disabled = false;
+    }
+    return;
+  }
   status.textContent = "Resuming...";
   $("#agent-answer-btn").disabled = true;
   try {

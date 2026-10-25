@@ -22,6 +22,7 @@ import json
 import re
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator
 
 from langchain.agents import create_agent
@@ -32,6 +33,7 @@ from langgraph.errors import GraphRecursionError
 
 from agents.json_utils import extract_json
 from agents.mcp_utils import run_sync
+from agents.test_vector_agent.orchestrator_feedback import feedback_inputs, feedback_rules, has_feedback
 from agents.test_vector_agent.state import AGENT_NAME
 from observability.callback import ObservabilityCallbackHandler
 from prompts.test_vector_agent_prompt import (
@@ -39,7 +41,7 @@ from prompts.test_vector_agent_prompt import (
     TEST_VECTOR_FIX_ADDENDUM,
     TEST_VECTOR_SKILLS_ADDENDUM,
 )
-from services.llm_client import get_llm
+from services.llm_client import get_llm_for_loop
 from services.mcp_client import get_mcp_client
 
 MAX_AGENT_STEPS = 30
@@ -85,13 +87,34 @@ def _forbidden_matlab(code: str) -> list[str]:
     return sorted({m.group(1) for m in _FORBIDDEN_RE.finditer(text)})
 
 
-def _guard_run_tool(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILURES) -> list[BaseTool]:
+def _clear_old_csvs(project_dir: str) -> None:
+    """Delete every CSV in the run folder before a MATLAB run. A run that
+    errors out part-way (observed: run 161047, header changed, script
+    failed at line 163) would otherwise leave the previous run's CSVs on
+    disk, and the validator cannot tell them from fresh ones."""
+    folder = Path(str(project_dir or ""))
+    if not folder.is_dir():
+        return
+    for f in folder.glob("*.csv"):
+        f.unlink(missing_ok=True)
+
+
+def new_run_state() -> dict:
+    """Bookkeeping shared between the guarded tools and the attempt:
+    `last_run` is None until run_matlab_script is called, then
+    {"status": "ok" | "error", "error": str}."""
+    return {"failures": 0, "dirty": True, "last_error": "", "scripts": set(), "last_run": None}
+
+
+def _guard_run_tool(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILURES,
+                    state: dict | None = None) -> list[BaseTool]:
     """Wrap generate/run so the loop can't burn steps re-running an unchanged
     script (observed with local models), and so failed runs are hard-capped."""
     by_name = {t.name: t for t in tools}
     gen_tool = by_name["generate_matlab_script"]
     run_tool = by_name["run_matlab_script"]
-    state = {"failures": 0, "dirty": True, "last_error": "", "scripts": set()}
+    if state is None:
+        state = new_run_state()
 
     def _stem(name) -> str:
         return str(name or "").strip().removesuffix(".m")
@@ -122,13 +145,17 @@ def _guard_run_tool(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILURES)
         if state["failures"] and not state["dirty"]:
             return ("REJECTED: the script has not changed since its last failed run. "
                     "Fix the error and call generate_matlab_script first.")
+        _clear_old_csvs(kwargs.get("project_dir"))
         out = await run_tool.ainvoke(kwargs)
         state["dirty"] = False
         if '"status": "error"' in str(out):
             state["failures"] += 1
             state["last_error"] = str(out)[:1500]
+            state["last_run"] = {"status": "error", "error": state["last_error"]}
             if state["failures"] >= max_failures:
                 raise RunAttemptsExceeded(state["last_error"])
+        else:
+            state["last_run"] = {"status": "ok", "error": ""}
         return out
 
     wrapped = {
@@ -255,33 +282,44 @@ class TestVectorGenerator:
 
     @property
     def llm(self):
-        if self._llm is None:
-            self._llm = get_llm()
-        return self._llm
+        """The injected client, or a fresh one per attempt: each attempt runs
+        on its own event loop (run_sync or the MatlabSession thread) and the
+        shared pool of the cached client raises "Event loop is closed"."""
+        if self._llm is not None:
+            return self._llm
+        return get_llm_for_loop()
 
     def generate(self, spec: dict, run_dir: str, skills: dict[str, str] | None = None,
-                 previous_result: dict | None = None, validation_issues: list[dict] | None = None) -> dict:
+                 previous_result: dict | None = None, validation_issues: list[dict] | None = None,
+                 attempt: int = 1, attempt_history: list[dict] | None = None) -> dict:
         """Inside `shared_matlab_session()` the attempt runs on the run's
         shared MATLAB; otherwise it opens a session of its own."""
-        system, payload = self._prompt(spec, run_dir, skills, previous_result, validation_issues)
+        system, payload = self._prompt(spec, run_dir, skills, previous_result, validation_issues,
+                                       attempt, attempt_history)
         shared = _run_session.get()
         if shared is None:
             return run_sync(self._generate_in_own_session(system, payload))
         return shared.run(self._tool_loop(shared.tools, system, payload))
 
     async def agenerate(self, spec: dict, run_dir: str, skills: dict[str, str] | None = None,
-                        previous_result: dict | None = None, validation_issues: list[dict] | None = None) -> dict:
-        system, payload = self._prompt(spec, run_dir, skills, previous_result, validation_issues)
+                        previous_result: dict | None = None, validation_issues: list[dict] | None = None,
+                        attempt: int = 1, attempt_history: list[dict] | None = None) -> dict:
+        system, payload = self._prompt(spec, run_dir, skills, previous_result, validation_issues,
+                                       attempt, attempt_history)
         return await self._generate_in_own_session(system, payload)
 
     @staticmethod
     def _prompt(spec: dict, run_dir: str, skills: dict[str, str] | None,
-                previous_result: dict | None, validation_issues: list[dict] | None) -> tuple[str, dict]:
+                previous_result: dict | None, validation_issues: list[dict] | None,
+                attempt: int = 1, attempt_history: list[dict] | None = None) -> tuple[str, dict]:
         system = TEST_VECTOR_AGENT_SYSTEM_PROMPT
         if skills:
             system += TEST_VECTOR_SKILLS_ADDENDUM + "\n\n".join(f"### {n}\n{c}" for n, c in skills.items())
         payload: dict = {"spec": spec, "project_dir": run_dir}
-        if previous_result is not None and validation_issues:
+        if has_feedback(attempt, attempt_history):             # the orchestrator called us again and says how it went
+            system += feedback_rules(attempt)
+            payload.update(feedback_inputs(attempt_history))
+        if previous_result is not None and validation_issues:  # the validator rejected our last CSVs in this run
             system += TEST_VECTOR_FIX_ADDENDUM
             payload["previous_result"] = previous_result
             payload["validation_issues"] = validation_issues
@@ -294,7 +332,8 @@ class TestVectorGenerator:
     async def _tool_loop(self, mcp_tools: list[BaseTool], system: str, payload: dict) -> dict:
         """One attempt: the LLM writes/runs the script against the given MATLAB
         tools until it succeeds or a cap trips. Caps are per attempt."""
-        tools = _guard_run_tool(mcp_tools)
+        runs = new_run_state()
+        tools = _guard_run_tool(mcp_tools, state=runs)
         agent = create_agent(self.llm, tools, system_prompt=system)
         handler = ObservabilityCallbackHandler(source=AGENT_NAME)
         try:
@@ -303,7 +342,12 @@ class TestVectorGenerator:
                 config={"callbacks": [handler], "recursion_limit": MAX_AGENT_STEPS},
             )
         except RunAttemptsExceeded as e:
-            return failure_result(f"Gave up after {MAX_RUN_FAILURES} failed MATLAB runs.", f"Last MATLAB error: {e}")
+            summary = failure_result(f"Gave up after {MAX_RUN_FAILURES} failed MATLAB runs.", f"Last MATLAB error: {e}")
         except GraphRecursionError:
-            return failure_result(f"Agent did not finish within {MAX_AGENT_STEPS} steps.")
-        return parse_test_vector_response(result["messages"][-1].content)
+            summary = failure_result(f"Agent did not finish within {MAX_AGENT_STEPS} steps.")
+        else:
+            summary = parse_test_vector_response(result["messages"][-1].content)
+        # What the validator needs and the LLM's summary cannot be trusted for:
+        # did the LAST MATLAB run succeed (so the CSVs on disk are its output)?
+        summary["last_matlab_run"] = runs["last_run"] or {"status": "never_ran", "error": ""}
+        return summary

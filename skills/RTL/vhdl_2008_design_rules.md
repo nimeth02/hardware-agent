@@ -1,5 +1,8 @@
 # VHDL-2008 design rules: allowed 2008 features, required patterns, port style, complete template
 
+Load this together with vhdl_language_rules.md (the LRM-based reference);
+where that file marks a rule [93], the 2008 features below replace it.
+
 Load this before writing ANY design file whose spec says
 "vhdl_version": "2008". The design is compiled with `xvhdl --2008`, so
 the VHDL-2008 features below are allowed. Testbenches go in tb/ and have
@@ -63,7 +66,7 @@ REQUIRED PATTERNS
     std_logic_vector(uns)           unsigned → slv
     to_unsigned(int, width)         integer → unsigned of given width
     to_integer(unsigned(slv))       slv → integer
-- Synchronous process (synchronous reset, preferred for 500 MHz designs):
+- Synchronous process (synchronous reset, preferred for fast clocks):
     process(clk)
     begin
       if rising_edge(clk) then
@@ -87,6 +90,19 @@ REQUIRED PATTERNS
 - Concatenation: `&` operator.
 - Comparisons: `=` and `/=` on std_logic_vector are fine.
 - Signal assignment uses `<=`. Variable assignment uses `:=`. Never mix.
+- Inside a process, between `process (...)` and `begin`, EVERY declaration
+  starts with `variable` (or `constant`):
+    variable temp_i : signed(47 downto 0);
+  A bare `temp_i : signed(47 downto 0);` is a syntax error, and every later
+  use of temp_i then fails too ("is not a variable", "illegal in an
+  expression"). Signals are declared in the architecture, never in a process.
+- One arithmetic step per line. Put each operation into a named signal or
+  variable of a declared width and chain them:
+    t1 := resize(signed('0' & x_p1), 16) - resize(signed('0' & x_p2), 16);
+    t2 := t1 + resize(signed('0' & x_m1), 16);
+  Never nest several resize()/shift_left()/signed() calls in one statement:
+  such chains are where parentheses go unbalanced ("syntax error near ;")
+  and where widths stop matching.
 - Every signal must be declared before use; every port must have a mode
   and a type.
 - VHDL-2008 allows reading an `out` port inside the architecture, but
@@ -176,7 +192,7 @@ re-type it as ASCII.
 EVERY OUTPUT IS REGISTERED
 ═══════════════════════════════════════════════════════════════════
 
-For 500 MHz timing closure, every output port must come out of a flip-flop,
+To meet the spec's clock (spec.clock.frequency_mhz), every output port must come out of a flip-flop,
 not combinational logic. Pattern:
 
   signal data_out_reg : std_logic_vector(7 downto 0);

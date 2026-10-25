@@ -2,7 +2,7 @@
 # agent, bundled so tests can inject fakes:
 #
 #   generator     rtl_generator.RTLGenerator        (LLM)
-#   decider       rtl_decider.RTLDecider            (LLM planner)
+#   decider       rtl_decider.RTLDecider            (LLM, picks the next action)
 #   skill_loader  rtl_skill_loader.RTLSkillLoader   (file-server MCP, read-only)
 #   linter        rtl_linter.lint_rtl               (deterministic)
 #

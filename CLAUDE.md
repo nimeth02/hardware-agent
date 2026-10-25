@@ -11,11 +11,12 @@ different job (a shopkeeper, a teacher). If not, rewrite it.
 
 ## Rules
 1. **First line = what it means for them**, one plain sentence, no jargon.
-2. **Say what happens, not how the code is built.** "The AI writes the chip code,
+2. **Say what happens, not how the code is built.** "The AI writes the RTL,
    a checker reads it, if there are mistakes the AI tries again." Never describe
    classes, graphs, nodes, state machines, layers, patterns, interfaces or
    abstractions unless the owner types "show me the code".
-3. **Analogy first**, one everyday comparison, then the steps.
+3. **No analogies, no loose examples.** Say the real thing directly, step by
+   step. (The owner asked for this on 2026-10-20.)
 4. **Swap jargon for plain words** (table below). If a term must stay because it
    is a file or status name, add a 3-to-6-word meaning in brackets once.
 5. **Short.** Max 5 bullets of one line each, or one small table. No paragraph
@@ -27,8 +28,8 @@ different job (a shopkeeper, a teacher). If not, rewrite it.
 ## Plain-words table (use the right column)
 | Jargon | Say instead |
 |---|---|
-| RTL, VHDL code, design | the chip code (the blueprint of the chip) |
-| testbench | the test program that checks the chip code |
+| RTL, VHDL code, design | RTL (always the real name, never "chip code") |
+| testbench | the test program that checks the RTL |
 | simulation | a dry run of the chip on the computer |
 | synthesis / implementation | turning the code into a real chip layout |
 | lint / linter | a spell-checker for code |

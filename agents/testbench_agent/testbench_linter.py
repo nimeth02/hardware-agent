@@ -57,6 +57,27 @@ def _static_checks(spec: dict, rtl: dict, testbench: dict) -> list[dict]:
                   f"Line {n}: 'x <= a when c else b' inside a process is not simulated by xelab 2020.1; "
                   f"use 'if c then x <= a; else x <= b; end if;'.")
 
+    # std_logic'val(n) picks by POSITION in ('U','X','0','1',...): 0 -> 'U',
+    # 1 -> 'X'. It compiles, and every expected 1-bit value is then wrong.
+    # unsigned(<1-bit port>) is the matching mistake on the printing side:
+    # xvhdl "cannot convert type 'std_logic' to type 'unsigned'" (observed
+    # looping for 6 attempts). Both get a plain message with the right form.
+    one_bit = [p["name"] for p in spec.get("ports") or []
+               if isinstance(p, dict) and p.get("name") and str(p.get("width") or "").strip() in ("1", "[0:0]")]
+    one_bit_re = re.compile(r"\bunsigned\s*\(\s*(" + "|".join(map(re.escape, one_bit)) + r")\s*\)",
+                            re.IGNORECASE) if one_bit else None
+    for n, line in enumerate(code.splitlines(), 1):
+        text = line.split("--", 1)[0]
+        if re.search(r"\bstd_logic'val\s*\(", text, re.IGNORECASE):
+            issue("std_logic_val",
+                  f"Line {n}: std_logic'val(n) gives 'U' for 0 and 'X' for 1 (position in the type), so the "
+                  f"comparison always fails; use (sig = '1') /= (v = 1) and print with integer'image(v).")
+        m = one_bit_re.search(text) if one_bit_re else None
+        if m:
+            issue("scalar_to_unsigned",
+                  f"Line {n}: '{m.group(1)}' is a 1-bit std_logic; unsigned({m.group(1)}) does not compile. "
+                  f"Compare with (sig = '1') /= (v = 1) and print with std_logic'image({m.group(1)}).")
+
     m = _ENTITY_RE.search(code)
     if not m:
         issue("no_entity", "No 'entity ... is' declaration found.")
@@ -78,6 +99,7 @@ def _static_checks(spec: dict, rtl: dict, testbench: dict) -> list[dict]:
             issue("port_not_connected", f"Spec port '{name}' does not appear in the testbench.")
 
     issues += _replay_checks(spec, code)
+    issues += _streaming_checks(spec, code)
     return issues
 
 
@@ -136,11 +158,116 @@ def _replay_checks(spec: dict, code: str) -> list[dict]:
                                      f"s_axis_tready is an output, m_axis_tready an input). Read each row's columns "
                                      f"in that order, one read per column, even ones you do not use."})
 
+    issues += _column_order_checks(inputs, outputs, text)
+
     for m in _SELF_CMP_RE.finditer(text):
         if m.group(1).lower() == m.group(2).lower():
             issues.append({"code": "self_comparison",
                            "detail": f"'if {m.group(1)} /= {m.group(2)}' compares a variable with itself; read the "
                                      f"outputs-row cycle into a second variable (v_cycle_out) and compare the two."})
+    return issues
+
+
+_READ_TARGET_RE = re.compile(r"\bread(?:_wide)?\s*\(\s*(\w+)\s*,\s*(\w+)", re.IGNORECASE)
+
+
+def _port_of(target: str, ports: list[dict]) -> str | None:
+    """Which port a read target like `v_s_axis_tdata` refers to: the longest
+    port name contained in it (so `s_axis_tready` wins over `s_axis_t`)."""
+    low = target.lower()
+    hits = [p["name"] for p in ports if p["name"].lower() in low]
+    return max(hits, key=len) if hits else None
+
+
+def _column_order_checks(inputs: list[dict], outputs: list[dict], text: str) -> list[dict]:
+    """The right NUMBER of reads per row can still put them in the wrong
+    ORDER: a testbench that reads `s_axis_tready` from the inputs file
+    (because the name sounds like an input) shifts every later column and
+    the 32-bit tdata lands in an integer. For each line variable, map the
+    read targets to port names and compare with the files' column order."""
+    ports = inputs + outputs
+    targets: dict[str, list[str]] = {}
+    for m in _READ_TARGET_RE.finditer(text):
+        if m.group(2).lower() in ("c", "ok"):           # read_wide's own character reads
+            continue
+        targets.setdefault(m.group(1).lower(), []).append(m.group(2))
+    layouts = {"test_vectors_in.csv": inputs, "test_vectors_out.csv": outputs}
+    issues: list[dict] = []
+    for line_var, seq in targets.items():
+        names = [_port_of(t, ports) for t in seq[1:]]       # seq[0] is the cycle column
+        if not any(names):
+            continue
+        matched = [f for f, cols in layouts.items()
+                   if len(names) == len(cols) and all(n is None or n == c["name"] for n, c in zip(names, cols))]
+        if matched or len(names) not in {len(inputs), len(outputs)}:
+            continue                                        # right order, or a count issue already reported
+        wrong = [f for f, cols in layouts.items() if len(names) == len(cols)]
+        for f in wrong:
+            cols = layouts[f]
+            order = ", ".join(["cycle"] + [c["name"] for c in cols])
+            got = ", ".join(["cycle"] + [n or "?" for n in names])
+            issues.append({"code": "column_order_mismatch",
+                           "detail": f"Reads from line '{line_var}' are in the order [{got}] but {f} has the columns "
+                                     f"[{order}]. Direction comes from the spec, NOT the name: s_axis_tready is an "
+                                     f"OUTPUT (outputs file), m_axis_tready is an INPUT (inputs file). Read each "
+                                     f"column, in file order, into the variable of that port."})
+    return issues
+
+
+_STREAM_PORTS = {"s_axis_tvalid", "s_axis_tready", "m_axis_tvalid", "m_axis_tready"}
+# `if v_m_axis_tvalid = 1`: the CSV's flag (an integer) opens a block ...
+_CSV_TVALID_GATE_RE = re.compile(r"\bif\s+\w*m_axis_tvalid\w*\s*=\s*1\b", re.IGNORECASE)
+# ... and inside it the DUT's bare m_axis_tdata wire is compared: cycle-by-cycle.
+_DUT_TDATA_CMP_RE = re.compile(r"(?<![\w])m_axis_tdata\s*/?=|/?=\s*m_axis_tdata\b", re.IGNORECASE)
+# `m_axis_tvalid = '1' and m_axis_tready = '1'`: the DUT's own handshake decides.
+_HANDSHAKE_RE = re.compile(r"\bm_axis_tvalid\s*=\s*'1'\s+and\s+m_axis_tready\s*=\s*'1'"
+                           r"|\bm_axis_tready\s*=\s*'1'\s+and\s+m_axis_tvalid\s*=\s*'1'", re.IGNORECASE)
+_IF_RE = re.compile(r"\bif\b", re.IGNORECASE)
+_END_IF_RE = re.compile(r"\bend\s+if\b", re.IGNORECASE)
+
+
+def _csv_gated_compare(lines: list[str]) -> str | None:
+    """The `if <csv tvalid> = 1` line whose block compares the DUT's
+    m_axis_tdata, or None. Collecting expected beats inside such a block
+    (`exp_beats(n) := v_m_axis_tdata`) is the correct pattern and is not
+    a compare."""
+    for start, line in enumerate(lines):
+        if not _CSV_TVALID_GATE_RE.search(line):
+            continue
+        depth = 0
+        for inner in lines[start:]:
+            depth += len(_IF_RE.findall(inner)) - 2 * len(_END_IF_RE.findall(inner))  # 'end if' also matches \bif\b
+            if _DUT_TDATA_CMP_RE.search(inner):
+                return line.strip()
+            if depth <= 0:
+                break
+    return None
+
+
+def _streaming_checks(spec: dict, code: str) -> list[dict]:
+    """Streaming designs (AXI-Stream handshake ports) answer a few cycles
+    after the input beat, and the vectors put the expected output on the
+    SAME row as the input beat (matlab_golden_model_rules, STREAMING
+    DESIGNS). A testbench that compares cycle by cycle therefore fails on
+    every beat ("expected 24_50_141 got 0_0_0" in the LLR runs). Require
+    the beat-order pattern from vhdl_2008_testbench_rules instead."""
+    names = {str(p.get("name", "")).lower() for p in (spec.get("ports") or []) if isinstance(p, dict)}
+    if not _STREAM_PORTS <= names:
+        return []
+    lines = [line.split("--", 1)[0] for line in code.splitlines()]       # drop comments
+    rule = ("STREAMING DESIGNS rule: collect the outputs rows with m_axis_tvalid = 1 as the expected beats, "
+            "and compare m_axis_tdata with the next expected beat on every rising edge where the DUT's "
+            "m_axis_tvalid = '1' and m_axis_tready = '1'; never on the cycle of the outputs row.")
+    issues: list[dict] = []
+    gate = _csv_gated_compare(lines)
+    if gate:
+        issues.append({"code": "streaming_cycle_compare",
+                       "detail": f"'{gate}' compares m_axis_tdata on the cycle the CSV row says, but the "
+                                 f"pipeline answers several cycles later, so every beat mismatches. {rule}"})
+    if not _HANDSHAKE_RE.search(chr(10).join(lines)):
+        issues.append({"code": "streaming_no_handshake_compare",
+                       "detail": f"No compare guarded by the DUT's handshake (m_axis_tvalid = '1' and "
+                                 f"m_axis_tready = '1') was found. {rule}"})
     return issues
 
 

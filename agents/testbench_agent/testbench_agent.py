@@ -12,7 +12,7 @@
 #                    +- finalize_testbench -> END (COMPLETE)
 #                    +- limit / fixes not converging -> END (NEEDS_REVIEW | FAILED)
 #
-# `decide` asks the LLM policy (TestbenchDecider) for the next action, then
+# `decide` asks the decider (TestbenchDecider, an LLM) for the next action, then
 # applies deterministic guardrails (testbench_guard). Every generation is
 # followed by the linter (static checks + DUT/testbench compile); lint
 # issues feed the next generation as fix instructions.
@@ -24,6 +24,7 @@ import threading
 
 from langgraph.graph import END, START, StateGraph
 
+from agents.testbench_agent.dto import agent_result_dto, decider_input_dto
 from agents.testbench_agent.state import (
     MAX_ITERATIONS, MAX_STALLED_FIXES, Action, TestbenchAgentState, TestbenchStatus, initial_state,
 )
@@ -53,7 +54,7 @@ class TestbenchAgent:
                 "last_action": None,
                 "error": stop_reason,
             }
-        decision = guard(self.tools.decider.decide(self.summary(state)), state)
+        decision = guard(self.tools.decider.decide(decider_input_dto(state)), state)
         return {
             "iteration": iteration + 1,
             "last_action": decision.action.value,
@@ -72,7 +73,8 @@ class TestbenchAgent:
         lint_issues = (state.get("lint") or {}).get("issues") or []
         try:
             testbench = self.tools.generator.generate(
-                state["spec"], state["rtl"], state.get("skills"), state.get("testbench"), lint_issues)
+                state["spec"], state["rtl"], state.get("skills"), state.get("testbench"), lint_issues,
+                attempt=state.get("attempt", 1), attempt_history=state.get("attempt_history"))
         except Exception as e:  # LLM/transport failure: end the run, don't crash the caller
             return {"status": TestbenchStatus.FAILED.value, "error": f"testbench generation failed: {e}"}
         return {"testbench": testbench, "lint": None, "error": None}
@@ -122,11 +124,16 @@ class TestbenchAgent:
         return g
 
     # ── public API ───────────────────────────────────────────────────────
-    def run(self, spec: dict, rtl: dict) -> dict:
+    def run(self, spec: dict, rtl: dict, requirement_id: str | None = None, attempt: int = 1,
+            attempt_history: list[dict] | None = None) -> dict:
+        """requirement_id / attempt / attempt_history: the orchestrator's note saying
+        which run this call belongs to, whether it is the 1st, 2nd, ... call for it,
+        and how the earlier calls went ({attempt, status, error, issues, downstream?} each)."""
+        start = initial_state(spec, rtl, requirement_id, attempt, attempt_history)
         problem = self.check_inputs(rtl)
         if problem:
-            return self.summarize({**initial_state(spec, rtl), "status": TestbenchStatus.FAILED.value, "error": problem})
-        return self.summarize(self.graph.invoke(initial_state(spec, rtl)))
+            return agent_result_dto({**start, "status": TestbenchStatus.FAILED.value, "error": problem})
+        return agent_result_dto(self.graph.invoke(start))
 
     @staticmethod
     def check_inputs(rtl: dict) -> str | None:
@@ -137,32 +144,6 @@ class TestbenchAgent:
             return "rtl.code contains no entity declaration — provide the RTL agent's output, not a placeholder."
         return None
 
-    @staticmethod
-    def summary(state: TestbenchAgentState) -> dict:
-        """Compact view handed to the planner."""
-        return {
-            "spec": state.get("spec"),
-            "rtl_entity": (state.get("rtl") or {}).get("entity_name"),
-            "skills_loaded": state.get("skills_loaded", False),
-            "skill_names": list((state.get("skills") or {}).keys()),
-            "has_testbench": state.get("testbench") is not None,
-            "lint": state.get("lint"),
-            "iteration": state.get("iteration", 0),
-            "max_iterations": MAX_ITERATIONS,
-        }
-
-    @staticmethod
-    def summarize(state: dict) -> dict:
-        return {
-            "status": state.get("status", TestbenchStatus.RUNNING.value),
-            "testbench": state.get("testbench"),
-            "lint": state.get("lint"),
-            "skills_used": list((state.get("skills") or {}).keys()),
-            "iteration": state.get("iteration", 0),
-            "decision_reason": state.get("decision_reason"),
-            "warnings": state.get("warnings", []),
-            "error": state.get("error"),
-        }
 
 
 # ── module-level API (kept for existing callers) ───────────────────────────
@@ -179,6 +160,8 @@ def get_agent() -> TestbenchAgent:
         return _default_agent
 
 
-def run_testbench_generation(spec: dict, rtl: dict) -> dict:
-    """Returns {"status", "testbench", "lint", "skills_used", "iteration", "decision_reason", "warnings", "error"}."""
-    return get_agent().run(spec, rtl)
+def run_testbench_generation(spec: dict, rtl: dict, requirement_id: str | None = None, attempt: int = 1,
+                             attempt_history: list[dict] | None = None) -> dict:
+    """Returns dto.agent_result_dto: {"status", "requirement_id", "attempt", "testbench", "lint",
+    "skills_used", "iteration", "decision_reason", "warnings", "error"}."""
+    return get_agent().run(spec, rtl, requirement_id, attempt, attempt_history)

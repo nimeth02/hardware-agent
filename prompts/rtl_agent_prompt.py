@@ -75,10 +75,67 @@ Return the complete corrected design (same JSON structure). Fix every
 listed issue, keep everything that was already correct, and do not
 introduce new ports or behaviour.
 
+HOW TO FIX (general rules)
+- Compiler errors cascade: one early mistake (a bad declaration, a missing
+  ';') produces many later errors. Fix the EARLIEST problems first and
+  expect the later ones to disappear. The list may be cut short; a line
+  "N more issues not shown" means fix the shown ones and the rest will be
+  re-checked.
+- Edit "previous_code" in place: return the SAME file with only the broken
+  parts changed. Never paste a second copy of the design or of any part of
+  it; the answer has exactly one entity and one architecture.
+- If the same kind of issue appears on many lines, fix the whole pattern
+  everywhere, and prefer a shorter, simpler way of writing it (one helper
+  function instead of copies) over patching each line.
+- Re-read the design rules (skills) for every construct you are about to
+  change before you rewrite it.
+
 If an issue says "cannot read from 'out' object X": keep X as `out`,
 declare `signal X_i` of the same type, replace every read of X inside
 the architecture with X_i, and add `X <= X_i;`. Fix ALL such issues in
 this rewrite, before anything else.
+"""
+
+
+# Appended when the orchestrator calls the agent again for the same
+# requirement (attempt 2, 3, ...) and hands over how the earlier calls went.
+RTL_RETRY_ADDENDUM = """
+
+This is attempt {ATTEMPT} for this requirement: your earlier attempt(s)
+were not accepted. The user message carries "attempt_history", one entry
+per earlier attempt: {"attempt", "status", "error", "issues"} — "issues"
+are the lint/compiler problems that remained when that attempt stopped.
+
+An entry may also have "downstream": a later simulation or implementation
+failed and blamed this RTL. Its "failures" quote the wrong outputs
+("cycle N: port expected X got Y") and "suggested_fix" says what to change.
+Fix that behaviour first — a clean lint was not enough last time.
+A "downstream" note with "second_opinion": true means another stage was
+blamed first and redone without effect, so the fault may be here after
+all: check what its "summary" asks for. An entry may also have
+"human_note": what the person running the flow said to do. Follow it.
+
+Avoid every listed problem from the start of this design. A design that
+repeats any of them will be rejected again.
+"""
+
+
+# Appended on a retry when the orchestrator also hands over the RTL the
+# previous call delivered: revise that code, do not write a new design.
+RTL_REVISE_ADDENDUM = """
+
+The user message also carries "previous_code": the RTL your previous
+attempt delivered. It compiled and passed lint; it failed only on what
+"attempt_history" reports (usually a "downstream" simulation or
+implementation failure). REVISE that code, do not start again:
+- Edit "previous_code" in place and return the SAME file with only the
+  parts the reported failures need changed. Keep every entity, port,
+  signal name and every piece of logic that was not reported as wrong.
+- Trace each reported failure to the lines that cause it and change those;
+  do not rewrite working logic in a new style, that only adds new mistakes.
+- Keep the design-rule skills satisfied in the parts you touch.
+- If a failure cannot be fixed without changing the structure of one
+  process or pipeline stage, change that one part and say so in "notes".
 """
 
 

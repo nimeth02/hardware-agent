@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -48,15 +49,32 @@ def parse_analysis_response(raw: str, sim: dict | None) -> dict:
 
 
 # The Vivado MCP server now returns logs up to 200 KB so the UI can show the
-# whole xsim/xvhdl output. The LLM only needs the tail (assert messages and
-# the PASSED/FAILED marker come last), so trim at this boundary.
+# whole xsim/xvhdl output. The LLM needs the FIRST mismatches (the clearest
+# evidence: the earliest cycle that went wrong) and the tail (the
+# PASSED/FAILED marker), not the warnings in between, so keep both ends.
+LLM_LOG_HEAD = 3000
 LLM_LOG_TAIL = 6000
+_FIRST_ERROR = re.compile(r"^.*\b(Error|ERROR|Failure|FAILURE|Fatal|FATAL)\b.*$", re.MULTILINE)
 
 
-def _tail(text, limit: int = LLM_LOG_TAIL):
-    if not isinstance(text, str) or len(text) <= limit:
+def _first_error_at(text: str) -> int:
+    """Where the first error line starts (0 if there is none)."""
+    match = _FIRST_ERROR.search(text)
+    return match.start() if match else 0
+
+
+def _tail(text, head: int = LLM_LOG_HEAD, tail: int = LLM_LOG_TAIL):
+    """The log cut for the LLM: `head` chars from the first error line, then
+    `tail` chars from the end. Short logs are returned as they are."""
+    if not isinstance(text, str) or len(text) <= head + tail:
         return text
-    return f"... [first {len(text) - limit} chars omitted for the LLM; full log in the run record]\n" + text[-limit:]
+    start = _first_error_at(text)
+    skipped = f"... [first {start} chars omitted for the LLM; full log in the run record]\n" if start else ""
+    if len(text) - start <= head + tail:
+        return skipped + text[start:]
+    middle = len(text) - start - head - tail
+    return (skipped + text[start:start + head]
+            + f"\n... [{middle} chars omitted for the LLM; full log in the run record]\n" + text[-tail:])
 
 
 def _trim_for_llm(compile_result: dict | None, sim: dict | None) -> tuple[dict | None, dict | None]:

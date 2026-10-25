@@ -32,9 +32,11 @@ class FakeGenerator(TestVectorGenerator):
         self.results = list(results)
         self.calls: list[dict] = []
 
-    def generate(self, spec, run_dir, skills=None, previous_result=None, validation_issues=None):
+    def generate(self, spec, run_dir, skills=None, previous_result=None, validation_issues=None,
+                 attempt=1, attempt_history=None):
         self.calls.append({"run_dir": run_dir, "skills": dict(skills or {}), "previous": previous_result,
-                           "issues": list(validation_issues or [])})
+                           "issues": list(validation_issues or []), "attempt": attempt,
+                           "attempt_history": list(attempt_history or [])})
         return self.results.pop(0) if len(self.results) > 1 else self.results[0]
 
 
@@ -94,6 +96,31 @@ def test_clean_validation_finalizes(tmp_path):
     out = make_agent([GOOD], [CLEAN]).run(SPEC, str(tmp_path))
     assert out["status"] == TestVectorStatus.COMPLETE.value
     assert out["result"] == GOOD and out["validation"] == CLEAN and out["error"] is None
+    assert out["requirement_id"] is None and out["attempt"] == 1            # called on its own: no orchestrator note
+
+
+EARLIER = [{"attempt": 1, "status": "NEEDS_REVIEW", "error": "fix attempts left the validation issues unchanged",
+            "issues": DIRTY["issues"], "likely_cause": None}]
+
+
+def test_the_agent_knows_which_orchestrator_call_it_is_and_tells_the_generator(tmp_path):
+    agent = make_agent([GOOD], [CLEAN])
+    out = agent.run(SPEC, str(tmp_path), requirement_id="counter_T-11.35_D-16.10.2026", attempt=2, attempt_history=EARLIER)
+    assert out["requirement_id"] == "counter_T-11.35_D-16.10.2026" and out["attempt"] == 2
+    assert agent.tools.generator.calls[0]["attempt"] == 2                   # the generator is told it is the 2nd call
+    assert agent.tools.generator.calls[0]["attempt_history"] == EARLIER      # and how the 1st one went
+    first_call = make_agent([GOOD], [CLEAN])
+    first_call.run(SPEC, str(tmp_path))                                     # called on its own: 1st call, no history
+    assert first_call.tools.generator.calls[0]["attempt"] == 1
+    assert first_call.tools.generator.calls[0]["attempt_history"] == []
+
+
+def test_on_a_later_attempt_the_generator_prompt_carries_the_orchestrator_feedback():
+    system1, payload1 = TestVectorGenerator._prompt(SPEC, "x", None, None, None)
+    system2, payload2 = TestVectorGenerator._prompt(SPEC, "x", None, None, None, attempt=2, attempt_history=EARLIER)
+    assert "attempt 2" not in system1 and "attempt_history" not in payload1   # 1st call: prompt unchanged
+    assert "This is attempt 2 for this requirement" in system2
+    assert payload2["attempt_history"] == EARLIER and payload2["spec"] == SPEC
 
 
 def test_validation_issues_trigger_a_fix_with_feedback(tmp_path):
@@ -186,8 +213,14 @@ def test_validator_checks_both_files_their_layout_and_that_they_line_up(monkeypa
     assert "out_of_range" in codes
 
     del files["test_vectors_out.csv"]
-    codes = [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]
-    assert "csv_missing" in codes
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    missing = next(i for i in issues if i["code"] == "csv_missing")
+    assert "['cycle', 'count']" in missing["detail"]                           # the fix prompt gets the exact header
+
+    files["test_vectors_out.csv"] = "cycle,cnt\n0,0\n1,1\n"                   # wrong port name
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    column = next(i for i in issues if i["code"] == "port_column_missing")
+    assert "'count'" in column["detail"] and "['cycle', 'count']" in column["detail"] and "['cycle', 'cnt']" in column["detail"]
 
 
 def test_run_guard_rejects_unknown_scripts_without_counting_a_failure():
@@ -259,3 +292,42 @@ def test_agent_only_has_restricted_actions():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_old_csvs_are_deleted_before_every_matlab_run_and_the_last_run_is_recorded(tmp_path):
+    """Run 161047: the script was rewritten, its new run crashed, and the CSVs of
+    the earlier (different) script stayed on disk and passed validation."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator import _guard_run_tool, new_run_state
+
+    stale = tmp_path / "test_vectors_in.csv"
+    stale.write_text("cycle,old\n0,0\n")
+    (tmp_path / "gen_test_vectors.m").write_text("x = 1;")
+    seen_at_run: list[bool] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        seen_at_run.append(stale.exists())
+        return '{"status": "error", "error": "Undefined function at line 163"}' if len(seen_at_run) == 1 \
+            else '{"status": "ok", "output": "wrote 60 rows"}'
+
+    state = new_run_state()
+    tools = _guard_run_tool([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                             StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")],
+                            state=state)
+    gen, run = {t.name: t for t in tools}["generate_matlab_script"], {t.name: t for t in tools}["run_matlab_script"]
+
+    async def scenario():
+        assert state["last_run"] is None
+        await gen.ainvoke({"filename": "gen_test_vectors", "code": "x", "project_dir": str(tmp_path)})
+        await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": str(tmp_path)})
+        assert state["last_run"] == {"status": "error", "error": '{"status": "error", "error": "Undefined function at line 163"}'}
+        await gen.ainvoke({"filename": "gen_test_vectors", "code": "y", "project_dir": str(tmp_path)})
+        await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": str(tmp_path)})
+        assert state["last_run"] == {"status": "ok", "error": ""}
+    asyncio.run(scenario())
+    assert seen_at_run == [False, False]          # the stale CSV was gone before MATLAB started, both times
+    assert (tmp_path / "gen_test_vectors.m").exists()   # only CSVs are cleared, never the script

@@ -45,7 +45,7 @@ enforced, not hoped for.
 | LLM | Ollama serving `qwen3-coder-next` (80B, 262k context) through its OpenAI-compatible API (`langchain-openai`) |
 | Tool servers | MCP (`mcp<2`, FastMCP) over stdio: file server (scoped read/list/write, no delete), Vivado server (`run_xvhdl`, `run_simulation`, `run_vivado_batch`), MATLAB server (`generate_matlab_script`, `run_matlab_script`) via `langchain-mcp-adapters` |
 | EDA | Xilinx Vivado 2020.1 (`xvhdl`, `xelab`, `xsim`, batch synth/impl) local, or on another machine over SSH (`VIVADO_REMOTE_*` in `.env`, needs `pip install paramiko`); MATLAB R2026a + `matlabengine` |
-| Backend / UI | FastAPI + uvicorn, Server-Sent Events for live run timelines, a Stop button that ends a live run at its next step, vanilla HTML/CSS/JS (no build step) |
+| Backend / UI | FastAPI + uvicorn, Server-Sent Events for live run timelines, a Stop button that ends a live run at its next step, vanilla HTML/CSS/JS (no build step), plus an alternative Streamlit UI (`server/streamlit_app.py`) |
 | Observability | SQLite (`observability/traces.db`): LLM traces, per-node step timings, agent runs/events/tool calls (incl. the orchestrator's `agent_input` / `agent_output` / `state` events), queried from the UI |
 | Persistence | LangGraph SQLite checkpointers in `checkpoints/` (resumable spec-analysis sessions) |
 | Tests | pytest, fake tools only (no LLM, MCP, Vivado or MATLAB needed) |
@@ -60,7 +60,7 @@ skills/                 markdown rule files loaded into generator prompts (RTL: 
 mcp_servers/            file_server.py, vivado_server.py (+ vivado_env.py), matlab_server.py (+ matlab_engine.py)
 services/               .env config, LLM client, MCP client, checkpoint store
 observability/          tracing callback, run store, SQLite schema
-server/                 FastAPI app (server/app.py) and static UI (server/static/)
+server/                 FastAPI app (server/app.py), static UI (server/static/) and Streamlit UI (server/streamlit_app.py)
 projects/               example projects the simulation/implementation agents run as-is (see projects/README.md)
 tests/                  unit tests per agent
 .claude/agents/         Claude Code subagents used during development (ui-backend, project-guide, source-control)
@@ -94,6 +94,9 @@ cp .env.example .env        # then edit the paths/model for your machine
 ```bash
 # from Git Bash, in the repo root; do NOT use --reload (unreliable on Windows)
 python -m uvicorn server.app:app --port 8000
+
+# optional alternative UI (needs the backend above), then open http://localhost:8501
+python -m streamlit run server/streamlit_app.py --server.port 8501
 ```
 
 Open <http://localhost:8000>:

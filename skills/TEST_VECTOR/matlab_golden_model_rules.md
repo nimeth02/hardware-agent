@@ -43,6 +43,27 @@ SCRIPT STRUCTURE (preallocate two matrices, convert once)
   matrices above avoid orientation errors.
 
 ═══════════════════════════════════════════════════════════════════
+ONE FLAT SCRIPT, NO LOCAL FUNCTIONS (the #1 cause of failed runs now)
+═══════════════════════════════════════════════════════════════════
+
+- Do NOT define functions in the script (`function y = f(x) ... end`).
+  Script variables are invisible inside them ("Unrecognized function or
+  variable 'TWO'"), and a definition in the wrong place fails with
+  "Function definitions are not supported in this context". Put the
+  logic inline in the loop; for a small formula use an anonymous
+  function that takes everything it needs as arguments:
+      wrap  = @(x, nbits) mod(x, 2^nbits);
+      demap = @(i, q, scale) ...;              % no free variables inside
+- One row = one value per column name. Build the row from the SAME list
+  the header uses and check it, so "size of the left side is 1-by-3 and
+  the size of the right side is 1-by-4" cannot happen:
+      row = [c, clk, rst, en];
+      assert(numel(row) == numel(in_names), 'row/header mismatch');
+      ins(c+1, :) = row;
+  Every output port in out_names needs a value every cycle, even when it
+  is "don't care" (write 0).
+
+═══════════════════════════════════════════════════════════════════
 NUMBER TYPES (the #1 cause of failed runs)
 ═══════════════════════════════════════════════════════════════════
 
@@ -104,6 +125,15 @@ CSV LAYOUT (validated)
   test_vectors_in.csv), even though their names look the other way round.
 - Active-low resets (`aresetn`, `rst_n`): 0 while in reset, 1 afterwards.
   Active-high resets (`rst`): 1 while in reset, 0 afterwards.
+- STREAMING designs (AXI-Stream tvalid/tready ports): the RTL answers
+  several cycles after the input beat and the exact delay is not known
+  here, so the testbench compares output beats IN ORDER, not by cycle.
+  Write the expected result of an input beat on the SAME row as that
+  input, with m_axis_tvalid = 1 on that row and 0 on rows with no beat;
+  put 1 in s_axis_tready on every row after reset. The outputs-row cycle
+  is only used to label errors. Put m_axis_tready = 0 on a few rows (with
+  no new input beat on those rows) to exercise backpressure; the testbench
+  holds its comparison while m_axis_tready = 0.
 
 ═══════════════════════════════════════════════════════════════════
 COVERAGE

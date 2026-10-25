@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import TypedDict
 
-MAX_ITERATIONS = 6              # planner decisions per run; checked in TestbenchAgent.decide_node
+MAX_ITERATIONS = 10            # decider decisions per run; checked in TestbenchAgent.decide_node
 MAX_STALLED_FIXES = 2           # fix regenerations that leave the lint issues unchanged before giving up
 AGENT_NAME = "testbench_agent"  # observability source tag for this agent's LLM calls
 SKILLS_DIR = "skills/TESTBENCH" # testbench-rule files, loaded through the file-server MCP
@@ -29,7 +29,7 @@ class TestbenchStatus(str, Enum):
 
 
 class Action(str, Enum):
-    """The only things the agent can do. Chosen by the planner LLM
+    """The only things the agent can do. Chosen by the decider LLM
     (TestbenchDecider), validated by the guardrails; each value is also the
     name of the graph node that executes it."""
 
@@ -41,11 +41,14 @@ class Action(str, Enum):
 
 class TestbenchAgentState(TypedDict, total=False):
     """Everything LangGraph tracks for one run. Nodes return partial updates;
-    TestbenchAgent.summarize() turns it into the API response."""
+    dto.agent_result_dto() turns it into the API response."""
 
     # --- inputs ---
     spec: dict                    # the approved specification
     rtl: dict                     # the design under test {entity_name, code, ...}
+    requirement_id: str | None    # the orchestrator's run this call belongs to (None when called on its own)
+    attempt: int                  # which call this is from the orchestrator for that requirement: 1 = first
+    attempt_history: list[dict]   # how the earlier calls went, oldest first: {attempt, status, error, issues, downstream?}
 
     # --- working data ---
     skills: dict[str, str]        # skill file name -> content, injected into the generator prompt
@@ -59,17 +62,21 @@ class TestbenchAgentState(TypedDict, total=False):
 
     # --- control / reporting ---
     status: str                   # a TestbenchStatus value
-    iteration: int                # planner decisions taken so far; compared with MAX_ITERATIONS
+    iteration: int                # decider decisions taken so far; compared with MAX_ITERATIONS
     last_action: str | None       # the Action just chosen — routes decide -> that node
-    decision_reason: str | None   # planner's (or guard's) one-line justification
+    decision_reason: str | None   # decider's (or guard's) one-line justification
     warnings: list[str]           # non-fatal problems (e.g. skills could not be loaded)
     error: str | None             # why the run ended in FAILED / NEEDS_REVIEW
 
 
-def initial_state(spec: dict, rtl: dict) -> TestbenchAgentState:
+def initial_state(spec: dict, rtl: dict, requirement_id: str | None = None, attempt: int = 1,
+                  attempt_history: list[dict] | None = None) -> TestbenchAgentState:
     return {
         "spec": spec,
         "rtl": rtl,
+        "requirement_id": requirement_id,
+        "attempt": attempt,
+        "attempt_history": attempt_history or [],
         "skills": {},
         "skills_loaded": False,
         "testbench": None,

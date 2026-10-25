@@ -1,6 +1,6 @@
 # agents/test_vector_agent/test_vector_guard.py — deterministic guardrails
-# applied to every planner decision before the graph acts on it. The
-# planner (LLM) suggests; these rules, using only facts from the state,
+# applied to every decider decision before the graph acts on it. The
+# decider (LLM) suggests; these rules, using only facts from the state,
 # have the final say. Rules run in order; the first one that objects
 # replaces the decision.
 
@@ -39,7 +39,7 @@ def validate_before_finalize(decision: Decision, state: TestVectorAgentState) ->
 
 
 def no_finalize_with_issues(decision: Decision, state: TestVectorAgentState) -> Decision | None:
-    """The validator decides when the vectors are done, not the planner."""
+    """The validator decides when the vectors are done, not the decider."""
     if decision.action is Action.FINALIZE_VECTORS and (state.get("validation") or {}).get("issues"):
         return Decision(Action.GENERATE_VECTORS, "guard: cannot finalize while the validator reports issues; fixing")
     return None
