@@ -42,7 +42,7 @@ enforced, not hoped for.
 | Layer | Technology |
 |---|---|
 | Agents | Python 3.13, LangChain 1.x, LangGraph 1.x (state graphs, `interrupt` for human-in-the-loop, `create_agent` tool loop for the orchestrator) |
-| LLM | Ollama serving `qwen3-coder-next` (80B, 262k context) through its OpenAI-compatible API (`langchain-openai`) |
+| LLM | Ollama serving `qwen3-coder-next` (80B, 262k context) locally, or OpenRouter in the cloud (`LLM_PROVIDER=openrouter` + `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` in `.env`); both through the OpenAI-compatible API (`langchain-openai`) |
 | Tool servers | MCP (`mcp<2`, FastMCP) over stdio: file server (scoped read/list/write, no delete), Vivado server (`run_xvhdl`, `run_simulation`, `run_vivado_batch`), MATLAB server (`generate_matlab_script`, `run_matlab_script`) via `langchain-mcp-adapters` |
 | EDA | Xilinx Vivado 2020.1 (`xvhdl`, `xelab`, `xsim`, batch synth/impl) local, or on another machine over SSH (`VIVADO_REMOTE_*` in `.env`, needs `pip install paramiko`); MATLAB R2026a + `matlabengine` |
 | Backend / UI | FastAPI + uvicorn, Server-Sent Events for live run timelines, a Stop button that ends a live run at its next step, vanilla HTML/CSS/JS (no build step), plus an alternative Streamlit UI (`server/streamlit_app.py`) |
@@ -57,7 +57,7 @@ agents/                 one package per agent (state, tools, planner, guard, gra
                         + pipeline_agent/ (fixed-order flow) + vhdl_version.py (which VHDL edition a design uses)
 prompts/                system and planner prompts, one file per agent
 skills/                 markdown rule files loaded into generator prompts (RTL: one rulebook per VHDL edition, TESTBENCH, TEST_VECTOR)
-mcp_servers/            file_server.py, vivado_server.py (+ vivado_env.py), matlab_server.py (+ matlab_engine.py)
+mcp_servers/            file_server.py, vivado_server.py (+ vivado_env.py), matlab_server/ (matlab_server.py + matlab_engine.py)
 services/               .env config, LLM client, MCP client, checkpoint store
 observability/          tracing callback, run store, SQLite schema
 server/                 FastAPI app (server/app.py), static UI (server/static/) and Streamlit UI (server/streamlit_app.py)
@@ -76,7 +76,7 @@ CLAUDE.md               how Claude Code must explain things to the owner (plain 
 |---|---|
 | Windows 11 with **Git Bash** | Vivado's `settings64.sh` is sourced through `bash`, so run the server from Git Bash (or make sure `bash` is on PATH) |
 | **Python 3.13** | global install is fine; no virtual environment is required |
-| **Ollama** with the model pulled | `ollama pull qwen3-coder-next` (any tool-calling model works; set `LLM_MODEL`) |
+| **Ollama** with the model pulled, or an **OpenRouter** key | `ollama pull qwen3-coder-next` (any tool-calling model works; set `LLM_MODEL`), or set `LLM_PROVIDER=openrouter`, `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` in `.env` (no local model needed; `LLM_TIMEOUT_SECONDS` caps one request) |
 | **Vivado 2020.1** (WebPACK is enough) | needed by the RTL/testbench linters, simulation and implementation agents; without it those steps report `compiler: null` / environment errors. It may live on another machine: set `VIVADO_REMOTE_HOST/USER/PASSWORD/KEY/SETTINGS64` in `.env` and `pip install paramiko` |
 | **MATLAB R2026a** + `matlabengine` | only for `test_vector_agent`; the rest of the flow works without MATLAB |
 
@@ -132,7 +132,8 @@ The suite uses fake tools, so it needs no LLM, Vivado or MATLAB.
 
 | Symptom | Cause / fix |
 |---|---|
-| run ends `FAILED: Connection error` | Ollama is not running or the model is not pulled |
+| run ends `FAILED: Connection error` | Ollama is not running or the model is not pulled; with `LLM_PROVIDER=openrouter`, no internet or a wrong `OPENROUTER_API_KEY` |
+| `Missing required LLM env var(s) for provider '...'` | `.env` lacks the variables the chosen `LLM_PROVIDER` needs (`OLLAMA_API_BASE`/`LLM_MODEL` or `OPENROUTER_API_KEY`/`OPENROUTER_MODEL`); copy them from `.env.example` |
 | `Vivado environment not available: failed to source …settings64.sh` | `bash` not on PATH (start from Git Bash) or wrong `VIVADO_SETTINGS64` |
 | `compiler: null` in lint results | Vivado unavailable; static checks still ran |
 | `No SIMULATION PASSED/FAILED marker` | testbench ran past `sim_time` or never prints the marker; the agent reruns once with a longer `sim_time` |
@@ -147,6 +148,9 @@ Create `projects/<name>/` with `spec.json`, `src/*.vhd`, `tb/<entity>_tb.vhd`
 and optionally the test-vector CSVs (`test_vectors_in.csv` +
 `test_vectors_out.csv`, or a single `test_vectors.csv` as in `counter4`);
 see `projects/README.md`. Vivado output (`work_proj/`, `impl_out/`, generated
-`scripts/` and `constraints/`) is git-ignored, and so are the folders the
+`scripts/` and `constraints/`) is git-ignored, and so is every other folder
+under `projects/` (`projects/*` in `.gitignore`), including the ones the
 orchestrator generates (`projects/<name>_T-hh.mm_D-dd.mm.yyyy/`); only
-hand-written examples such as `counter4` are committed.
+hand-written examples such as `counter4` are committed (un-ignored by name).
+When a fix round rewrites a generated project's RTL or testbench, the
+previous version is kept in `projects/<name>/history/`.

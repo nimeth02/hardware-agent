@@ -24,7 +24,7 @@ from agents.test_vector_agent.dto import agent_result_dto, decider_input_dto
 from agents.test_vector_agent.state import (
     MAX_ITERATIONS, MAX_STALLED_FIXES, Action, TestVectorAgentState, TestVectorStatus, initial_state,
 )
-from agents.test_vector_agent.test_vector_generator import shared_matlab_session
+from agents.test_vector_agent.test_vector_generator_agent.matlab_session import shared_matlab_session
 from agents.test_vector_agent.test_vector_guard import guard
 from agents.test_vector_agent.tools import TestVectorAgentTools
 from services.config import REPO_ROOT
@@ -146,11 +146,12 @@ class TestVectorAgent:
         # One MATLAB for the whole run: every generate_vectors attempt inside
         # the block reuses the same MATLAB MCP server instead of booting a
         # fresh MATLAB (1–2 min) per attempt. Closed when the run ends.
-        with shared_matlab_session() as matlab:
-            # TODO(human): when should MATLAB be switched on? Leave this empty
-            # and it starts on the first generate_vectors attempt (nothing is
-            # booted if the run stops before that). Or call `matlab.start()`
-            # here so MATLAB boots while skills are still being loaded.
+        with shared_matlab_session():
+            # MATLAB is started lazily, on the first generate_vectors attempt:
+            # a run that stops while loading skills (or in tests, which use a
+            # fake generator) never boots it. Starting it here would save the
+            # few seconds the skill load takes, at the price of a 1–2 minute
+            # boot for every run that never reaches MATLAB.
             return agent_result_dto(self.graph.invoke(
                 initial_state(spec, run_dir, requirement_id, attempt, attempt_history)))
 

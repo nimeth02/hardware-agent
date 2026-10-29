@@ -9,7 +9,7 @@ import pytest
 from agents.test_vector_agent.state import Action, TestVectorStatus
 from agents.test_vector_agent.test_vector_agent import TestVectorAgent
 from agents.test_vector_agent.test_vector_decider import Decision, TestVectorDecider
-from agents.test_vector_agent.test_vector_generator import TestVectorGenerator, parse_test_vector_response
+from agents.test_vector_agent.test_vector_generator_agent.test_vector_generator import TestVectorGenerator, parse_test_vector_response
 from agents.test_vector_agent.test_vector_skill_loader import TestVectorSkillLoader
 from agents.test_vector_agent.tools import TestVectorAgentTools
 
@@ -223,10 +223,34 @@ def test_validator_checks_both_files_their_layout_and_that_they_line_up(monkeypa
     assert "'count'" in column["detail"] and "['cycle', 'count']" in column["detail"] and "['cycle', 'cnt']" in column["detail"]
 
 
+def test_an_input_beat_on_a_blocked_row_is_rejected(monkeypatch):
+    """llr_demap16 run 2026-10-29 12:00: rows with s_axis_tvalid = 1 and
+    m_axis_tready = 0 made the testbench wait forever (no_marker)."""
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = {"ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+        ("aclk", "input", "1"), ("s_axis_tvalid", "input", "1"), ("s_axis_tdata", "input", "8"),
+        ("m_axis_tready", "input", "1"), ("s_axis_tready", "output", "1"),
+        ("m_axis_tvalid", "output", "1"), ("m_axis_tdata", "output", "8")]]}
+    files = {"test_vectors_in.csv": "cycle,aclk,s_axis_tvalid,s_axis_tdata,m_axis_tready\n"
+                                    "0,1,1,5,1\n1,1,0,0,0\n2,1,1,6,0\n3,1,1,7,0\n4,1,1,8,1\n",
+             "test_vectors_out.csv": "cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata\n"
+                                     "0,1,1,10\n1,1,0,0\n2,1,1,12\n3,1,1,14\n4,1,1,16\n"}
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    blocked = [i for i in issues if i["code"] == "beat_while_blocked"]
+    assert len(blocked) == 1 and "row 4" in blocked[0]["detail"]            # first offending row only
+
+    files["test_vectors_in.csv"] = ("cycle,aclk,s_axis_tvalid,s_axis_tdata,m_axis_tready\n"
+                                    "0,1,1,5,1\n1,1,0,0,0\n2,1,0,0,0\n3,1,0,0,0\n4,1,1,8,1\n")
+    assert [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]] == []
+
+
 def test_run_guard_rejects_unknown_scripts_without_counting_a_failure():
     import asyncio
     from langchain_core.tools import StructuredTool
-    from agents.test_vector_agent.test_vector_generator import RunAttemptsExceeded, _guard_run_tool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools
+    from agents.test_vector_agent.test_vector_generator_agent.state import RunAttemptsExceeded
 
     runs: list[str] = []
 
@@ -237,9 +261,9 @@ def test_run_guard_rejects_unknown_scripts_without_counting_a_failure():
         runs.append(script_name)
         return '{"status": "error", "error": "boom"}'
 
-    tools = _guard_run_tool([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="write"),
-                             StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="run")],
-                            max_failures=2)
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="write"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="run")],
+                               max_failures=2)
     gen, run = {t.name: t for t in tools}["generate_matlab_script"], {t.name: t for t in tools}["run_matlab_script"]
 
     async def scenario():
@@ -258,10 +282,10 @@ def test_run_guard_rejects_unknown_scripts_without_counting_a_failure():
 def test_scripts_using_integer_classes_are_rejected_before_being_written():
     import asyncio
     from langchain_core.tools import StructuredTool
-    from agents.test_vector_agent.test_vector_generator import _forbidden_matlab, _guard_run_tool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import forbidden_matlab, guard_matlab_tools
 
-    assert _forbidden_matlab("x = int16(a) + bitshift(b, -2); % uint8( in a comment is fine") == ["bitshift", "int16"]
-    assert _forbidden_matlab("v = mod(x, 2^12); if v >= 2^11, v = v - 2^12; end") == []
+    assert forbidden_matlab("x = int16(a) + bitshift(b, -2); % uint8( in a comment is fine") == ["bitshift", "int16"]
+    assert forbidden_matlab("v = mod(x, 2^12); if v >= 2^11, v = v - 2^12; end") == []
 
     written: list[str] = []
 
@@ -272,8 +296,8 @@ def test_scripts_using_integer_classes_are_rejected_before_being_written():
     async def run_matlab_script(script_name: str, project_dir: str) -> str:
         return '{"status": "ok", "output": "wrote 40 rows"}'
 
-    tools = _guard_run_tool([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
-                             StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
     gen = {t.name: t for t in tools}["generate_matlab_script"]
 
     async def scenario():
@@ -281,6 +305,110 @@ def test_scripts_using_integer_classes_are_rejected_before_being_written():
         assert "REJECTED" in out and "uint32" in out and written == []
         out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "y = mod(5, 2^32);", "project_dir": "x"})
         assert "REJECTED" not in out and written == ["gen_test_vectors.m"]
+    asyncio.run(scenario())
+
+
+def test_scripts_using_non_matlab_operators_are_rejected_before_being_written():
+    """2026-10-29 llr_demap16: every first attempt copied the spec's `>>> 13`
+    into the script and MATLAB stopped with 'Invalid use of operator'."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import forbidden_operators, guard_matlab_tools
+
+    assert forbidden_operators("r = (p + 4096) >>> 13;") == [">>>"]
+    assert forbidden_operators("if a != b, n += 1; end  % x >>> 2 in a comment is fine") == ["!=", "+="]
+    assert forbidden_operators("fprintf('rows >> %d\\n', n); r = floor((p + 4096) / 2^13); if a ~= b, n = n + 1; end") == []
+
+    written: list[str] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        written.append(filename)
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok", "output": "wrote 40 rows"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "r = (p + 4096) >>> 13;", "project_dir": "x"})
+        assert "REJECTED" in out and ">>>" in out and "floor(x / 2^k)" in out and written == []
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "r = floor((p + 4096) / 2^13);", "project_dir": "x"})
+        assert "REJECTED" not in out and written == ["gen_test_vectors.m"]
+    asyncio.run(scenario())
+
+
+def test_scripts_that_pack_a_spec_field_at_the_wrong_bit_are_rejected():
+    """Run 170022 on 2026-10-29: `mod(I,4096)*2^12` for a field the spec puts
+    at [31:20]; every expected beat was wrong while the RTL was right."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import (
+        guard_matlab_tools, missing_field_positions, spec_fields)
+
+    spec = {"ports": [{"name": "s_axis_tdata", "direction": "input", "width": "32"},
+                      {"name": "m_axis_tdata", "direction": "output", "width": "24"}],
+            "behavior": ["Input format: s_axis_tdata[31:20] = I (signed), [19:8] = Q, [7:0] = ns",
+                         "packed into m_axis_tdata[23:18]=b3, [17:12]=b2, [11:6]=b1, [5:0]=b0",
+                         "saturate to range [-32, +31]; other_signal[15:4] = x is not a port"]}
+    assert [(p, hi, lo, n) for p, hi, lo, n in spec_fields(spec)] == [
+        ("s_axis_tdata", 31, 20, "I"), ("m_axis_tdata", 23, 18, "b3")]
+    wrong = "tdata = mod(I,4096)*2^12 + mod(Q,4096)*2^8 + ns; out = u6(b3)*2^18 + u6(b2)*2^12 + u6(b1)*2^6 + u6(b0);"
+    missing = missing_field_positions(spec, wrong)
+    assert len(missing) == 1 and missing[0].startswith("s_axis_tdata[31:20] = I starts at bit 20")
+    right = ("assert(all(I >= -2^11 & I <= 2^11-1), 'I does not fit 12 bits');\n"
+             + wrong.replace("mod(I,4096)*2^12", "mod(I,4096)*2^20"))
+    assert missing_field_positions(spec, right) == []
+    assert missing_field_positions(spec, "x = 1; % s_axis_tdata[31:20] = I * 2^20 only in a comment") != []
+    assert missing_field_positions(None, wrong) == []                      # no spec, nothing to check
+
+    written: list[str] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        written.append(filename)
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")], spec=spec)
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": wrong, "project_dir": "x"})
+        assert "REJECTED" in out and "2^20" in out and written == []
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": right, "project_dir": "x"})
+        assert "REJECTED" not in out and written == ["gen_test_vectors.m"]
+    asyncio.run(scenario())
+
+
+def test_failed_script_is_kept_under_a_numbered_name(tmp_path):
+    """The next attempt overwrites gen_test_vectors.m, so the crashed version
+    was unreadable afterwards (run 164152)."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        (tmp_path / filename).write_text(code)
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "error", "output": "", "error": "Line: 14 Column: 27 Invalid use of operator."}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")], max_failures=5)
+    by = {t.name: t for t in tools}
+
+    async def scenario():
+        await by["generate_matlab_script"].ainvoke({"filename": "gen_test_vectors.m", "code": "bad one", "project_dir": str(tmp_path)})
+        await by["run_matlab_script"].ainvoke({"script_name": "gen_test_vectors", "project_dir": str(tmp_path)})
+        await by["generate_matlab_script"].ainvoke({"filename": "gen_test_vectors.m", "code": "second", "project_dir": str(tmp_path)})
+        assert (tmp_path / "gen_test_vectors.failed1.m").read_text() == "bad one"
+        assert (tmp_path / "gen_test_vectors.m").read_text() == "second"
     asyncio.run(scenario())
 
 
@@ -299,7 +427,8 @@ def test_old_csvs_are_deleted_before_every_matlab_run_and_the_last_run_is_record
     the earlier (different) script stayed on disk and passed validation."""
     import asyncio
     from langchain_core.tools import StructuredTool
-    from agents.test_vector_agent.test_vector_generator import _guard_run_tool, new_run_state
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools
+    from agents.test_vector_agent.test_vector_generator_agent.state import new_run_state
 
     stale = tmp_path / "test_vectors_in.csv"
     stale.write_text("cycle,old\n0,0\n")
@@ -315,9 +444,9 @@ def test_old_csvs_are_deleted_before_every_matlab_run_and_the_last_run_is_record
             else '{"status": "ok", "output": "wrote 60 rows"}'
 
     state = new_run_state()
-    tools = _guard_run_tool([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
-                             StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")],
-                            state=state)
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")],
+                               state=state)
     gen, run = {t.name: t for t in tools}["generate_matlab_script"], {t.name: t for t in tools}["run_matlab_script"]
 
     async def scenario():
@@ -331,3 +460,91 @@ def test_old_csvs_are_deleted_before_every_matlab_run_and_the_last_run_is_record
     asyncio.run(scenario())
     assert seen_at_run == [False, False]          # the stale CSV was gone before MATLAB started, both times
     assert (tmp_path / "gen_test_vectors.m").exists()   # only CSVs are cleared, never the script
+
+
+def test_a_beat_during_reset_is_rejected(monkeypatch):
+    """llr_demap16 run 2026-10-29: the golden model wrote the first beat on
+    cycle 3 while aresetn was still 0, so the design dropped it and every
+    later beat was compared with the wrong expected value."""
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = {"reset": {"name": "aresetn", "active": "low"},
+            "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+                ("aclk", "input", "1"), ("aresetn", "input", "1"), ("s_axis_tvalid", "input", "1"),
+                ("s_axis_tdata", "input", "8"), ("m_axis_tready", "input", "1"), ("s_axis_tready", "output", "1"),
+                ("m_axis_tvalid", "output", "1"), ("m_axis_tdata", "output", "8")]]}
+    header_in = "cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata,m_axis_tready\n"
+    header_out = "cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata\n"
+    files = {"test_vectors_in.csv": header_in + "0,1,0,0,0,1\n1,1,0,1,5,1\n2,1,0,1,6,1\n3,1,1,1,7,1\n",
+             "test_vectors_out.csv": header_out + "0,0,0,0\n1,0,1,10\n2,0,1,12\n3,1,1,14\n"}
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = [i for i in v.validate_test_vectors(spec, "x", {})["issues"] if i["code"] == "beat_during_reset"]
+    assert len(issues) == 1                                                     # first offending row only
+    assert "row 3" in issues[0]["detail"] and "s_axis_tvalid = 1" in issues[0]["detail"]
+    assert "aresetn = 0" in issues[0]["detail"]
+
+    # an expected output beat on a reset row is just as wrong
+    files["test_vectors_in.csv"] = header_in + "0,1,0,0,0,1\n1,1,0,0,0,1\n2,1,1,1,6,1\n"
+    files["test_vectors_out.csv"] = header_out + "0,0,0,0\n1,0,1,10\n2,1,1,12\n"
+    issues = [i for i in v.validate_test_vectors(spec, "x", {})["issues"] if i["code"] == "beat_during_reset"]
+    assert len(issues) == 1 and "row 3" in issues[0]["detail"] and "m_axis_tvalid = 1" in issues[0]["detail"]
+
+    # beats only after the reset is released: clean
+    files["test_vectors_in.csv"] = header_in + "0,1,0,0,0,1\n1,1,0,0,0,1\n2,1,1,1,6,1\n"
+    files["test_vectors_out.csv"] = header_out + "0,0,0,0\n1,0,0,0\n2,1,1,12\n"
+    assert [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]] == []
+
+    # an active-high reset named rst: 1 means "in reset"
+    spec_hi = {**spec, "reset": {"name": "rst", "active": "high"},
+               "ports": [{**p, "name": "rst"} if p["name"] == "aresetn" else p for p in spec["ports"]]}
+    files["test_vectors_in.csv"] = header_in.replace("aresetn", "rst") + "0,1,1,1,5,1\n1,1,0,1,6,1\n"
+    files["test_vectors_out.csv"] = header_out + "0,0,1,10\n1,1,1,12\n"
+    issues = [i for i in v.validate_test_vectors(spec_hi, "x", {})["issues"] if i["code"] == "beat_during_reset"]
+    assert len(issues) == 1 and "row 2" in issues[0]["detail"] and "rst = 1" in issues[0]["detail"]
+
+
+def test_scripts_that_never_check_a_field_fits_its_width_are_rejected():
+    """llr_demap16, 2026-10-29 16:41: gen_test_vectors.m drew I = +2048 for a
+    12-bit signed field; mod(I, 4096) wrapped it to -2048 on the wire and
+    beats 5-6 were reported wrong while the RTL was right."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import (
+        guard_matlab_tools, missing_field_range_asserts)
+
+    spec = {"ports": [{"name": "s_axis_tdata", "direction": "input", "width": "32"},
+                      {"name": "m_axis_tdata", "direction": "output", "width": "24"}],
+            "behavior": ["s_axis_tdata[31:20] = I (signed), s_axis_tdata[19:8] = Q (signed), "
+                         "s_axis_tdata[7:0] = ns (unsigned)",
+                         "m_axis_tdata[23:18] = b3 is an output field: no stimulus assert needed"]}
+    unchecked = ("I = randi([-2048, 2048], 1, 8); tdata = mod(I,4096)*2^20 + mod(Q,4096)*2^8 + mod(ns,256); "
+                 "out = u6(b3)*2^18;")
+    missing = missing_field_range_asserts(spec, unchecked)
+    assert [m.split(" (")[0] for m in missing] == ["s_axis_tdata[31:20] = I", "s_axis_tdata[19:8] = Q",
+                                                   "s_axis_tdata[7:0] = ns"]
+    assert "2^11" in missing[0] and "12 bits" in missing[0]
+    checked = ("assert(all(I >= -2^11 & I <= 2^11-1), 'I');\n"
+               "assert(all(Q >= -2048 & Q <= 2047), 'Q');\n"          # literal bounds count too
+               "assert(all(ns >= 0 & ns <= 2^8-1), 'ns');\n" + unchecked)
+    assert missing_field_range_asserts(spec, checked) == []
+    # an assert with the wrong bound, or only in a comment, does not count
+    assert len(missing_field_range_asserts(spec, "assert(all(I <= 2^15), 'I');\n" + unchecked)) == 3
+    assert len(missing_field_range_asserts(spec, "% assert(all(I <= 2^11-1))\n" + unchecked)) == 3
+    assert missing_field_range_asserts(None, unchecked) == []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")], spec=spec)
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": unchecked, "project_dir": "x"})
+        assert "REJECTED" in out and "fit their bit width" in out and "assert(all(I" in out
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": checked, "project_dir": "x"})
+        assert "REJECTED" not in out
+    asyncio.run(scenario())

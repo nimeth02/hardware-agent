@@ -27,6 +27,30 @@ from agents.rtl_agent.tools import RTLAgentTools
 from agents.vhdl_version import resolve_vhdl_version, skill_matches_version
 
 
+def unchanged_on_retry(state: RTLAgentState) -> dict | None:
+    """A lint issue when a retry delivered the very file the orchestrator
+    handed back to be revised, or None.
+
+    The orchestrator only calls again because that file failed downstream
+    (a simulation blamed it). Returning it unchanged cannot fix anything,
+    but it passes every other check and costs a full simulation to find out
+    (llr_demap16, 2026-10-29: three byte-identical answers, three dry runs,
+    run ended on the step cap). Treated as a lint issue, the normal fix loop
+    asks for a real change and the stall guard ends the call in NEEDS_REVIEW
+    when none comes."""
+    new, old = (state.get("rtl") or {}).get("code"), (state.get("previous_rtl") or {}).get("code")
+    if not new or not old or new.strip() != old.strip():
+        return None
+    blamed = [n for a in state.get("attempt_history") or [] for n in a.get("downstream") or []]
+    failures = [f for n in blamed for f in (n.get("failures") or [])][:5]
+    fixes = [n.get("suggested_fix") for n in blamed if n.get("suggested_fix")]
+    return {"code": "unchanged_on_retry",
+            "detail": "The code returned is identical to previous_code, which a simulation already rejected; "
+                      "returning it again fixes nothing. Change the lines that cause the reported failures"
+                      + (f" ({'; '.join(failures)})" if failures else "")
+                      + (f". Suggested fix: {fixes[-1]}" if fixes else ".")}
+
+
 class RTLAgent:
     def __init__(self, tools: RTLAgentTools | None = None, max_iterations: int = MAX_ITERATIONS):
         self.tools = tools or RTLAgentTools()
@@ -84,6 +108,10 @@ class RTLAgent:
         except Exception as e:
             return {"status": RTLStatus.FAILED.value, "error": f"lint failed: {e}"}
         issues = lint.get("issues") or []
+        unchanged = unchanged_on_retry(state)
+        if unchanged:
+            lint = {**lint, "issues": [*issues, unchanged]}
+            issues = lint["issues"]
         signature = "|".join(f"{i.get('code')}:{i.get('detail')}" for i in issues)
         stalled = bool(issues) and signature == state.get("lint_signature")
         return {

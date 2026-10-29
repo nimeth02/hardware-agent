@@ -36,9 +36,10 @@ SECOND_OPINION_CHECK = {
                               "signal is set), not at a fixed cycle; that every input, including ready/handshake "
                               "signals, is driven from test_vectors_in.csv; and that the compare cycle matches the "
                               "design's real latency",
-    Stage.GENERATE_TEST_VECTORS: "that the expected values, their order and the latency/handshake assumptions "
-                                 "follow the spec exactly, and that no row expects an output before the design "
-                                 "can produce it",
+    Stage.GENERATE_TEST_VECTORS: "that every field is packed into the input word at the bit position the spec "
+                                 "gives (port[hi:lo] = name -> name * 2^lo, and unpack it again to check), that the "
+                                 "expected values, their order and the latency/handshake assumptions follow the "
+                                 "spec exactly, and that no row expects an output before the design can produce it",
     Stage.GENERATE_RTL: "that output timing, the valid/ready handshake and signed/unsigned arithmetic follow the "
                         "spec exactly",
 }
@@ -59,9 +60,14 @@ def downstream_note(by: Stage, analysis: dict) -> dict:
 
     `by` is the stage that failed (simulate or implement). The note keeps the
     parts of its analysis the blamed agent needs: verdict, failures (the exact
-    mismatches), summary and suggested_fix."""
-    return {"stage": by.value, "verdict": analysis.get("verdict"), "failures": analysis.get("failures"),
+    mismatches), summary and suggested_fix, plus "fixed_rule" when a code rule
+    (not the LLM) read the mismatches, so that reading reaches the agent
+    word for word even if the LLM's summary softened it."""
+    note = {"stage": by.value, "verdict": analysis.get("verdict"), "failures": analysis.get("failures"),
             "summary": analysis.get("summary"), "suggested_fix": analysis.get("suggested_fix")}
+    if analysis.get("fixed_rule"):
+        note["fixed_rule"] = analysis["fixed_rule"]
+    return note
 
 
 def times_blamed(stages: dict, stage: Stage) -> int:

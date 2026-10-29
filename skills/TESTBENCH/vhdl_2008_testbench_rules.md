@@ -53,6 +53,15 @@ of your input:
 The simulator stages both files in its working directory, so open them by
 their bare names.
 
+- SIGNED PORTS ARE STORED AS THEIR UNSIGNED BIT PATTERN. A port the spec
+  marks "signed" is written to the CSV as 0 .. 2**N-1 (an 8-bit -127 is
+  stored as 129, -1 as 255). Therefore ALWAYS compare a bus output with
+  `to_integer(unsigned(port))` and drive a bus input with
+  `std_logic_vector(to_unsigned(v, port'length))`, even for signed ports.
+  NEVER use `signed(...)` / `to_signed(...)` on a CSV value: comparing
+  `to_integer(signed(b3))` (= -127) with the CSV's 129 reports a mismatch
+  for every negative value although the RTL is correct.
+
 - Which file a port is in comes from its "direction" in the spec, NOT from
   its name. On an AXI-Stream: `s_axis_tready` is an OUTPUT of the design
   (outputs file), `m_axis_tready` is an INPUT (inputs file). List the
@@ -187,10 +196,41 @@ these designs compare in BEAT ORDER, not cycle by cycle:
 - Drive each inputs row for one cycle, except: a row with s_axis_tvalid = 1
   is held (do not read the next row) until the rising edge at which the
   DUT's s_axis_tready = '1', so the beat is really accepted.
+- AN IDLE ROW (s_axis_tvalid = 0) LASTS EXACTLY ONE EDGE. There is no beat
+  to accept, so s_axis_tready is irrelevant: leave the hold loop at once.
+  The exit line of the hold loop MUST therefore be
+      if cur_s_axis_tvalid = 0 or dut_s_axis_tready = '1' then exit; end if;
+  A loop that exits only on `cur_s_axis_tvalid = 1 and dut_s_axis_tready = '1'`
+  waits 64 edges on EVERY idle row (reset rows, gaps, the rows after the
+  last beat) and reports "cycle N: s_axis_tready never rose (deadlock)"
+  for each of them although the design is fine (llr_demap16, 2026-10-29:
+  cycles 0-1 and 50-59 were all idle rows). The linter rejects that loop.
+- Decide "accepted" from a copy taken AT the edge, like the output side:
+  `dut_s_axis_tready := s_axis_tready;` right after
+  `wait until rising_edge(aclk);`. The beat was taken at this edge only if
+  `dut_s_axis_tready = '1'`; otherwise re-drive the SAME row for the next
+  edge. THE WAIT MUST HAVE A LIMIT: count the edges spent on one row and
+  after 64 report "cycle N: s_axis_tready never rose (deadlock)" severity
+  error, count it, and move on to the next row. A wait without this limit
+  never ends when the DUT cannot accept (its output is blocked while
+  m_axis_tready = '0'): the result marker is never printed and the whole
+  run is reported as "no_marker" instead of a clear error.
 - On EVERY rising edge where m_axis_tvalid = '1' and m_axis_tready = '1',
   compare m_axis_tdata with the next expected beat and advance to the
   following one. A beat with nothing left to expect is an error
   ("unexpected output beat").
+- SAMPLE THE HANDSHAKE AT THE EDGE, NOT AFTER IT. The DUT consumes a beat
+  at the rising edge where tvalid and tready were both '1' JUST BEFORE
+  that edge. So copy m_axis_tvalid, m_axis_tready and m_axis_tdata into
+  the variables dut_m_axis_tvalid, dut_m_axis_tready, dut_m_axis_tdata
+  (keep these names; the checker accepts them) immediately after
+  `wait until rising_edge(aclk);` and BEFORE `wait for 1 ns;` (at that
+  moment the signals still hold their before-the-edge values), then
+  compare using the copies. Checking the
+  live signals 1 ns after the edge pairs the NEW tvalid/tdata with the
+  tready you are about to change: a beat whose tvalid first appears while
+  tready is '0' is then consumed unseen, and a correct RTL with 7 or 8
+  cycles of latency reports "missing output beats".
 - After the last inputs row, keep clocking with s_axis_tvalid = '0' and
   m_axis_tready = '1' for 16 more cycles so the pipeline drains; then any
   expected beat not yet seen is an error ("missing output beat k").
@@ -204,6 +244,8 @@ beats are read first into an array, then the inputs are replayed):
 
     type beat_array is array (0 to 1023) of std_logic_vector(23 downto 0);
     variable exp_beats : beat_array;  variable n_exp, k_exp : integer := 0;
+    variable dut_m_axis_tvalid, dut_m_axis_tready : std_logic;          -- before-the-edge copies
+    variable dut_m_axis_tdata : std_logic_vector(23 downto 0);
     -- pass 1: read ALL outputs rows, keep rows with m_axis_tvalid = 1
     while not endfile(out_file) loop
       readline(out_file, lo); commas_to_blanks(lo);
@@ -212,13 +254,16 @@ beats are read first into an array, then the inputs are replayed):
     end loop;
     -- pass 2: replay inputs; check every accepted output beat against exp_beats(k_exp)
     ...
-      wait until rising_edge(aclk); wait for 1 ns;
-      if m_axis_tvalid = '1' and m_axis_tready = '1' then
+      wait until rising_edge(aclk);
+      dut_m_axis_tvalid := m_axis_tvalid; dut_m_axis_tready := m_axis_tready; dut_m_axis_tdata := m_axis_tdata;
+      wait for 1 ns;
+      if dut_m_axis_tvalid = '1' and dut_m_axis_tready = '1' then   -- the beat consumed at this edge
         if k_exp >= n_exp then report "unexpected output beat" severity error; errors := errors + 1;
-        elsif m_axis_tdata /= exp_beats(k_exp) then report "beat " & integer'image(k_exp) & ...; errors := errors + 1;
+        elsif dut_m_axis_tdata /= exp_beats(k_exp) then report "beat " & integer'image(k_exp) & ...; errors := errors + 1;
         end if;
         k_exp := k_exp + 1;
       end if;
+      -- now drive the next inputs row (s_axis_*, m_axis_tready) for the coming edge
     ...
     if k_exp < n_exp then report "missing output beats" severity error; errors := errors + 1; end if;
 
@@ -252,6 +297,14 @@ the decimal digits one character at a time, so any width works):
       end loop;
       v := std_logic_vector(acc);
     end procedure;
+
+Copy the procedure EXACTLY. Never replace `v'length` with a number such as
+`31 downto 0`: the one procedure serves every port it is called for (a
+24-bit output and a 32-bit input alike), and a fixed width stops the dry
+run at time 0 with "Array sizes do not match, left array has 24 elements,
+right array has 32 elements". Declare every v_<port> and dut_<port>
+variable with exactly that port's width from the spec (the linter checks
+both: read_wide_fixed_width, vector_variable_width).
 
     read(li, v_cycle); read(li, v_aclk); read_wide(li, v_s_axis_tdata); ...   -- in header order
     s_axis_tdata <= v_s_axis_tdata;                                            -- drive a wide input

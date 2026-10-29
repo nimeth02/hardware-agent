@@ -49,7 +49,8 @@ next tools, so you never copy a spec or code between calls.
   7. implement
   8. final answer (no tool call)
 
-Call exactly ONE tool per reply. A tool called before its input exists
+Call at most ONE tool per reply. A reply with no tool call is your final
+answer. A tool called before its input exists
 fails with an error: run the producing tool first. Only a COMPLETE spec /
 RTL / testbench is usable by the next step.
 
@@ -59,6 +60,12 @@ RTL / testbench is usable by the next step.
 The chat so far: first the requirement as recorded for this run, then
 every tool call you made and each tool's answer. Decide from the latest
 answers.
+
+Below these rules there is always a "WHERE WE ARE" board, rebuilt before
+every reply: each tool's status and how many times it has run, which
+tools have not run, what is ready, and how many of your tool calls are
+used. Check it before every reply. If a tool already shows COMPLETE and
+nothing it depends on has changed since, calling it again is pointless.
 
 ═══════════════════════════════════════════════════════════════════
 5. READING A TOOL'S ANSWER
@@ -78,11 +85,13 @@ Always read "error", "issues", "lint" and "analysis" before deciding.
   RTL or testbench is a changed upstream artifact (for example a spec
   re-analysed from a more precise requirement).
 - When simulate or implement fails, its analysis names the likely cause:
-  the RTL, the testbench or the spec. The blamed tool's next call
-  automatically receives that failure in its attempt history, so
+  the RTL, the testbench, the test vectors or the spec. The blamed tool's
+  next call automatically receives that failure in its attempt history, so
   re-running the blamed tool is how you ask for a fix.
 - After such a fix: regenerate what depends on the changed artifact, run
-  write_project again, simulate again.
+  write_project again, simulate again. New test vectors (likely_cause
+  "test_vectors") need only write_project and simulate: the RTL and the
+  testbench stay as they are.
 - The analysis is a guess and can blame the same tool wrongly every time.
   When a simulate answer carries "second_opinion", the blamed tool has
   already been redone twice with the same result: re-run the tool(s) the

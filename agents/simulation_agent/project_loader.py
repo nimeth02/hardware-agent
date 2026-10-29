@@ -65,12 +65,18 @@ class SimulationProjectLoader:
                     raise RuntimeError(f"spec.json is not valid JSON: {e}") from e
 
             test_vectors = [n for n in root_files if n.lower().endswith(".csv")]
+            test_vectors_in_csv = None
             for csv_name in test_vectors:
+                content = await read(csv_name)
+                if csv_name.lower() == "test_vectors_in.csv":
+                    # kept for the analyst: the stimulus rows of the failing
+                    # beats let it recompute the spec's answer for what the
+                    # design was really given (simulation_analyst.failing_input_rows)
+                    test_vectors_in_csv = content
                 # xsim runs with work_proj/ as cwd: put the CSVs where a
                 # relative open() in the testbench will find them.
                 out = text(await tools["write_file"].ainvoke(
-                    {"path": f"work_proj/{csv_name}", "content": await read(csv_name),
-                     "project_dir": project_dir}))
+                    {"path": f"work_proj/{csv_name}", "content": content, "project_dir": project_dir}))
                 if out.startswith("ERROR"):
                     raise RuntimeError(f"cannot stage {csv_name} into work_proj: {out}")
 
@@ -82,5 +88,6 @@ class SimulationProjectLoader:
             "top_entity": match.group(1),
             "spec": spec,
             "test_vectors": test_vectors,
+            "test_vectors_in_csv": test_vectors_in_csv,
             "testbench_code": testbench_code,
         }

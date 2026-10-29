@@ -57,7 +57,8 @@ def fakes(monkeypatch):
                         calls.append(("tb", spec, rtl, requirement_id, attempt, history)) or {"status": "COMPLETE", "testbench": TB})
     monkeypatch.setattr(orch, "run_test_vector_generation", lambda spec, run_dir, requirement_id, attempt, history:
                         calls.append(("vectors", spec, run_dir, requirement_id, attempt, history)) or VECTORS)
-    monkeypatch.setattr(orch.project_writer, "mcp_read_file", lambda d, f: f"{f}:cycle,...\n0,...\n")
+    monkeypatch.setattr(orch.project_writer, "mcp_read_file",                  # CSVs exist; no earlier RTL/testbench on disk
+                        lambda d, f: None if f.endswith(".vhd") else f"{f}:cycle,...\n0,...\n")
     monkeypatch.setattr(orch.project_writer, "mcp_write_files", lambda root, files: written.update(files))
     monkeypatch.setattr(orch, "run_simulation", lambda project, sim_time: calls.append(f"sim:{project}:{sim_time}") or
                         {"status": "COMPLETE", "verdict": "pass", "analysis": {"verdict": "pass"}})
@@ -83,7 +84,8 @@ def test_llm_drives_the_whole_flow_passing_results_between_the_tools(fakes):
         call("write_project"), call("simulate", sim_time="20us"), call("implement", part="xc7a35tcpg236-1"),
         final("COMPLETE", "counter implemented"),
     ])
-    assert out["status"] == "COMPLETE" and out["summary"] == "counter implemented" and out["error"] is None
+    assert out["status"] == "COMPLETE" and out["error"] is None
+    assert "WNS 8.6 ns" in out["summary"]                                   # the code writes the summary from the real numbers
     name = out["requirement_id"]
     project = str(orch.project_writer.REPO_ROOT / "projects" / name)        # the tools hand spec/rtl/... to each other
     assert calls == [("spec", "4-bit counter"), ("rtl", SPEC, name, 1, []), ("tb", SPEC, RTL, name, 1, []),
@@ -114,6 +116,20 @@ def test_write_project_returns_the_folder_named_after_the_requirement_id(fakes):
     assert not any(f.endswith(".csv") for f in answer["files"])             # no vectors given -> no CSVs
     assert cmd.update["stages"] == {"write_project": {"status": "COMPLETE", "attempts": 1, "error": None, "attempt_history": [
         {"attempt": 1, "status": "COMPLETE", "error": None, "issues": None, "likely_cause": None}]}}
+
+
+def test_write_project_keeps_the_overwritten_rtl_and_testbench_under_history(fakes, monkeypatch):
+    """Run 17:04 on 2026-10-29: the testbench that crashed the simulation was
+    overwritten by the fix round and could not be read afterwards."""
+    on_disk = {f"projects/r1/src/{RTL['entity_name']}.vhd": "old rtl", f"projects/r1/tb/{TB['entity_name']}.vhd": TB["code"]}
+    written: dict[str, str] = {}
+    monkeypatch.setattr(orch.project_writer, "mcp_read_file", lambda root, rel: on_disk.get(rel))
+    monkeypatch.setattr(orch.project_writer, "mcp_write_files", lambda root, files: written.update(files))
+    orch.project_writer.write_project("r1", SPEC, RTL, TB)
+    history = {k: v for k, v in written.items() if "/history/" in k}
+    assert list(history.values()) == ["old rtl"]                        # RTL changed: kept; testbench same: not kept
+    assert list(history)[0].startswith(f"projects/r1/history/src_{RTL['entity_name']}_")
+    assert written[f"projects/r1/src/{RTL['entity_name']}.vhd"] == RTL["code"]
 
 
 def test_each_helper_marks_its_status_attempts_and_error_in_the_state(fakes, monkeypatch):
@@ -192,6 +208,27 @@ def test_a_crashed_agent_fails_the_run(fakes, monkeypatch):
     assert out["error"] is None or "ollama down" in out["error"]      # relayed to the LLM, or ended the run
 
 
+def test_once_implement_passes_the_manager_is_not_asked_again_and_the_run_is_complete(fakes):
+    calls, _ = fakes
+    asked = []
+
+    class Spy(ScriptedToolModel):
+        def _generate(self, messages, *args, **kwargs):
+            asked.append(len(messages))
+            return super()._generate(messages, *args, **kwargs)
+
+    out = run_with([analyze(), call("generate_rtl"), call("generate_testbench"), call("generate_test_vectors"),
+                    call("write_project"), call("simulate"), call("implement"),
+                    analyze(), call("generate_rtl"), final("NEEDS_REVIEW", "redo")],   # never reached
+                   model_cls=Spy)
+    assert out["status"] == "COMPLETE" and out["error"] is None
+    assert "finish rule" in out["stop_reason"]
+    assert len(asked) == 7                                                     # 7 tool calls, no 8th LLM call
+    assert sum(1 for c in calls if isinstance(c, tuple) and c[0] == "spec") == 1
+    assert sum(1 for c in calls if isinstance(c, tuple) and c[0] == "rtl") == 1
+    assert out["results"]["rtl"] == RTL                                       # the good RTL is untouched
+
+
 def test_runaway_loop_hits_the_runtime_step_limit(fakes):
     out = run_with([analyze() for _ in range(40)])
     assert out["status"] == "FAILED" and "orchestration failed" in out["error"]
@@ -223,6 +260,27 @@ def test_manager_decides_from_the_chat_so_far(fakes):
     assert [m.type for m in seen[-1]] == ["system", "human", "ai", "tool", "ai", "tool", "ai", "tool"]
     assert [m.name for m in seen[-1] if m.type == "tool"] == ["analyze_spec", "generate_rtl", "generate_testbench"]
     assert "counter4" in seen[-1][3].content                                # a helper's answer reaches the AI
+
+
+def test_manager_is_shown_a_status_board_with_attempt_counts_on_every_call(fakes):
+    seen = []
+
+    class Spy(ScriptedToolModel):
+        def _generate(self, messages, *args, **kwargs):
+            seen.append(messages)
+            return super()._generate(messages, *args, **kwargs)
+
+    out = run_with([analyze(), call("generate_rtl"), call("generate_testbench"), call("write_project"),
+                    call("write_project"), final("NEEDS_REVIEW", "stop")], model_cls=Spy)
+    boards = [m[0].content.split("WHERE WE ARE")[-1] for m in seen]          # the board is at the end of the rules
+    assert "nothing has run yet" in boards[0] and "tool calls used: 0 of 25" in boards[0]
+    assert "analyze_spec: COMPLETE, 1 attempt" in boards[1] and "not run yet: generate_rtl" in boards[1]
+    last = boards[-1]
+    assert "write_project: COMPLETE, 2 attempts" in last                        # it can see it already did this twice
+    assert "tool calls used: 5 of 25" in last and "not run yet: generate_test_vectors, simulate, implement" in last
+    assert "ready for the next tools: spec, rtl, testbench, project_dir" in last
+    assert "entity counter4 is end" not in seen[-1][0].content               # the code itself is never on the board
+    assert out["status"] == "NEEDS_REVIEW"
 
 
 def test_requirement_is_recorded_in_the_state_and_shown_to_the_llm_from_there(fakes):
@@ -350,3 +408,59 @@ def test_at_the_retry_limit_the_person_is_asked_and_their_answer_buys_another_ro
     cmd2 = tools["generate_rtl"].invoke({"runtime": again})
     assert told == [(4, rtl_stage["attempt_history"])]                        # the 4th call runs, handed the note
     assert cmd2.update["stages"]["generate_rtl"]["retry_limit"] == 5           # the grant survives the record
+
+
+def test_requirement_folder_name_skips_the_json_wrapper_and_the_name_label():
+    from datetime import datetime
+    from agents.orchestrator_agent.requirement_id import new_requirement_id, requirement_name
+    now = datetime(2026, 10, 28, 12, 3)
+    wrapped = '{"requirement_text": "Name: simple LLR demapper 16QAM\nClock aclk, 100 MHz"}'
+    assert requirement_name(wrapped) == "simple_llr_demapper_16qam_cloc"
+    assert new_requirement_id(wrapped, now) == "simple_llr_demapper_16qam_cloc_T-12.03_D-28.10.2026"
+    assert requirement_name("4-bit up counter: clk 100 MHz") == "4_bit_up_counter_clk_100_mhz"   # plain text unchanged
+    assert requirement_name("Name: simple L") == "simple_l"
+
+
+def test_a_failed_simulation_can_blame_the_test_vectors_and_the_vector_agent_is_told(fakes, monkeypatch):
+    """llr_demap16 run 170022 (2026-10-29): the CSV packed a field at the wrong
+    bit, the RTL was right, and the analyst could only choose rtl/testbench/
+    spec. Now it can name the vectors and the blame lands on that stage."""
+    analysis = {"verdict": "fail", "likely_cause": "test_vectors",
+                "failures": ["beat 1 (input cycle 5): m_axis_tdata expected hi=1040 lo=1040 got hi=1024 lo=1055"],
+                "summary": "the input word carries I = 1 where the golden model computed with I = 256",
+                "suggested_fix": "pack I with 2^20 as the spec's s_axis_tdata[31:20] says"}
+    monkeypatch.setattr(orch, "run_simulation", lambda project, sim_time:
+                        {"status": "NEEDS_REVIEW", "verdict": "fail", "analysis": analysis, "error": "simulation fail"})
+    told = []
+    monkeypatch.setattr(orch, "run_test_vector_generation", lambda spec, run_dir, requirement_id, attempt, history:
+                        told.append((attempt, history)) or VECTORS)
+    out = run_with([analyze(), call("generate_rtl"), call("generate_testbench"), call("generate_test_vectors"),
+                    call("write_project"), call("simulate"), call("generate_test_vectors"), final("NEEDS_REVIEW", "stop")])
+    tv_first = out["stages"]["generate_test_vectors"]["attempt_history"][0]
+    assert tv_first["downstream"] == [{"stage": "simulate", "verdict": "fail", "failures": analysis["failures"],
+                                       "summary": analysis["summary"], "suggested_fix": analysis["suggested_fix"]}]
+    assert "downstream" not in out["stages"]["generate_rtl"]["attempt_history"][0]        # the RTL is not blamed
+    assert "downstream" not in out["stages"]["generate_testbench"]["attempt_history"][0]
+    assert told == [(1, []), (2, [tv_first])]                                  # 2nd vector call is handed the blame
+    from agents.orchestrator_agent.blame import blamed_stage
+    from agents.orchestrator_agent.state import Stage
+    assert blamed_stage(analysis) is Stage.GENERATE_TEST_VECTORS
+
+
+def test_the_retry_limit_question_lists_every_attempt_and_suggests_the_other_side():
+    from agents.orchestrator_agent.guard import attempt_reasons, retry_limit_question
+    from agents.orchestrator_agent.state import Stage
+    entry = {"attempt_history": [
+        {"attempt": 1, "status": "COMPLETE", "error": None, "issues": None, "likely_cause": "rtl"},
+        {"attempt": 2, "status": "NEEDS_REVIEW", "error": "lint issues remain", "issues": None},
+        {"attempt": 3, "status": "NEEDS_REVIEW", "error": None, "issues": [{"detail": "beat 1 expected 3 got 4"}]}]}
+    reasons = attempt_reasons(entry)
+    question, suggestions = retry_limit_question(Stage.GENERATE_RTL, reasons)
+    assert "generate_rtl has been run 3 times" in question
+    assert all(line in question for line in reasons)                           # every attempt is shown
+    assert "Attempt 1 (COMPLETE): rtl" in question and "Attempt 3 (NEEDS_REVIEW): beat 1 expected 3 got 4" in question
+    assert suggestions[0] == "Run generate_rtl once more"
+    assert any("generate_testbench" in s for s in suggestions) and any("generate_test_vectors" in s for s in suggestions)
+    assert "NEEDS_REVIEW" in suggestions[-1]
+    _, spec_suggestions = retry_limit_question(Stage.ANALYZE_SPEC, [])
+    assert spec_suggestions == ["Run analyze_spec once more", "Stop the run so I can review it (NEEDS_REVIEW)"]

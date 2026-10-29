@@ -33,7 +33,14 @@ only when Vivado is reachable):
 | 7 | `target <= A * B;` where target width ≠ width(A)+width(B) | regex width inference | `multiplier_width` |
 | 8 | Same signal assigned from two processes / concurrent statements | regex | `multiple_drivers` |
 | 9 | Real compile with `xvhdl` (`--2008` when spec says 2008); follow-on errors collapsed | Vivado | `compile_error` |
-| 10 | Smoke dry run: auto-generated testbench, random inputs, 400 cycles, only looks for a crash | Vivado xsim | `smoke_sim_crash` |
+| 10 | Smoke dry run: auto-generated testbench, random inputs, 400 cycles, looks for a crash | Vivado xsim | `smoke_sim_crash` |
+| 11 | A stage register `x_sK` reading a `_s(K-2)` or older register | regex on `_sK` names | `pipeline_stage_skip` |
+| 12 | Pipelined design returned without a "stage map" note | notes scan | `stage_map_missing` |
+| 13 | Data registers (stages + any output register) ≠ valid-chain bits | regex count of `_sK` / `valid_pipe` | `valid_data_length_mismatch` |
+| 14 | `abs_x <= unsigned(-x)` with no sign test (`-x` is not \|x\|) | regex + preceding keyword | `abs_without_sign_check` |
+| 16 | `x * 4` / `x * to_signed(4, N)` on a vector target (a shift written as a multiply; doubles the width) | regex on assignments, every statement position | `power_of_two_multiply` |
+| 17 | Any `target <= expr` whose computable widths differ (`+`/`-` = widest operand, `*` = sum, `&` = sum, resize/shift/abs) | `rtl_widths.py` width arithmetic | `assignment_width` |
+| 15 | Smoke dry run, output streams (`*tvalid`/`*tdata`/`*tready`): data 0 on every accepted beat, data moved while stalled, valid never rose | Vivado xsim, `SMOKE_STATS` line | `smoke_output_stuck_at_zero`, `smoke_stream_data_changed_while_stalled`, `smoke_output_never_valid` |
 
 The design *rules* the LLM is asked to follow (registered outputs, one
 arithmetic step per line, `_i` shadow signals for outputs, numeric_std only,

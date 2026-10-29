@@ -118,6 +118,44 @@ def _port_bits(port: dict) -> int | None:
     return abs(int(m.group(1)) - int(m.group(2))) + 1 if m else None
 
 
+_READ_WIDE_DEF_RE = re.compile(r"\bprocedure\s+read_wide\b(.*?)\bend\s+procedure\b", re.IGNORECASE | re.DOTALL)
+_FIXED_WIDTH_RE = re.compile(r"\(\s*(\d+)\s+downto\s+0\s*\)", re.IGNORECASE)
+_VEC_VAR_RE = re.compile(r"\bvariable\s+([^:;]+?)\s*:\s*std_logic_vector\s*\(\s*(\d+)\s+downto\s+0\s*\)", re.IGNORECASE)
+
+
+def _read_wide_checks(ports: list[dict], text: str) -> list[dict]:
+    """Run 17:04 on 2026-10-29 (llr_demap16): the simulation died at time 0
+    with 'Array sizes do not match, left array has 24 elements, right array
+    has 32 elements' inside read_wide. The procedure is shared by every port
+    it is called for, so a width written as a number inside it (31 downto 0)
+    or a v_<port> variable declared with another port's width breaks the
+    first call with a different width. Both compile fine."""
+    issues: list[dict] = []
+    for m in _READ_WIDE_DEF_RE.finditer(text):
+        body = m.group(1)
+        fixed = [w.group(0) for w in _FIXED_WIDTH_RE.finditer(body)]
+        if fixed or "v'length" not in body.lower().replace(" ", ""):
+            issues.append({"code": "read_wide_fixed_width",
+                           "detail": "read_wide must size its accumulator from the parameter, exactly as the "
+                                     "WIDE PORTS rule shows: `variable acc : unsigned(v'length - 1 downto 0)` and "
+                                     "`v := std_logic_vector(acc)`. " +
+                                     (f"It contains the fixed width(s) {fixed}; " if fixed else "It does not use v'length; ") +
+                                     "the same procedure is called for every port it reads (24-bit and 32-bit alike), "
+                                     "so a fixed width crashes with 'Array sizes do not match'."})
+    for m in _VEC_VAR_RE.finditer(text):
+        declared = int(m.group(2)) + 1
+        for var in (v.strip() for v in m.group(1).split(",")):
+            port_name = _port_of(var, ports)
+            port = next((p for p in ports if p.get("name") == port_name), None)
+            bits = _port_bits(port) if port else None
+            if bits is not None and bits != declared:
+                issues.append({"code": "vector_variable_width",
+                               "detail": f"Variable '{var}' is std_logic_vector({declared - 1} downto 0) but port "
+                                         f"'{port_name}' is {bits} bits; declare it as std_logic_vector({bits - 1} "
+                                         f"downto 0). Every v_<port>/dut_<port> variable has exactly its port's width."})
+    return issues
+
+
 def _replay_checks(spec: dict, code: str) -> list[dict]:
     """Mistakes in replaying the CSVs that compile fine but break the
     simulation: a row read with fewer/more values than its columns (every
@@ -146,9 +184,12 @@ def _replay_checks(spec: dict, code: str) -> list[dict]:
         counts: dict[str, int] = {}
         for m in _READ_RE.finditer(text):
             counts[m.group(1).lower()] = counts.get(m.group(1).lower(), 0) + 1
-        expected = sorted([1 + len(inputs), 1 + len(outputs)])
-        got = sorted(counts.values(), reverse=True)[:2]
-        if counts and sorted(got) != expected:
+        in_n, out_n = 1 + len(inputs), 1 + len(outputs)
+        # A file may be read in several passes (collect expected beats first, then
+        # replay), so a line variable's reads only have to add up to whole rows.
+        whole_rows = lambda n: any((n - a * in_n) % out_n == 0   # noqa: E731
+                                   for a in range(n // in_n + 1))
+        if counts and not all(whole_rows(n) for n in counts.values()):
             in_cols = ", ".join(["cycle"] + [p["name"] for p in inputs])
             out_cols = ", ".join(["cycle"] + [p["name"] for p in outputs])
             issues.append({"code": "column_count_mismatch",
@@ -158,6 +199,7 @@ def _replay_checks(spec: dict, code: str) -> list[dict]:
                                      f"s_axis_tready is an output, m_axis_tready an input). Read each row's columns "
                                      f"in that order, one read per column, even ones you do not use."})
 
+    issues += _read_wide_checks(ports, text)
     issues += _column_order_checks(inputs, outputs, text)
 
     for m in _SELF_CMP_RE.finditer(text):
@@ -220,10 +262,35 @@ _CSV_TVALID_GATE_RE = re.compile(r"\bif\s+\w*m_axis_tvalid\w*\s*=\s*1\b", re.IGN
 # ... and inside it the DUT's bare m_axis_tdata wire is compared: cycle-by-cycle.
 _DUT_TDATA_CMP_RE = re.compile(r"(?<![\w])m_axis_tdata\s*/?=|/?=\s*m_axis_tdata\b", re.IGNORECASE)
 # `m_axis_tvalid = '1' and m_axis_tready = '1'`: the DUT's own handshake decides.
-_HANDSHAKE_RE = re.compile(r"\bm_axis_tvalid\s*=\s*'1'\s+and\s+m_axis_tready\s*=\s*'1'"
-                           r"|\bm_axis_tready\s*=\s*'1'\s+and\s+m_axis_tvalid\s*=\s*'1'", re.IGNORECASE)
+# The rule file's sketch samples the wires AT the edge into dut_m_axis_tvalid /
+# dut_m_axis_tready copies and compares those, so a prefix is allowed (the
+# CSV's integer flag is compared with 1, not '1', so it never matches here).
+_HANDSHAKE_RE = re.compile(r"\b\w*m_axis_tvalid\s*=\s*'1'\s+and\s+\w*m_axis_tready\s*=\s*'1'"
+                           r"|\b\w*m_axis_tready\s*=\s*'1'\s+and\s+\w*m_axis_tvalid\s*=\s*'1'", re.IGNORECASE)
 _IF_RE = re.compile(r"\bif\b", re.IGNORECASE)
 _END_IF_RE = re.compile(r"\bend\s+if\b", re.IGNORECASE)
+
+
+def _row_variable_compare(lines: list[str], ports: list[dict]) -> str | None:
+    """A compare of the DUT's m_axis_tdata against the variable the current
+    outputs ROW was read into (`if m_axis_tdata /= v_m_axis_tdata`), or
+    None. Even inside the DUT's handshake, that is a cycle-by-cycle compare:
+    the row's value belongs to the beat sent on that row, which the pipeline
+    answers several cycles later. The beat-order pattern compares against an
+    array element (`exp_beats(k_exp)`) instead, and only stores the row
+    variable (`exp_beats(n) := v_m_axis_tdata`)."""
+    text = "\n".join(lines)
+    row_vars = {m.group(2) for m in _READ_TARGET_RE.finditer(text)
+                if _port_of(m.group(2), ports) == "m_axis_tdata"}
+    if not row_vars:
+        return None
+    var = "|".join(re.escape(v) for v in row_vars)
+    cmp_re = re.compile(rf"(?<![\w'])m_axis_tdata\s*/?=\s*(?:{var})\b|\b(?:{var})\s*/?=\s*m_axis_tdata(?!\w)",
+                        re.IGNORECASE)
+    for line in lines:
+        if cmp_re.search(line):
+            return line.strip()
+    return None
 
 
 def _csv_gated_compare(lines: list[str]) -> str | None:
@@ -264,11 +331,56 @@ def _streaming_checks(spec: dict, code: str) -> list[dict]:
         issues.append({"code": "streaming_cycle_compare",
                        "detail": f"'{gate}' compares m_axis_tdata on the cycle the CSV row says, but the "
                                  f"pipeline answers several cycles later, so every beat mismatches. {rule}"})
+    ports = [p for p in (spec.get("ports") or []) if isinstance(p, dict) and p.get("name")]
+    row_cmp = _row_variable_compare(lines, ports)
+    if row_cmp:
+        issues.append({"code": "streaming_row_compare",
+                       "detail": f"'{row_cmp}' compares the DUT's m_axis_tdata with the value read from the CURRENT "
+                                 f"outputs row. That row holds the result of the beat sent on that same row, which "
+                                 f"the pipeline delivers several cycles later, so the output is checked against the "
+                                 f"wrong beat (seen as 'expected X got 0' and later 'got X' on another cycle). "
+                                 f"Store the row's value in an array of expected beats and compare against "
+                                 f"exp_beats(k_exp). {rule}"})
     if not _HANDSHAKE_RE.search(chr(10).join(lines)):
         issues.append({"code": "streaming_no_handshake_compare",
                        "detail": f"No compare guarded by the DUT's handshake (m_axis_tvalid = '1' and "
                                  f"m_axis_tready = '1') was found. {rule}"})
+    idle = _idle_row_hold_issue(lines)
+    if idle:
+        issues.append(idle)
     return issues
+
+
+# The bounded "hold the row until s_axis_tready" loop (its deadlock report
+# or its edge counter) and the two ways an idle row may leave it early.
+_HOLD_LOOP_RE = re.compile(r"never\s+rose|stall_count|hold_count", re.IGNORECASE)
+_IDLE_ROW_TEST_RE = re.compile(r"\b\w*s_axis_tvalid\w*\s*(?:=\s*'?0'?|/=\s*'?1'?)(?![\w'])", re.IGNORECASE)
+_BEAT_ROW_GATE_RE = re.compile(r"\bif\s+\w*s_axis_tvalid\w*\s*=\s*'?1'?\s+then\b", re.IGNORECASE)
+_LEAVE_RE = re.compile(r"\bexit\b|\bwait\s+until\b", re.IGNORECASE)
+_LOOP_RE = re.compile(r"\bloop\b", re.IGNORECASE)
+
+
+def _idle_row_hold_issue(lines: list[str]) -> dict | None:
+    """A hold loop that an idle row (s_axis_tvalid = 0) cannot leave early.
+    Such a row has no beat to accept, so waiting for s_axis_tready is
+    pointless: the loop runs its 64-edge limit and reports "s_axis_tready
+    never rose (deadlock)" for every reset row, gap row and trailing row
+    (llr_demap16, 2026-10-29: cycles 0-1 and 50-59), and the analyst
+    blamed the RTL for a testbench fault."""
+    if not any(_HOLD_LOOP_RE.search(line) for line in lines):
+        return None                                     # no bounded hold loop: nothing to leave
+    for i, line in enumerate(lines):
+        window = "\n".join(lines[i:i + 3])
+        if _IDLE_ROW_TEST_RE.search(line) and _LEAVE_RE.search(window):
+            return None                                 # `if tvalid = 0 or tready = '1' then exit`
+        if _BEAT_ROW_GATE_RE.search(line) and _LOOP_RE.search(window):
+            return None                                 # `if tvalid = 1 then loop ... end loop; else one edge`
+    return {"code": "hold_on_idle_row",
+            "detail": "The hold loop ('s_axis_tready never rose') has no early exit for an idle row "
+                      "(s_axis_tvalid = 0). Such a row carries no beat, so the loop waits its full limit on every "
+                      "reset row, gap row and row after the last beat and reports a deadlock that is not there. "
+                      "Make the loop's exit line `if cur_s_axis_tvalid = 0 or dut_s_axis_tready = '1' then exit; "
+                      "end if;` so an idle row lasts exactly one edge (STREAMING DESIGNS rule)."}
 
 
 def _compile(spec: dict, rtl: dict, testbench: dict) -> tuple[str | None, list[dict]]:

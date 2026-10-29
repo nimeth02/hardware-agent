@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 from agents.mcp_utils import mcp_read_file, mcp_write_files
 from services.config import REPO_ROOT
@@ -23,6 +24,7 @@ def write_project(requirement_id: str, spec: dict, rtl: dict, testbench: dict,
         f"projects/{name}/src/{rtl['entity_name']}.vhd": rtl["code"],
         f"projects/{name}/tb/{testbench['entity_name']}.vhd": testbench["code"],
     }
+    files.update(_previous_versions(name, files))
     vectors = test_vectors or {}
     if vectors.get("status") == "COMPLETE":
         for key in CSV_KEYS:
@@ -32,3 +34,21 @@ def write_project(requirement_id: str, spec: dict, rtl: dict, testbench: dict,
                 files[f"projects/{name}/{csv_name}"] = content
     mcp_write_files(str(REPO_ROOT), files)
     return {"status": "COMPLETE", "project_dir": str(REPO_ROOT / "projects" / name), "files": list(files)}
+
+
+def _previous_versions(name: str, files: dict[str, str]) -> dict[str, str]:
+    """A fix round rewrites src/<entity>.vhd and tb/<entity>_tb.vhd in place,
+    so the version that crashed the simulation was unreadable afterwards
+    (run 17:04 on 2026-10-29). Copy a differing old version to
+    projects/<name>/history/<src|tb>_<file>_<HHMMSS>.vhd first. history/ is
+    outside src/ and tb/, so nothing compiles or uploads it."""
+    stamp = datetime.now().strftime("%H%M%S")
+    kept: dict[str, str] = {}
+    for rel, new in files.items():
+        if not rel.endswith(".vhd"):
+            continue
+        old = mcp_read_file(str(REPO_ROOT), rel)
+        if old is not None and old != new:
+            kind, fname = rel.split("/")[-2], rel.split("/")[-1]
+            kept[f"projects/{name}/history/{kind}_{fname[:-4]}_{stamp}.vhd"] = old
+    return kept

@@ -1,4 +1,4 @@
-# mcp_servers/matlab_server.py — MCP server for MATLAB script generation and execution
+# mcp_servers/matlab_server/matlab_server.py — MCP server for MATLAB script generation and execution
 #
 # Transport: stdio (launched as subprocess by the client).
 # One warm MATLAB engine is shared across all tool calls (see matlab_engine.py).
@@ -16,6 +16,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+# Launched as a plain script (`python mcp_servers/matlab_server/matlab_server.py`),
+# so the repo root is not on sys.path; import the engine module from this folder.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from matlab_engine import engine_error, engine_ready, get_engine, warm_engine  # noqa: E402
 

@@ -1,11 +1,13 @@
 # projects/
 
 Example projects the simulation and implementation agents run as-is. One
-folder per design. Hand-written examples (`counter4/`) are committed; the
-folders the orchestrator writes for each run
+folder per design. Hand-written examples (`counter4/`) are committed; every
+other folder here is git-ignored (`projects/*` in `.gitignore`), including
+the folders the orchestrator writes for each run
 (`<requirement>_T-hh.mm_D-dd.mm.yyyy/`, see
-`agents/orchestrator_agent/requirement_id.py`) have the same layout but are
-git-ignored.
+`agents/orchestrator_agent/requirement_id.py`), which have the same layout.
+To commit a new hand-written example, add a `!projects/<name>/` line to
+`.gitignore`.
 
     projects/<name>/
       spec.json          the approved spec (entity name, clock -> XDC, vhdl_version 93|2008; given to the analysts)
@@ -20,6 +22,8 @@ git-ignored.
       scripts/           synth_impl.tcl, written by the implementation agent
       impl_out/          utilization.rpt, timing_summary.rpt, post_route.dcp
       work_proj/         created by the Vivado tools (logs, xsim.dir, waves.vcd)
+      history/           the src/ and tb/ files a fix round overwrote, kept by the
+                         orchestrator as <src|tb>_<file>_<HHMMSS>.vhd; never compiled
 
 Run from the UI (Agents -> simulation_agent / implementation_agent, input
 `{"project": "counter4"}`) or from Python: `run_simulation("counter4")`,

@@ -270,6 +270,36 @@ end architecture;"""
                 if i["code"] == "conditional_assignment_in_process"]
 
 
+def test_read_wide_with_a_fixed_width_or_a_wrongly_sized_vector_variable_is_caught():
+    """Run 17:04 on 2026-10-29: 'Array sizes do not match, left array has 24
+    elements, right array has 32 elements' at time 0 inside read_wide."""
+    from agents.testbench_agent.testbench_linter import _replay_checks
+    spec = {"entity_name": "demap", "ports": [
+        {"name": "aclk", "direction": "input", "width": "1"},
+        {"name": "s_axis_tdata", "direction": "input", "width": "32"},
+        {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
+        {"name": "m_axis_tdata", "direction": "output", "width": "24"}]}
+    bad = """
+      variable v_cycle, v_cycle_out, v_aclk, v_m_axis_tvalid : integer;
+      variable v_s_axis_tdata : std_logic_vector(31 downto 0);
+      variable v_m_axis_tdata : std_logic_vector(31 downto 0);     -- port is 24 bits
+      procedure read_wide(l : inout line; v : out std_logic_vector) is
+        variable acc : unsigned(31 downto 0) := (others => '0');  -- fixed width
+      begin
+        v := std_logic_vector(acc);
+      end procedure;
+      read(li, v_cycle); read(li, v_aclk); read_wide(li, v_s_axis_tdata);
+      read(lo, v_cycle_out); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+    """
+    issues = _replay_checks(spec, bad)
+    assert [i["code"] for i in issues] == ["read_wide_fixed_width", "vector_variable_width"]
+    assert "(31 downto 0)" in issues[0]["detail"] and "v_m_axis_tdata" in issues[1]["detail"] and "23 downto 0" in issues[1]["detail"]
+
+    good = bad.replace("variable v_m_axis_tdata : std_logic_vector(31 downto 0)", "variable v_m_axis_tdata : std_logic_vector(23 downto 0)") \
+              .replace("unsigned(31 downto 0)", "unsigned(v'length - 1 downto 0)")
+    assert _replay_checks(spec, good) == []
+
+
 def test_replay_mistakes_that_compile_but_break_the_simulation_are_caught():
     from agents.testbench_agent.testbench_linter import _replay_checks
     spec = {"entity_name": "demap", "ports": [
@@ -297,6 +327,32 @@ def test_replay_mistakes_that_compile_but_break_the_simulation_are_caught():
     assert _replay_checks(spec, good) == []
     # no directions in the spec (older specs): the column count cannot be known, nothing is reported
     assert _replay_checks(SPEC, bad) == [i for i in _replay_checks(SPEC, bad) if i["code"] == "self_comparison"]
+
+
+def test_reading_the_outputs_file_in_two_passes_is_not_a_column_count_mismatch():
+    """The LLR demapper run: the testbench reads test_vectors_out.csv twice (collect
+    expected beats, then replay). 4 + 4 reads of `lo` are two whole rows, not 8 columns."""
+    from agents.testbench_agent.testbench_linter import _replay_checks
+    spec = {"entity_name": "llr", "ports": [
+        {"name": "aclk", "direction": "input", "width": "1"},
+        {"name": "aresetn", "direction": "input", "width": "1"},
+        {"name": "s_axis_tvalid", "direction": "input", "width": "1"},
+        {"name": "s_axis_tready", "direction": "output", "width": "1"},
+        {"name": "s_axis_tdata", "direction": "input", "width": "32"},
+        {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
+        {"name": "m_axis_tready", "direction": "input", "width": "1"},
+        {"name": "m_axis_tdata", "direction": "output", "width": "24"}]}
+    two_passes = """
+      read(lo, v_cycle); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+      read(li, v_cycle); read(li, v_aclk); read(li, v_aresetn); read(li, v_s_axis_tvalid);
+      read_wide(li, v_s_axis_tdata); read(li, v_m_axis_tready);
+      read(lo, v_cycle); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+    """
+    assert _replay_checks(spec, two_passes) == []
+    # a column really skipped in the second pass (7 reads of `lo`) is still caught
+    skipped = two_passes.replace("read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);\n    ",
+                                 "read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);\n    ", 1)
+    assert {i["code"] for i in _replay_checks(spec, skipped)} == {"column_count_mismatch"}
 
 
 def test_right_number_of_reads_in_the_wrong_column_order_is_caught():
@@ -394,5 +450,88 @@ def test_streaming_designs_must_be_compared_in_beat_order_not_per_cycle():
     """
     assert _streaming_checks(stream, beat_order) == []
 
+    # the rule file's sketch: sample the wires AT the edge (before `wait for
+    # 1 ns`) into dut_* copies and compare those -- the checker accepts it
+    sampled_at_edge = """
+      if v_m_axis_tvalid = 1 then exp_beats(n_exp) := v_m_axis_tdata; n_exp := n_exp + 1; end if;
+      ...
+      wait until rising_edge(aclk);
+      dut_m_axis_tvalid := m_axis_tvalid; dut_m_axis_tready := m_axis_tready; dut_m_axis_tdata := m_axis_tdata;
+      wait for 1 ns;
+      if dut_m_axis_tvalid = '1' and dut_m_axis_tready = '1' then
+        if dut_m_axis_tdata /= exp_beats(k_exp) then report "beat mismatch" severity error; end if;
+        k_exp := k_exp + 1;
+      end if;
+    """
+    assert _streaming_checks(stream, sampled_at_edge) == []
+
     # a plain counter has no handshake ports: nothing to enforce
     assert _streaming_checks(SPEC, per_cycle) == []
+
+
+def test_streaming_compare_against_the_current_row_is_caught_even_inside_the_handshake():
+    """llr_demap16 run of 2026-10-29 (4 attempts, RTL blamed every time): the
+    compare sat inside the DUT's handshake, so the old rules were satisfied,
+    but it compared m_axis_tdata with v_m_axis_tdata of the CURRENT row -> the
+    output was checked against the wrong beat ('cycle 17: expected hi=125
+    lo=61440 got hi=0 lo=0', then 'cycle 20: ... got hi=125 lo=61440')."""
+    from agents.testbench_agent.testbench_linter import _streaming_checks
+    stream = {"entity_name": "llr", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+        ("aclk", "input", "1"), ("aresetn", "input", "1"),
+        ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
+        ("m_axis_tvalid", "output", "1"), ("m_axis_tready", "input", "1"), ("m_axis_tdata", "output", "24")]]}
+    row_compare = """
+      read(lo, v_cycle_out); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+      wait until rising_edge(aclk); wait for 1 ns;
+      if m_axis_tvalid = '1' and m_axis_tready = '1' then
+        if m_axis_tdata /= v_m_axis_tdata then report "mismatch" severity error; end if;
+      end if;
+    """
+    issues = _streaming_checks(stream, row_compare)
+    assert [i["code"] for i in issues] == ["streaming_row_compare"]
+    assert "v_m_axis_tdata" in issues[0]["detail"] and "exp_beats(k_exp)" in issues[0]["detail"]
+
+    # storing the row value into the expected-beat array is the right pattern, not a compare
+    beat_order = """
+      read(lo, v_cycle_out); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata);
+      if v_m_axis_tvalid = 1 then exp_beats(n_exp) := v_m_axis_tdata; n_exp := n_exp + 1; end if;
+      wait until rising_edge(aclk); wait for 1 ns;
+      if m_axis_tvalid = '1' and m_axis_tready = '1' then
+        if m_axis_tdata /= exp_beats(k_exp) then report "beat mismatch" severity error; end if;
+      end if;
+    """
+    assert _streaming_checks(stream, beat_order) == []
+
+
+def test_a_hold_loop_that_an_idle_row_cannot_leave_is_rejected():
+    """llr_demap16, 2026-10-29 16:40: the hold loop exited only on
+    `tvalid = 1 and tready = '1'`, so every idle row (cycles 0-1, 50-59) ran
+    the 64-edge limit and reported a deadlock; the analyst blamed the RTL."""
+    from agents.testbench_agent.testbench_linter import _idle_row_hold_issue, _streaming_checks
+    stream = {"entity_name": "llr", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+        ("aclk", "input", "1"), ("aresetn", "input", "1"),
+        ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
+        ("m_axis_tvalid", "output", "1"), ("m_axis_tready", "input", "1"), ("m_axis_tdata", "output", "24")]]}
+    wrong = """
+        loop
+          wait until rising_edge(aclk);
+          dut_s_axis_tready := s_axis_tready;
+          if dut_m_axis_tvalid = '1' and dut_m_axis_tready = '1' then k_exp := k_exp + 1; end if;
+          if cur_s_axis_tvalid = 1 and dut_s_axis_tready = '1' then
+            exit;
+          end if;
+          stall_count := stall_count + 1;
+          if stall_count > 64 then
+            report "cycle " & integer'image(v_cycle) & ": s_axis_tready never rose (deadlock)" severity error;
+            exit;
+          end if;
+        end loop;
+    """
+    assert "hold_on_idle_row" in [i["code"] for i in _streaming_checks(stream, wrong)]
+    right = wrong.replace("if cur_s_axis_tvalid = 1 and dut_s_axis_tready = '1' then",
+                          "if cur_s_axis_tvalid = 0 or dut_s_axis_tready = '1' then")
+    assert "hold_on_idle_row" not in [i["code"] for i in _streaming_checks(stream, right)]
+    # the other correct shape: only beat rows enter the hold loop at all
+    gated = "if v_s_axis_tvalid = 1 then\n  loop\n ... never rose ...\n  end loop;\nelse wait until rising_edge(aclk); end if;"
+    assert _idle_row_hold_issue(gated.splitlines()) is None
+    assert _idle_row_hold_issue(["wait until rising_edge(aclk);"]) is None       # no hold loop, nothing to check

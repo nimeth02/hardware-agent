@@ -179,6 +179,17 @@ Consequences that cause real bugs:
   signed number needs one extra top bit: `signed('0' & u)`. Compare the
   two sides at the same width: `resize(signed('0' & u), 13) <= to_signed(2, 13)`
   or simply compare unsigned with unsigned: `u <= to_unsigned(2, u'length)`.
+- Negation does NOT add a bit: `-x` and `abs(x)` are exactly as wide as
+  `x`. So a 12-bit `-x` does not fit a 13-bit target (the compiler accepts
+  it; the simulation stops with "Array sizes do not match, left array has
+  13 elements, right array has 12 elements"), and `-x` of the most negative
+  value (-2048 in 12 bits) wraps back to -2048. Resize FIRST, then negate:
+      abs_i <= unsigned(-resize(i_s, 13));     -- correct: widen, then negate
+      abs_i <= unsigned(resize(-i_s, 13));     -- WRONG: -2048 wraps before the resize
+      abs_i <= unsigned(-i_s);                 -- WRONG: 12 bits into 13, simulation crash
+- `shift_left` and `shift_right` keep the width of their first argument:
+  `shift_right(p, 13)` of a 25-bit `p` is 25 bits and cannot be assigned to
+  a 16-bit signal. Shift into a value of the same width, then `resize`.
 - `and or xor not ...` on vectors need both vectors the SAME LENGTH, else
   the simulation stops (7.2.1). Result of `=` and relations is BOOLEAN.
 - Order comparison `<` `>` on std_logic_vector compares position by
@@ -446,7 +457,8 @@ the textual order does not matter.
 | OTHERS is illegal aggregate choice                             | `(others => '0')` as an operand or argument         | section 6 |
 | ambiguous / more than one possible type                        | literal or `&` with no declared target type         | qualify (5) or assign to a signal |
 | expression is not BOOLEAN                                      | `if x then` with a std_logic [93]                   | `if x = '1' then` |
-| Array sizes do not match, left has N, right has M              | widths differ on `<=`, `:=`, `&` join, product      | count bits; use resize; product = sum of widths |
+| Array sizes do not match, left has N, right has M              | widths differ on `<=`, `:=`, `&` join, product,     | count bits; use resize; product = sum of widths; |
+|                                                                | or `-x` / `abs(x)` stored one bit wider             | `-resize(x, N)`, not `-x` (negation keeps x's width) |
 | index (N) out of range / slice out of range                    | index or slice bound outside the vector             | check bounds, loop ranges |
 | value N is outside the range of subtype natural/...            | counter below 0 or above its integer range          | use unsigned, or guard |
 | multiple sources / multiple drivers                            | signal written in two places                         | section 10 |

@@ -45,6 +45,9 @@ Workflow (use the tools in this order):
    - do all arithmetic in plain double (mod, floor, min/max); never use
      int8/int16/uint8/uint32, typecast, bitshift or idivide — mixing
      integer classes is the most common reason a run fails;
+   - the spec's `>>>`, `>>`, `<<`, `!=`, `+=` and `++` are NOT MATLAB:
+     write floor(x / 2^k), mod(x * 2^k, 2^N), ~=, x = x + v instead
+     (a script containing them is rejected before it runs);
    - print the number of rows written.
    Recommended structure — preallocate two numeric matrices and convert
    them once, which avoids row/column orientation mistakes:

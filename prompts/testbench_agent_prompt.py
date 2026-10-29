@@ -31,6 +31,10 @@ The vector files are NOT given to you; their layout is fixed by convention:
 - test_vectors_out.csv: header "cycle", then every port with direction
   "output" in spec order — the value expected after that cycle's rising edge
 One row per clock cycle in both, same cycle numbers, integers only.
+Signed ports are stored as their unsigned bit pattern (8-bit -127 is
+written as 129): always read, drive and compare buses with
+`unsigned(...)` / `to_unsigned(...)`, never `signed(...)` /
+`to_signed(...)`, even when the spec marks the port "signed".
 
 For every request:
 
@@ -110,6 +114,14 @@ object with:
 Return the complete corrected testbench (same JSON structure). Fix every
 listed issue, keep the checks that were already correct, and do not
 change the DUT's ports or behaviour expectations beyond what the spec says.
+
+If an issue is "read_wide_fixed_width", "vector_variable_width", or a
+simulation message says "Array sizes do not match, left array has L
+elements, right array has R elements": a vector of one width was written
+into a variable of another. Re-copy read_wide from the WIDE PORTS rule
+(accumulator sized by v'length, no number inside the procedure) and
+declare every v_<port>/dut_<port> variable with exactly its port's width
+from the spec. Change those lines; returning the same file is refused.
 """
 
 

@@ -1,4 +1,4 @@
-# mcp_servers/matlab_engine.py — shared warm MATLAB engine singleton
+# mcp_servers/matlab_server/matlab_engine.py — shared warm MATLAB engine singleton
 #
 # Starting MATLAB takes 1–2 minutes, so one engine process is started per
 # server lifetime and shared across all tool calls (same pattern as the
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]   # mcp_servers/matlab_server/ -> repo root
 load_dotenv(dotenv_path=_REPO_ROOT / ".env", override=False)
 
 MATLAB_STARTUP_OPTIONS = os.getenv("MATLAB_STARTUP_OPTIONS", "").strip()

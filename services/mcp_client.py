@@ -31,7 +31,7 @@ def _stdio(server_file: str) -> dict:
 
 MCP_SERVERS = {
     "files": _stdio("file_server.py"),
-    "matlab": _stdio("matlab_server.py"),
+    "matlab": _stdio("matlab_server/matlab_server.py"),
     "vivado": _stdio("vivado_server.py"),
 }
 

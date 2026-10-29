@@ -62,7 +62,8 @@ PRODUCES = {
 
 # simulate / implement analysis "likely_cause" -> the stage whose work is blamed
 # ("environment", "constraints" and None blame nobody)
-BLAMED_STAGE = {"rtl": Stage.GENERATE_RTL, "testbench": Stage.GENERATE_TESTBENCH, "spec": Stage.ANALYZE_SPEC}
+BLAMED_STAGE = {"rtl": Stage.GENERATE_RTL, "testbench": Stage.GENERATE_TESTBENCH, "spec": Stage.ANALYZE_SPEC,
+                "test_vectors": Stage.GENERATE_TEST_VECTORS}
 
 
 class StageRecord(TypedDict, total=False):

@@ -30,6 +30,12 @@ projects/*/constraints/
 projects/*_20[0-9][0-9][0-9][0-9][0-9][0-9]_*/
 projects/20[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_*/
 projects/*_T-[0-9][0-9].[0-9][0-9]_D-[0-9][0-9].[0-9][0-9].[0-9][0-9][0-9][0-9]/
+# Everything else under projects/ (local drafts such as "Example 1/",
+# example-complete-llr-demapper/) stays on this machine. To commit a new
+# hand-written example, add a "!projects/<name>/" line below.
+projects/*
+!projects/README.md
+!projects/counter4/
 
 # ── Vivado / xsim / MATLAB leftovers ──────────────────────────────────
 *.jou
@@ -47,6 +53,10 @@ webtalk*
 # ── Third-party reference code (170 MB, not part of the product) ──────
 reference/
 references/
+
+# ── Local-only files (server logs, tunnel helper) ─────────────────────
+logs/
+tunnel
 
 # ── Editors / OS ──────────────────────────────────────────────────────
 .vscode/

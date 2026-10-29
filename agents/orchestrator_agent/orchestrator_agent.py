@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage
 from agents.json_utils import extract_json
 from agents.orchestrator_agent.requirement_id import new_requirement_id
 from agents.orchestrator_agent.state import AGENT_NAME, MAX_ITERATIONS, PRODUCES, OrchestratorState, initial_state
+from agents.orchestrator_agent.status_board import finish_when_done, with_status_board
 from agents.orchestrator_agent.stop_reason import stop_reason
 from agents.orchestrator_agent.tools import make_tools
 from agents.orchestrator_agent.tracing import log_state, snapshot
@@ -30,8 +31,11 @@ FINAL_STATUSES = ("COMPLETE", "NEEDS_REVIEW", "FAILED")
 
 def build_manager():
     """Job 1: create the manager AI with its helpers (the other agents) attached
-    and the run's state as its notebook: the tools read from it and record into it."""
-    return create_agent(get_llm(), make_tools(), system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+    and the run's state as its notebook: the tools read from it and record into it.
+    Before every LLM call the finish rule may end the run; otherwise the rules
+    get the current status board appended."""
+    return create_agent(get_llm(), make_tools(),
+                        middleware=[with_status_board(ORCHESTRATOR_SYSTEM_PROMPT), finish_when_done],
                         state_schema=OrchestratorState)
 
 

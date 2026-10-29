@@ -78,8 +78,29 @@ the whole problem:
 - Wrap to N bits:              v = mod(x, 2^N);
 - Two's-complement sign (N):   v = mod(x, 2^N); if v >= 2^(N-1), v = v - 2^N; end
 - Arithmetic shift right k:    floor(x / 2^k)          (floors toward -inf like SRA)
+  The spec writes shifts as `>>>`, `>>` or `<<`. MATLAB has NONE of these
+  operators (nor `!=`, `+=`, `++`): the guard rejects the script before it
+  runs. `(p + 4096) >>> 13` MUST become `floor((p + 4096) / 2^13)`, and
+  `x != y` becomes `x ~= y`.
 - Shift left k:                mod(x * 2^k, 2^N)
 - Pack fields into one word:   word = hi * 2^(lo_bits) + lo;   (all non-negative first)
+  The multiplier of a field is 2^(its START bit) taken from the spec's
+  `port[hi:lo] = name`, NEVER from its width. Spec "s_axis_tdata[31:20] = I,
+  [19:8] = Q, [7:0] = ns" is exactly
+      tdata = mod(I,4096) * 2^20 + mod(Q,4096) * 2^8 + mod(ns,256);   % [31:20] [19:8] [7:0]
+  (`mod(I,4096) * 2^12` puts I on top of Q: the guard rejects a script that
+  never uses 2^lo for a field; write the [hi:lo] in a comment next to each term).
+- EVERY FIELD VALUE MUST FIT ITS WIDTH BEFORE PACKING. `mod(I, 4096)` wraps
+  silently: I = +2048 in a 12-bit signed field becomes -2048 on the wire,
+  so the expected output belongs to a symbol the RTL never received
+  (llr_demap16, 2026-10-29: two beats "wrong" while the RTL was right).
+  For an n-bit signed field keep -2^(n-1) <= v <= 2^(n-1)-1, for an
+  unsigned field 0 <= v <= 2^n-1, and prove it with an assert right
+  before the pack line, one per input field, naming the field:
+      assert(all(I >= -2^11 & I <= 2^11-1), 'I does not fit 12 bits');   % [31:20]
+      assert(all(ns >= 0 & ns <= 2^8-1), 'ns does not fit 8 bits');      % [7:0]
+  Random stimulus must be drawn inside that range (randi([-2048, 2047], ...)).
+  The guard rejects a script without one assert per input field.
 - Extract a field [hi:lo]:     field = mod(floor(word / 2^lo), 2^(hi-lo+1));
 - Saturate:                    v = min(max(x, -2^(N-1)), 2^(N-1)-1);
 - bitand/bitor/bitxor are fine on NON-NEGATIVE doubles; wrap signed values
@@ -91,6 +112,33 @@ the whole problem:
   with a digit-by-digit reader, so do not split it into halves.
 - Scripts that use the forbidden integer-class functions above are
   rejected before they are written; rewrite them in double arithmetic.
+
+═══════════════════════════════════════════════════════════════════
+PACKING FIELDS INTO A WIDE PORT (checked before the run and by MATLAB)
+═══════════════════════════════════════════════════════════════════
+
+When the spec puts several fields inside one port ("s_axis_tdata[31:20] =
+I, [19:8] = Q, [7:0] = ns"), the bit position of each field is the ONLY
+thing the design reads. A field packed in the wrong place gives CSVs that
+agree with each other and are wrong on every beat: the design answers
+correctly for the word it was given, the simulation reports every beat as
+a mismatch, and the RTL gets blamed (run 170022, 2026-10-29: I was packed
+with 2^12, on top of Q; the RTL was right and was rewritten three times).
+
+- Copy the spec's [hi:lo] into a comment next to the packing line and use
+  the literal 2^lo of each field (the script is rejected before it runs if
+  a field's start bit never appears in it):
+      % s_axis_tdata[31:20] = I (12 bits), [19:8] = Q (12 bits), [7:0] = ns (8 bits)
+      word = mod(I, 2^12) * 2^20 + mod(Q, 2^12) * 2^8 + mod(ns, 2^8);
+- Unpack the word straight after packing it and stop the script if a field
+  does not come back (one assert per field):
+      assert(mod(floor(word / 2^20), 2^12) == mod(I, 2^12), 'I is not at bit 20');
+      assert(mod(floor(word / 2^8),  2^12) == mod(Q, 2^12), 'Q is not at bit 8');
+      assert(mod(word, 2^8) == mod(ns, 2^8),                 'ns is not at bit 0');
+- Compute the expected outputs from the SAME I, Q, ns variables that went
+  into the word, never from a second copy of the values.
+- Do the same for packed OUTPUT ports: the field order and the 2^lo of each
+  expected value come from the spec's [hi:lo], and an unpack assert follows.
 
 ═══════════════════════════════════════════════════════════════════
 WHAT YOU CAN AND CANNOT DO
@@ -125,15 +173,27 @@ CSV LAYOUT (validated)
   test_vectors_in.csv), even though their names look the other way round.
 - Active-low resets (`aresetn`, `rst_n`): 0 while in reset, 1 afterwards.
   Active-high resets (`rst`): 1 while in reset, 0 afterwards.
+- No input beat on a reset row: while the reset is active, `s_axis_tvalid`
+  (or `en`/`we`) is 0 and no output is expected (`m_axis_tvalid` = 0). The
+  design drops anything sent during reset, so a beat there can never be
+  matched. MATLAB indexes from 1: `tvalid(c+1)` is cycle c, so a beat list
+  `beat_cycles = [4, ...]` written into `tvalid(4)` lands on cycle 3 — use
+  `tvalid(c+1) = 1` with the cycle number, or check the printed CSV.
 - STREAMING designs (AXI-Stream tvalid/tready ports): the RTL answers
   several cycles after the input beat and the exact delay is not known
   here, so the testbench compares output beats IN ORDER, not by cycle.
   Write the expected result of an input beat on the SAME row as that
   input, with m_axis_tvalid = 1 on that row and 0 on rows with no beat;
   put 1 in s_axis_tready on every row after reset. The outputs-row cycle
-  is only used to label errors. Put m_axis_tready = 0 on a few rows (with
-  no new input beat on those rows) to exercise backpressure; the testbench
-  holds its comparison while m_axis_tready = 0.
+  is only used to label errors. Put m_axis_tready = 0 on a few rows to
+  exercise backpressure; the testbench holds its comparison while
+  m_axis_tready = 0.
+- HARD RULE: a row with m_axis_tready = 0 MUST have s_axis_tvalid = 0.
+  The design cannot accept a new beat while its output is blocked, so the
+  testbench would wait forever for s_axis_tready and the simulation would
+  end without a result ("no_marker"). The validator rejects such a row
+  (code beat_while_blocked). Send the next beat on the first row where
+  m_axis_tready is back to 1.
 
 ═══════════════════════════════════════════════════════════════════
 COVERAGE

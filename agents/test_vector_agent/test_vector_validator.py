@@ -76,6 +76,58 @@ def _check_file(label: str, run_dir: str, name: str, ports: list[dict], issue) -
     return header, data
 
 
+def _reset_row_checks(spec: dict, in_header: list[str], in_rows: list[list[str]],
+                      out_header: list[str], out_rows: list[list[str]], issue) -> None:
+    """Streaming designs only: a row that holds the reset active must not
+    send an input beat (s_axis_tvalid = 1) or expect an output beat
+    (m_axis_tvalid = 1). The design drops anything sent during reset, so
+    such a beat can never be matched and the whole beat order is off by
+    one from then on (llr_demap16 run, 2026-10-29: the golden model wrote
+    the first beat on cycle 3 while aresetn was still 0)."""
+    if "s_axis_tvalid" not in in_header or "m_axis_tvalid" not in out_header:
+        return                                      # not a streaming design
+    reset = spec.get("reset") or {}
+    name = reset.get("name") or next((h for h in in_header if h.lower() in ("aresetn", "rst_n", "resetn", "rst", "reset")), None)
+    if not name or name not in in_header:
+        return
+    active = "0" if str(reset.get("active", "")).lower() == "low" or name.lower().endswith("n") else "1"
+    rst_col, tvalid_col, mvalid_col = in_header.index(name), in_header.index("s_axis_tvalid"), out_header.index("m_axis_tvalid")
+    for r, (in_row, out_row) in enumerate(zip(in_rows, out_rows), start=2):
+        if len(in_row) <= max(rst_col, tvalid_col) or len(out_row) <= mvalid_col:
+            continue                                # ragged rows are reported by _check_file
+        if in_row[rst_col].strip() != active:
+            continue
+        sent = in_row[tvalid_col].strip() == "1"
+        expected = out_row[mvalid_col].strip() == "1"
+        if sent or expected:
+            what = "s_axis_tvalid" if sent else "m_axis_tvalid"
+            issue("beat_during_reset",
+                  f"row {r}: {what} = 1 while {name} = {active} (reset active). The design drops everything sent "
+                  f"during reset, so this beat can never be matched and every later beat is checked against the "
+                  f"wrong expected value. Keep s_axis_tvalid = 0 and m_axis_tvalid = 0 on every reset row and "
+                  f"send the first beat on the first row after the reset is released.")
+            break                                   # one message per mistake, not one per row
+
+
+def _backpressure_row_checks(in_header: list[str], in_rows: list[list[str]], issue) -> None:
+    """Streaming designs only: a row with m_axis_tready = 0 must not send an
+    input beat (s_axis_tvalid = 1). The pipeline cannot accept while its
+    output is blocked, so the testbench's "hold the row until accepted"
+    wait never ends and the run finishes as no_marker (llr_demap16 run,
+    2026-10-29 12:00: rows 12, 16 and 20 had tvalid = 1 with tready = 0)."""
+    if "s_axis_tvalid" not in in_header or "m_axis_tready" not in in_header:
+        return                                      # not a streaming design
+    tvalid_col, tready_col = in_header.index("s_axis_tvalid"), in_header.index("m_axis_tready")
+    for r, row in enumerate(in_rows, start=2):
+        if len(row) > max(tvalid_col, tready_col) and row[tvalid_col].strip() == "1" and row[tready_col].strip() == "0":
+            issue("beat_while_blocked",
+                  f"row {r}: s_axis_tvalid = 1 while m_axis_tready = 0. The design cannot accept a beat while "
+                  f"its output is blocked, so the testbench waits forever for s_axis_tready and the simulation "
+                  f"never prints a result. Put s_axis_tvalid = 0 on every row with m_axis_tready = 0 and send "
+                  f"that beat on the next row where m_axis_tready = 1.")
+            break                                   # one message per mistake, not one per row
+
+
 def validate_test_vectors(spec: dict, run_dir: str, result: dict) -> dict:
     """Returns {"csv": {"inputs": path | None, "outputs": path | None},
     "num_vectors": int, "columns": {"inputs": [...], "outputs": [...]},
@@ -98,11 +150,12 @@ def validate_test_vectors(spec: dict, run_dir: str, result: dict) -> dict:
     # The generator records how the LAST MATLAB run went in
     # result["last_matlab_run"] = {"status": "ok" | "error" | "never_ran", "error": "..."}.
     # The key is absent when an older caller (or a test fake) built the result.
-    # TODO(human): when the key is present and the status is not "ok", refuse the
-    # CSVs: call issue("matlab_run_failed", <plain message that includes the
-    # MATLAB error text so the next attempt can fix it>). Without this, a script
-    # that crashed after an earlier success leaves an old CSV that would pass.
+    # A script that crashed after an earlier success would leave an old CSV
+    # that passes every layout check, so a failed last run refuses the CSVs.
     last_run = result.get("last_matlab_run")
+    if last_run and last_run.get("status") != "ok":
+        issue("matlab_run_failed", f"The last MATLAB run did not succeed (status {last_run.get('status')}), so "
+                                   f"the CSVs on disk are not its output. MATLAB said: {last_run.get('error') or ''}")
 
     in_name = result.get("input_csv") or INPUT_CSV
     out_name = result.get("output_csv") or OUTPUT_CSV
@@ -117,6 +170,8 @@ def validate_test_vectors(spec: dict, run_dir: str, result: dict) -> dict:
             if a and b and a[0].strip() != b[0].strip():
                 issue("cycle_mismatch", f"row {r}: cycle {a[0]} in {in_name} but {b[0]} in {out_name}.")
                 break
+        _reset_row_checks(spec, in_header, in_rows, out_header, out_rows, issue)
+        _backpressure_row_checks(in_header, in_rows, issue)
 
     return {
         "csv": {"inputs": str(Path(run_dir) / in_name) if in_header else None,

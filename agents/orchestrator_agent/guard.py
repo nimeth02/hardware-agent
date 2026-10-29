@@ -21,6 +21,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from agents.orchestrator_agent import human_input
+from agents.orchestrator_agent.blame import SECOND_OPINION
 from agents.orchestrator_agent.state import MAX_RETRIES_PER_STAGE, Stage
 from agents.orchestrator_agent.tracing import log_answer
 
@@ -69,9 +70,12 @@ def retry_limit_question(stage: Stage, reasons: list[str]) -> tuple[str, list[st
     (question, suggested answers). The manager AI reads the person's answer
     word for word and acts on it, so the suggestions should say plainly which
     helper to run next or that the run should stop."""
-    # TODO(human): write the question (it must show every line of `reasons`) and the suggested answers.
-    question = f"{stage.value} has been run {len(reasons)} times without success. What should I do next?"
-    suggestions: list[str] = []
+    listed = "\n".join(f"  - {line}" for line in reasons) or "  - (no attempt recorded)"
+    question = (f"{stage.value} has been run {len(reasons)} times and still did not succeed:\n{listed}\n"
+                f"What should happen next?")
+    suggestions = [f"Run {stage.value} once more",
+                   *(f"Re-run {other.value} instead; the fault may be there" for other in SECOND_OPINION.get(stage, ())),
+                   "Stop the run so I can review it (NEEDS_REVIEW)"]
     return question, suggestions
 
 

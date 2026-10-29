@@ -34,6 +34,11 @@ For every request:
 7. If "ambiguities" is non-empty or something needed is still missing,
    make the most conventional choice for that kind of hardware and record
    it in "notes" — never leave a TODO or invent unstated requirements.
+8. For a pipelined design (registers named <field>_s1, _s2, ...), the
+   FIRST entry of "notes" is the stage map (one line per stage listing its
+   registers, each line reading only the line above) and the code is
+   written from that map. A stage that reads a register from two stages
+   back is a bug the linter rejects; a design without the map is rejected.
 
 Return exactly one JSON object with this structure:
 
@@ -90,6 +95,41 @@ HOW TO FIX (general rules)
 - Re-read the design rules (skills) for every construct you are about to
   change before you rewrite it.
 
+If an issue is "pipeline_stage_skip" or "stage_map_missing": rewrite the
+stage map first (every register a stage reads must sit in the line above;
+add copy registers such as `i_s2 <= i_s1;` where a value jumps a stage),
+then change the code to match the map.
+
+If an issue is "valid_data_length_mismatch" or "smoke_output_stuck_at_zero":
+the valid flag and the data do not take the same number of clocks. Count
+the registers one input bit passes through on its way to m_axis_tdata
+(including any output register written inside the process); valid_pipe
+must have exactly that many bits and m_axis_tvalid must come from its
+LAST bit. Do the count in the stage map (one row per register, an output
+register is its own row), then fix the code. Do NOT touch the arithmetic.
+
+If an issue is "abs_without_sign_check": replace the bare negation with
+`unsigned(abs(resize(x, N)))` (or an if/else where only the negative
+branch negates). A plain `-x` is not an absolute value.
+
+If an issue is "smoke_stream_data_changed_while_stalled": every register,
+including the output register, must hold its value while advance = '0'
+(valid high and ready low); move the write under the `elsif advance = '1'`.
+
+If an issue is "power_of_two_multiply", "assignment_width" or
+"multiplier_width", or a "smoke_sim_crash" says "Array sizes do not match,
+left array has L elements, right array has R elements": one assignment
+puts an R-bit value into an L-bit target. The issue names the line when it
+can; if it names only a process, look inside the FUNCTIONS that process
+calls (their `variable` declarations and `:=` lines) — that is where it
+hid last time. A product is as wide as both factors added, and `x * 4`
+or `x * to_signed(4, 16)` DOUBLES the width: write `shift_left(resize(x,
+16), 2)` instead. `shift_right(x, n)` KEEPS the width of x: a 25-bit
+product shifted right is still 25 bits, so `r <= shift_right(p + 4096, 13)`
+into a 16-bit `r` is wrong. Keep the shifted value in a signal or variable
+as wide as `p`, then `r <= resize(that, 16);` on its own line.
+Change that line; returning the same file is refused.
+
 If an issue says "cannot read from 'out' object X": keep X as `out`,
 declare `signal X_i` of the same type, replace every read of X inside
 the architecture with X_i, and add `X <= X_i;`. Fix ALL such issues in
@@ -110,6 +150,9 @@ An entry may also have "downstream": a later simulation or implementation
 failed and blamed this RTL. Its "failures" quote the wrong outputs
 ("cycle N: port expected X got Y") and "suggested_fix" says what to change.
 Fix that behaviour first — a clean lint was not enough last time.
+A "downstream" note may carry "fixed_rule": a reading of the mismatches
+made by code, not by a model. It overrides the note's own "summary" and
+"suggested_fix": do exactly the checks it lists before changing anything else.
 A "downstream" note with "second_opinion": true means another stage was
 blamed first and redone without effect, so the fault may be here after
 all: check what its "summary" asks for. An entry may also have

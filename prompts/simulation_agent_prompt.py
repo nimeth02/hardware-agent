@@ -32,13 +32,56 @@ Classify the outcome:
 
 For "fail", decide the most likely cause from the evidence. Before blaming
 the RTL, re-derive the expected value yourself from "spec" and the
-stimulus in "testbench_code": if the DUT's observed value is what the
-spec predicts and the testbench expected something else, the testbench
-is wrong, not the design.
-- "rtl"        — the design's observed behaviour contradicts the spec.
-- "testbench"  — the expected values or timing in the testbench contradict
-                 the spec (the DUT is behaving correctly).
-- "spec"       — the spec itself is ambiguous/contradictory here.
+stimulus that was really sent: if the DUT's observed value is what the
+spec predicts for that stimulus and the test expected something else, the
+vectors or the testbench are wrong, not the design.
+- "rtl"          — the design's observed behaviour contradicts the spec.
+- "testbench"    — the compare order/timing or file handling in the
+                   testbench contradicts the spec (the DUT is behaving
+                   correctly, the CSV values are right).
+- "test_vectors" — the golden CSV is wrong: the stimulus word in
+                   test_vectors_in.csv does not hold the fields the golden
+                   model computed from (a field packed at the wrong bit
+                   position), or the expected value in test_vectors_out.csv
+                   is not what the spec gives for that stimulus.
+- "spec"         — the spec itself is ambiguous/contradictory here.
+The input may carry "failing_input_rows": the test_vectors_in.csv rows
+(every input port, as written) of the cycles the mismatch lines name
+("beat 1 (input cycle 14)" or "cycle 17: ..."). This is the stimulus the
+DUT really received. For the first one or two rows, do this arithmetic
+explicitly in "summary":
+  1. split the input word into the fields the spec defines — for
+     "port[31:20] = I" the field is floor(word / 2^20) mod 2^12, then apply
+     two's complement if the field is signed;
+  2. compute the spec's expected output from those decoded fields;
+  3. compare with the line's "got" and "expected".
+  got == spec's value  -> likely_cause "test_vectors" (the design is right
+  for what it was given; the CSV is wrong — a decoded field that is tiny
+  or wildly off, e.g. I = 1 where the model meant 256, means the golden
+  model packed it with the wrong shift). Never blame the RTL here.
+  expected == spec's value and got differs -> likely_cause "rtl".
+  Without "failing_input_rows" (no CSV in the project) use the stimulus in
+  "testbench_code" instead.
+Known pattern: the vector CSVs store signed ports as their unsigned bit
+pattern (8-bit -127 is written as 129). If every mismatch on an N-bit port
+satisfies expected - 2**N = got (e.g. "expected 129 got -127",
+"expected 255 got -1"), the testbench compares with `signed(...)` while
+the CSV is unsigned: verdict "fail", likely_cause "testbench", and the
+suggested_fix is to change the testbench's compare to
+`to_integer(unsigned(port))`. The vectors and the RTL are correct in that
+case — never ask for the CSV to be regenerated or the RTL to be rewritten.
+The input may carry "fixed_rule_hint": a deterministic reading of the
+mismatch lines made by code, not by a model. It overrides your own guess:
+when it says the "got" values are the expected values of other cycles,
+the arithmetic is right and the fault is timing/ordering; follow the
+likely_cause it names and never blame the RTL's arithmetic. When it says
+every "got" is 0, the output never carried a computed value: the fault is
+the output register / valid alignment (or a testbench that reads too
+early), never the arithmetic or the output packing. Copy its checks into
+suggested_fix. When it says every "s_axis_tready never rose (deadlock)"
+cycle is an idle row (s_axis_tvalid = 0 in test_vectors_in.csv), the
+design is not stuck: the testbench waited for a handshake on a row that
+sends no beat; likely_cause "testbench", and copy its suggested exit line.
 For "error", use "environment" for tool/licence/path problems, otherwise
 "testbench" for compile errors in the testbench or "rtl" for compile
 errors in the design.
@@ -47,7 +90,7 @@ Return exactly one JSON object:
 
 {
   "verdict": "pass" | "fail" | "error",
-  "likely_cause": "rtl" | "testbench" | "spec" | "environment" | null,
+  "likely_cause": "rtl" | "testbench" | "test_vectors" | "spec" | "environment" | null,
   "failures": [
     "one line per distinct failing check or error, quoting the message"
   ],

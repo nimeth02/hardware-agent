@@ -70,11 +70,46 @@ writer by construction.
       end if;
     end process;
 
+- Stage N reads ONLY stage N-1 registers. Never let stage 3 read `a_s1`
+  directly (skipping `b_s2`): the data then arrives at the output one
+  cycle BEFORE `valid_pipe(last)`, and when the valid flag finally rises
+  the output register already holds the next item (seen as "expected X
+  got 0" and "got X" one beat later). If a stage has nothing to compute,
+  still copy the data through it (`b_s2 <= a_s1`).
 - Latency = number of stages. Count them against the spec's limit, but
   never merge stages to save latency if that breaks the timing rules in
   section 3b.
 - `valid_pipe` is a std_logic_vector, one bit per stage, shifted every
   advance.
+- EVERY value a stage uses comes from the PREVIOUS stage's registers —
+  including side inputs such as a noise/scale value `ns`, a mode or an
+  index that enters with the beat. Carry them along: `ns_s1 <= ns;
+  ns_s2 <= ns_s1; ...` and multiply in stage 4 with `ns_s3`, never with
+  `ns_s1` or the raw input. Mixing a fresh side input with an older
+  symbol's numbers gives wrong results whenever two consecutive beats
+  differ, and zeros after a gap.
+- The valid chain and the data chain MUST be the same length: the number
+  of `valid_pipe` bits equals the number of registers a data value really
+  passes through from input to `m_axis_tdata`. A register that nothing
+  reads does not count — delete it. If valid is one stage longer than
+  data, every output beat shows the NEXT beat's data and the first beat
+  is lost; one stage shorter and the testbench sees stale data.
+- AN OUTPUT REGISTER IS A STAGE. `m_axis_tdata_reg <= ... b3_s6 ...` inside
+  the clocked process is a 7th register after stages 1-6, so it needs a 7th
+  valid bit (`valid_pipe(6) <= valid_pipe(5);` on the line next to it) and
+  `m_axis_tvalid_i <= valid_pipe(6)`. With only valid_pipe(5 downto 0) the
+  valid flag rises one clock BEFORE the register is written and every beat
+  is read as 0 (linter: `valid_data_length_mismatch`). Simplest and
+  preferred: NO separate output register — join the last stage's registers
+  with a plain assignment outside the process:
+      m_axis_tdata <= std_logic_vector(b3_s6 & b2_s6 & b1_s6 & b0_s6);
+  Then valid_pipe has exactly as many bits as there are stages.
+- COUNT BEFORE YOU RETURN: list every register one input bit passes through
+  on its way to `m_axis_tdata` (i_s1, abs_i_s2, ..., b0_s6[, m_axis_tdata_reg]).
+  That count is the ONLY correct length of valid_pipe, and the output valid
+  flag is its LAST bit. The dry run checks this: if m_axis_tvalid is high
+  while m_axis_tdata is 0 on every beat, the design is sent back
+  (`smoke_output_stuck_at_zero`).
 - Handshake (stall-safe, no data loss):
     advance       <= m_tready or not valid_pipe(last);  -- output free or empty
     s_tready_i    <= advance;                           -- accept only when advancing
@@ -132,12 +167,28 @@ target with exactly that width.
   `sll`, `srl`, `sra` do NOT work on signed/unsigned; use the functions.
   Multiplying or dividing by a power of two (2, 4, ... 8192) is a shift,
   never a multiplier or divider. Never write `x * to_signed(8192, N)`,
-  `x / 8192` or `x sra 13`, and never use `/` between two signals.
-  "Round half up then divide by 8192" is:
-      sum <= x + to_signed(4096, x'length);   -- constant sized like x
-      res <= shift_right(sum, 13);
+  `x * 4`, `x / 8192` or `x sra 13`, and never use `/` between two signals.
+  (The linter rejects a power-of-two multiply: `power_of_two_multiply`.
+  Besides being slow, `x * to_signed(4, 16)` is 32 bits wide and crashes a
+  16-bit target with "Array sizes do not match".) Inside a FUNCTION the
+  same rules hold: `res := shift_left(resize(x, 16), 2);`, never
+  `res := resize(x, 16) * to_signed(4, 16);`.
+  "Round half up then divide by 8192" is THREE steps, each at a written
+  width (the linter rejects the one-line version as `assignment_width`):
+      signal sum : signed(24 downto 0);        -- same width as the product p
+      signal sh  : signed(24 downto 0);        -- shift_right keeps 25 bits
+      signal res : signed(15 downto 0);        -- the narrow target
+      sum <= p + to_signed(4096, p'length);    -- 25 bits, constant sized like p
+      sh  <= shift_right(sum, 13);             -- still 25 bits
+      res <= resize(sh, 16);                   -- 25 -> 16 bits, separate step
+  WRONG (25 bits into 16, `assignment_width`):
+      res <= shift_right(p + to_signed(4096, 25), 13);
   If the maths seems to need a real division by a changing value, stop and
   re-read the spec: it is almost always a multiplication or a shift.
+- `shift_right(x, n)` does NOT make x narrower: a 25-bit x stays 25 bits
+  (the top bits are copies of the sign). Store it in a 25-bit signal or
+  variable, then `resize(..., 16)` on its own line; never assign
+  `shift_right(...)` of a wide value straight to a narrower signal.
 - `shift_left(x, n)` does NOT make x wider: a 12-bit x stays 12 bits and the
   top bits are lost. To multiply by 4 or 8 into a wider target, widen FIRST,
   then shift:
@@ -159,9 +210,28 @@ target with exactly that width.
   * Assigning a product or sum straight to a narrower or wider signal:
     use `resize(value, target'length)` and say the width in a comment.
   * Slicing the input wrongly: `s_axis_tdata(31 downto 20)` is 12 bits.
+  * Negating into a wider signal: `-x` is as wide as `x`, so a 12-bit `-x`
+    does not fit a 13-bit magnitude signal. Widen first, then negate:
+    `neg_i <= -resize(i_s, 13);`.
+- ABSOLUTE VALUE: `-x` is NOT |x|. It flips positive inputs negative too,
+  and the linter rejects it (`abs_without_sign_check`). Use numeric_std's
+  `abs` on the WIDENED value, one line, no if needed:
+      abs_i_s2 <= unsigned(abs(resize(i_s1, 13)));   -- 12 -> 13 bits, |-2048| = 2048 fits
+  If you prefer an if/else, the negation goes ONLY in the negative branch:
+      if i_s1 < 0 then abs_i_s2 <= unsigned(-resize(i_s1, 13));
+      else             abs_i_s2 <= unsigned(resize(i_s1, 13));  end if;
   Write the width of every piece in a comment next to the line.
 - Mixed signedness: convert explicitly, e.g. a signed value times an
   unsigned one: `a * signed('0' & b)` (b gains one sign bit: 8 -> 9 bits).
+  So when the spec says "signed 16 x unsigned 8 -> signed 24", the VHDL
+  product is 16 + 9 = 25 bits, NOT 24. Declare the product signal with the
+  real width and narrow it afterwards; never store the product in the
+  spec's width directly:
+      signal p_full : signed(24 downto 0);                 -- 16 + 9 = 25 bits
+      p_full <= m * signed('0' & ns);                      -- natural widths
+      p      <= resize(p_full, 24);                        -- the spec's 24 bits
+  (`p <= m * signed('0' & ns);` into a 24-bit p is the "multiplier_width"
+  lint error; the lint tells the exact widths.)
 - Shifts and rounding: `shift_right(x, n)` keeps the width; add the
   rounding constant BEFORE the shift, using a constant sized like x.
 - Saturation: compare against constants, then `resize` (see the function
@@ -179,4 +249,17 @@ target with exactly that width.
 [ ] left and right side of every assignment (and every `&` join) have equal widths
 [ ] stage count ≤ the spec's latency limit (without breaking section 3b)
 [ ] every multiply result is registered; no stage mixes multiply/add/saturate
+[ ] every side input (ns, mode, index, ...) is delayed stage by stage and used
+    from the SAME stage as the data it is combined with
+[ ] the stage map (pipeline_stage_map.md) is the first note, and every
+    `x_sK <= ...` line reads only `_s(K-1)` names; nothing reads `_s(K-2)`
+[ ] valid_pipe length = number of data registers on the path to m_axis_tdata,
+    COUNTING any output register (m_axis_tdata_reg) as one more stage with
+    its own valid bit; no register is written and never read
+[ ] every absolute value uses `abs(resize(x, N))` or an if/else on the sign;
+    never a bare `-x`
+[ ] m_axis_tdata keeps its value while m_axis_tvalid = '1' and
+    m_axis_tready = '0' (every register holds when advance = '0')
+[ ] on a retry: the new code differs from the previous attempt where the
+    reported failure is; returning the same code with a new note is a failure
 [ ] no process lists in its sensitivity list a signal that only it writes

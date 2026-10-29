@@ -7,7 +7,14 @@ from __future__ import annotations
 import pytest
 
 from agents.simulation_agent.simulation_agent import SimulationAgent, resolve_project_dir
-from agents.simulation_agent.simulation_analyst import SimulationAnalyst, deterministic_verdict, parse_analysis_response
+from agents.simulation_agent.simulation_analyst import (
+    SimulationAnalyst,
+    all_zero_output_hint,
+    deterministic_verdict,
+    fixed_rule_hint,
+    parse_analysis_response,
+    shifted_values_hint,
+)
 from agents.simulation_agent.simulation_decider import Decision, SimulationDecider
 from agents.simulation_agent.simulation_runner import double_sim_time, outcome_of
 from agents.simulation_agent.state import MAX_SIM_RERUNS, Action, SimulationStatus
@@ -220,6 +227,16 @@ def test_invalid_planner_output_falls_back_safely():
 def test_deterministic_verdicts_and_outcomes():
     assert deterministic_verdict(COMPILE_OK, SIM_PASS)["verdict"] == "pass"
     assert deterministic_verdict(COMPILE_OK, {**SIM_NO_MARKER, "sim_time": "40us"})["verdict"] == "error"
+    # the log stops early (last report at 126 ns of 40 us): a frozen handshake, not a short sim_time
+    frozen = {**SIM_NO_MARKER, "sim_time": "40us",
+              "sim_output": "Error: beat 0: m_axis_tdata expected 2015 got 1560\nTime: 116 ns  Iteration: 0\n"
+                            "Error: beat 1: m_axis_tdata expected 1560 got 2015\nTime: 126 ns  Iteration: 0\n"}
+    verdict = deterministic_verdict(COMPILE_OK, frozen)
+    assert verdict["verdict"] == "error" and "126 ns" in verdict["summary"] and "waiting" in verdict["summary"]
+    assert "m_axis_tready = 0" in verdict["suggested_fix"]
+    # reports run on until near the end: the stimulus really is longer than sim_time
+    long_run = {**frozen, "sim_output": "Error: x\nTime: 39500 ns  Iteration: 0\n"}
+    assert "end of sim_time" in deterministic_verdict(COMPILE_OK, long_run)["summary"]
     assert deterministic_verdict(COMPILE_OK, SIM_FAIL) is None
     assert deterministic_verdict(COMPILE_BAD, None) is None
     assert outcome_of({"status": "ok", "sim_passed": True, "sim_output": "SIMULATION PASSED"}) == "passed"
@@ -228,6 +245,73 @@ def test_deterministic_verdicts_and_outcomes():
     assert outcome_of({"status": "error", "sim_passed": False, "sim_output": "", "error_class": "environment"}) == "error"
     assert outcome_of({"status": "error", "sim_passed": False, "sim_output": "run 10us\nquit"}) == "no_marker"
     assert double_sim_time("10us") == "20us" and double_sim_time("1.5 ms") == "3ms" and double_sim_time("bogus") == "bogus"
+
+
+def test_got_values_that_belong_to_other_cycles_are_flagged_as_a_timing_fault():
+    """llr_demap16, 2026-10-29: four attempts blamed the RTL's arithmetic while
+    every 'got' was simply the expected value of an earlier cycle."""
+    log = """Error: cycle 16: m_axis_tdata changed while m_axis_tready is low
+Error: cycle 17: m_axis_tdata expected hi=125 lo=61440 got hi=0 lo=0
+Error: cycle 18: m_axis_tdata expected hi=130 lo=0 got hi=0 lo=2015
+Error: cycle 20: m_axis_tdata expected hi=0 lo=0 got hi=125 lo=61440
+Error: cycle 21: m_axis_tdata expected hi=129 lo=63520 got hi=130 lo=0
+Error: cycle 23: m_axis_tdata expected hi=125 lo=63520 got hi=125 lo=61440
+Note: SIMULATION FAILED"""
+    hint = shifted_values_hint(log)
+    assert hint and "3 of the 5" in hint and "'testbench'" in hint and "not arithmetic" in hint
+
+    # genuinely wrong values (never expected anywhere) give no hint; so do all-zero gots
+    assert shifted_values_hint("Error: cycle 1: count expected 3 got 7\nError: cycle 2: count expected 4 got 9") is None
+    assert shifted_values_hint("Error: cycle 1: q expected 3 got 0\nError: cycle 2: q expected 0 got 0") is None
+    assert shifted_values_hint("Error: cycle 1: q expected 3 got 4") is None          # one line proves nothing
+    assert shifted_values_hint(None) is None
+
+    # the hint reaches the LLM analyst as "fixed_rule_hint"
+    seen = {}
+
+    class Llm:
+        def invoke(self, messages, config=None):
+            import json
+            seen.update(json.loads(messages[1].content))
+            return type("R", (), {"content": '{"verdict": "fail", "likely_cause": "testbench"}'})()
+
+    SimulationAnalyst(Llm()).analyze(PROJECT, COMPILE_OK, {**SIM_FAIL, "sim_output": log})
+    assert "FIXED RULE" in seen["fixed_rule_hint"]
+    seen.clear()
+    SimulationAnalyst(Llm()).analyze(PROJECT, COMPILE_OK, SIM_FAIL)
+    assert "fixed_rule_hint" not in seen                        # a plain mismatch log carries no hint
+
+
+def test_all_zero_gots_are_flagged_as_an_output_register_fault():
+    """llr_demap16, 2026-10-29, later run: every beat came out as 0 (the output
+    register was loaded one clock after the last valid bit) and the analyst
+    blamed 'the demapping calculation or output packing'."""
+    log = """Error: beat 1 (input cycle 12): m_axis_tdata expected 2131480 got 0
+Error: beat 2 (input cycle 14): m_axis_tdata expected 14911000 got 0
+Error: beat 3 (input cycle 16): m_axis_tdata expected 8253440 got 0
+Note: SIMULATION FAILED"""
+    hint = all_zero_output_hint(log)
+    assert hint and "all 3" in hint and "'rtl'" in hint and "NOT arithmetic" in hint
+    assert fixed_rule_hint(log) == hint and shifted_values_hint(log) is None
+
+    assert all_zero_output_hint("Error: c 1: w expected hi=1 lo=2 got hi=0 lo=0\n"
+                                "Error: c 2: w expected hi=3 lo=0 got hi=0 lo=0")      # "hi=0 lo=0" is zero too
+    assert all_zero_output_hint("Error: cycle 1: q expected 3 got 0\nError: cycle 2: q expected 4 got 9") is None
+    assert all_zero_output_hint("Error: cycle 1: q expected 0 got 0\nError: cycle 2: q expected 3 got 0") is None
+    assert all_zero_output_hint("Error: cycle 1: q expected 3 got 0") is None       # one line proves nothing
+    assert all_zero_output_hint(None) is None
+
+    # the rule travels with the analysis, so the blame note hands it to the RTL agent verbatim
+    class Llm:
+        def invoke(self, messages, config=None):
+            return type("R", (), {"content": '{"verdict": "fail", "likely_cause": "rtl"}'})()
+
+    analysis = SimulationAnalyst(Llm()).analyze(PROJECT, COMPILE_OK, {**SIM_FAIL, "sim_output": log})
+    assert analysis["fixed_rule"] == hint
+    from agents.orchestrator_agent.blame import downstream_note
+    from agents.orchestrator_agent.state import Stage
+    assert downstream_note(Stage.SIMULATE, analysis)["fixed_rule"] == hint
+    assert "fixed_rule" not in downstream_note(Stage.SIMULATE, {"verdict": "fail"})
 
 
 def test_invalid_analyst_output_becomes_a_safe_verdict():
@@ -265,3 +349,86 @@ def test_the_llm_sees_the_first_mismatches_and_the_end_of_a_long_log():
     assert "chars omitted for the LLM" in cut[len(warnings) // 10:]            # the middle is cut
     assert _tail("short log", head=500, tail=300) == "short log"
     assert _tail(None) is None
+
+
+def test_the_analyst_is_handed_the_input_rows_of_the_failing_beats():
+    """llr_demap16 run 170022 (2026-10-29): the golden model packed I with
+    2^12 instead of 2^20, the design answered correctly for the word it was
+    given, and the analyst, who never saw the CSV, blamed the RTL. With the
+    stimulus rows in hand it can decode the word and blame the vectors."""
+    from agents.simulation_agent.simulation_analyst import failing_input_rows
+    csv_text = ("cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata,m_axis_tready\n"
+                "3,1,1,0,0,1\n4,1,1,1,128,1\n5,1,1,1,1114240,1\n6,1,1,1,16711808,1\n7,1,1,1,2031744,1\n")
+    log = """Error: beat 1 (input cycle 5): m_axis_tdata expected hi=1040 lo=1040 got hi=1024 lo=1055
+Error: beat 2 (input cycle 6): m_axis_tdata expected hi=3120 lo=1040 got hi=3073 lo=1055
+Error: beat 2 (input cycle 6): m_axis_tdata expected hi=3120 lo=1040 got hi=3073 lo=1055
+Error: beat 9 (input cycle 99): m_axis_tdata expected 1 got 2
+Note: SIMULATION FAILED"""
+    rows = failing_input_rows(log, csv_text)
+    assert rows == [{"cycle": "5", "aclk": "1", "aresetn": "1", "s_axis_tvalid": "1", "s_axis_tdata": "1114240", "m_axis_tready": "1"},
+                    {"cycle": "6", "aclk": "1", "aresetn": "1", "s_axis_tvalid": "1", "s_axis_tdata": "16711808", "m_axis_tready": "1"}]
+    # a fixed-cycle compare names the row directly; only "expected ... got" lines count
+    assert [r["cycle"] for r in failing_input_rows("Error: cycle 7: q expected 3 got 4\nNote: cycle 4 reached", csv_text)] == ["7"]
+    assert failing_input_rows(log, None) == [] and failing_input_rows(None, csv_text) == [] and failing_input_rows(log, "") == []
+    many = "\n".join(f"Error: cycle {c}: q expected 1 got 2" for c in range(3, 8)) * 3
+    assert len(failing_input_rows(many, csv_text)) == 5                         # distinct cycles, in log order
+
+    # the rows reach the LLM analyst as "failing_input_rows"; without a CSV the key is absent
+    seen = {}
+
+    class Llm:
+        def invoke(self, messages, config=None):
+            import json
+            seen.update(json.loads(messages[1].content))
+            return type("R", (), {"content": '{"verdict": "fail", "likely_cause": "test_vectors"}'})()
+
+    project = {**PROJECT, "test_vectors_in_csv": csv_text}
+    analysis = SimulationAnalyst(Llm()).analyze(project, COMPILE_OK, {**SIM_FAIL, "sim_output": log})
+    assert analysis["likely_cause"] == "test_vectors"
+    assert [r["s_axis_tdata"] for r in seen["failing_input_rows"]] == ["1114240", "16711808"]
+    seen.clear()
+    SimulationAnalyst(Llm()).analyze(PROJECT, COMPILE_OK, {**SIM_FAIL, "sim_output": log})
+    assert "failing_input_rows" not in seen
+
+    from prompts.simulation_agent_prompt import SIMULATION_AGENT_SYSTEM_PROMPT
+    assert '"test_vectors"' in SIMULATION_AGENT_SYSTEM_PROMPT and "failing_input_rows" in SIMULATION_AGENT_SYSTEM_PROMPT
+
+
+def test_deadlocks_on_idle_rows_are_blamed_on_the_testbench_not_the_rtl():
+    """llr_demap16, 2026-10-29 16:40: the hold loop waited for s_axis_tready on
+    rows with s_axis_tvalid = 0 (cycles 0-1 and 50-59), reported 12 deadlocks,
+    and the analyst blamed the RTL; the RTL's ready wire was high all along."""
+    from agents.simulation_agent.simulation_analyst import idle_row_deadlock_hint
+    csv_text = ("cycle,aresetn,s_axis_tvalid,s_axis_tdata,m_axis_tready\n"
+                "0,0,0,0,1\n1,0,0,0,1\n2,1,1,123,1\n3,1,1,456,0\n50,1,0,0,1\n51,1,0,0,1\n")
+    log = ("Error: cycle 0: s_axis_tready never rose (deadlock)\nError: cycle 1: s_axis_tready never rose (deadlock)\n"
+           "Error: beat 5 (input cycle 14): m_axis_tdata expected 129 248 32 got 130 8 32\n"
+           "Error: cycle 50: s_axis_tready never rose (deadlock)\nError: cycle 51: s_axis_tready never rose (deadlock)\n"
+           "Note: SIMULATION FAILED")
+    hint = idle_row_deadlock_hint(log, csv_text)
+    assert hint and "all 4" in hint and "cycles 0, 1, 50, 51" in hint and "'testbench'" in hint
+    assert "cur_s_axis_tvalid = 0 or dut_s_axis_tready = '1'" in hint
+    assert fixed_rule_hint(log, csv_text) == hint and fixed_rule_hint(log) is None    # needs the CSV
+    # a stuck REAL beat (tvalid = 1, cycle 3) is not covered by the rule
+    assert idle_row_deadlock_hint("Error: cycle 3: s_axis_tready never rose (deadlock)", csv_text) is None
+    assert idle_row_deadlock_hint("Error: cycle 99: s_axis_tready never rose (deadlock)", csv_text) is None
+    assert idle_row_deadlock_hint("Error: cycle 1: q expected 3 got 4", csv_text) is None
+    assert idle_row_deadlock_hint(log, None) is None and idle_row_deadlock_hint(None, csv_text) is None
+
+    # the hint reaches the LLM analyst when the project carries the CSV
+    seen = {}
+
+    class CapturingLLM:
+        def invoke(self, messages, config=None):
+            import json as _json
+            seen.update(_json.loads(messages[1].content))
+
+            class R:
+                content = '{"verdict": "fail", "likely_cause": "testbench", "failures": [], "summary": "s", "suggested_fix": "f"}'
+            return R()
+
+    SimulationAnalyst(llm=CapturingLLM()).analyze({**PROJECT, "test_vectors_in_csv": csv_text}, {"status": "ok"},
+                                                  {"outcome": "failed", "sim_output": log})
+    assert "idle row" in seen["fixed_rule_hint"]
+    from prompts.simulation_agent_prompt import SIMULATION_AGENT_SYSTEM_PROMPT
+    assert "never rose" in SIMULATION_AGENT_SYSTEM_PROMPT and "idle row" in SIMULATION_AGENT_SYSTEM_PROMPT
