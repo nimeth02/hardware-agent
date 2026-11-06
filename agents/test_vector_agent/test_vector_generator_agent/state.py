@@ -13,12 +13,20 @@ from typing import TypedDict
 from agents.test_vector_agent.test_vector_validator import INPUT_CSV, OUTPUT_CSV
 
 MAX_AGENT_STEPS = 30       # LLM steps (tool calls + replies) per attempt; checked by the tool loop's recursion limit
-MAX_RUN_FAILURES = 3       # failed MATLAB runs per attempt before the attempt gives up (RunAttemptsExceeded)
+MAX_RUN_FAILURES = 3       # failed MATLAB runs (run_matlab_script OR matlab_eval) per attempt before it gives up (RunAttemptsExceeded)
+MAX_IDENTICAL_REJECTS = 2  # times in a row the LLM may re-send a script that already crashed before the attempt gives up
 SCRIPT_NAME = "gen_test_vectors.m"   # the golden-model script the LLM writes in run_dir
 
 
 class RunAttemptsExceeded(Exception):
-    """Raised by the MATLAB guard when an attempt has used up MAX_RUN_FAILURES."""
+    """Raised by the MATLAB guard when an attempt has used up MAX_RUN_FAILURES,
+    or re-sent a script that already crashed MAX_IDENTICAL_REJECTS times in a
+    row (2026-11-06: seven identical 2,600-token scripts until the step cap).
+    `reason` is the one-line summary the attempt reports; `str(e)` the detail."""
+
+    def __init__(self, error: str, reason: str = f"Gave up after {MAX_RUN_FAILURES} failed MATLAB runs."):
+        super().__init__(error)
+        self.reason = reason
 
 
 class LastRun(TypedDict):
@@ -31,14 +39,18 @@ class LastRun(TypedDict):
 class RunState(TypedDict):
     """Bookkeeping shared between the guarded MATLAB tools and the attempt."""
 
-    failures: int             # failed MATLAB runs so far, compared with MAX_RUN_FAILURES
+    failures: int             # failed MATLAB runs so far (script runs + matlab_eval snippets), compared with MAX_RUN_FAILURES
     dirty: bool               # True once the script changed since its last run; blocks re-running an unchanged script
     scripts: set[str]         # script stems the LLM wrote this attempt; run_matlab_script accepts only these
+    codes: dict[str, str]     # script stem -> its text as last written this attempt (to show the line that crashed)
+    failed_fingerprints: set[str]  # code (minus comments/spacing) of every script that crashed this attempt
+    identical_rejects: int    # consecutive generate calls re-sending an already-crashed script; reset by a real change
     last_run: LastRun | None  # None until run_matlab_script is called
 
 
 def new_run_state() -> RunState:
-    return {"failures": 0, "dirty": True, "scripts": set(), "last_run": None}
+    return {"failures": 0, "dirty": True, "scripts": set(), "codes": {}, "failed_fingerprints": set(),
+            "identical_rejects": 0, "last_run": None}
 
 
 def failure_result(reason: str, detail: str = "") -> dict:

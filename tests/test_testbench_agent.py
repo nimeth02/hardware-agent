@@ -30,10 +30,11 @@ class FakeGenerator(TestbenchGenerator):
         self.tbs = list(tbs)
         self.calls: list[dict] = []
 
-    def generate(self, spec, rtl, skills=None, previous_testbench=None, lint_issues=None, attempt=1, attempt_history=None):
+    def generate(self, spec, rtl, skills=None, previous_testbench=None, lint_issues=None, attempt=1, attempt_history=None,
+                 starting_testbench=None):
         self.calls.append({"rtl": rtl, "skills": dict(skills or {}), "previous": previous_testbench,
                            "lint_issues": list(lint_issues or []), "attempt": attempt,
-                           "attempt_history": list(attempt_history or [])})
+                           "attempt_history": list(attempt_history or []), "starting": starting_testbench})
         return self.tbs.pop(0) if len(self.tbs) > 1 else self.tbs[0]
 
 
@@ -129,6 +130,42 @@ def test_on_a_later_attempt_the_generator_prompt_carries_the_orchestrator_feedba
     assert "attempt 2" not in first[0].content and "attempt_history" not in first[1].content
     assert "This is attempt 2 for this requirement" in second[0].content and '"downstream"' in second[0].content
     assert "cannot open test_vectors_out.csv" in second[1].content and '"rtl"' in second[1].content
+
+
+def test_a_retry_is_handed_the_previous_testbench_to_revise_not_rewrite():
+    """2026-11-06: a blamed testbench was rewritten from zero on every retry,
+    so parts that were already right (file names, DUT wiring, reset) could
+    come back wrong. Like the RTL agent, the testbench agent now receives
+    the testbench its previous call delivered and is told to edit it."""
+    import json
+
+    class Spy(FakeListChatModel):
+        seen: list = []
+
+        def _call(self, messages, *args, **kwargs):
+            Spy.seen.append(messages)
+            return super()._call(messages, *args, **kwargs)
+
+    Spy.seen = []
+    gen = TestbenchGenerator(llm=Spy(responses=['{"entity_name": "counter4_tb", "code": "x"}'] * 3))
+    gen.generate(SPEC, RTL, attempt=2, attempt_history=EARLIER, starting_testbench=GOOD_TB)
+    system, user = Spy.seen[0]
+    assert "REVISE that code" in system.content                              # told to edit, not rewrite
+    assert json.loads(user.content)["previous_code"] == GOOD_TB["code"]      # and handed the code to edit
+    gen.generate(SPEC, RTL, attempt=2, attempt_history=EARLIER, starting_testbench=GOOD_TB,
+                 previous_testbench=BAD_TB, lint_issues=DIRTY["issues"])     # this run's own lint fix wins
+    system, user = Spy.seen[1]
+    assert "REVISE that code" not in system.content and "lint_issues" in user.content
+    assert json.loads(user.content)["previous_code"] == BAD_TB["code"]
+    gen.generate(SPEC, RTL, attempt=1, starting_testbench=GOOD_TB)           # 1st call: nothing to revise
+    assert "previous_code" not in Spy.seen[2][1].content
+
+    # the agent passes the orchestrator's testbench through to the generator on a retry
+    agent = make_agent([GOOD_TB], [CLEAN])
+    agent.run(SPEC, RTL, attempt=2, attempt_history=EARLIER, previous_testbench=GOOD_TB)
+    assert agent.tools.generator.calls[0]["starting"] == GOOD_TB
+    assert agent.tools.generator.calls[0]["previous"] is None               # not seeded as this run's testbench
+    assert make_agent([GOOD_TB], [CLEAN]).run(SPEC, RTL).__class__ is dict  # the old call shape still works
 
 
 def test_lint_issues_trigger_a_fix_regeneration_with_feedback():
@@ -464,6 +501,10 @@ def test_streaming_designs_must_be_compared_in_beat_order_not_per_cycle():
       end if;
     """
     assert _streaming_checks(stream, sampled_at_edge) == []
+    # the same guard with each term in parentheses is the same handshake
+    assert _streaming_checks(stream, sampled_at_edge.replace(
+        "if dut_m_axis_tvalid = '1' and dut_m_axis_tready = '1' then",
+        "if (dut_m_axis_tvalid = '1') and (dut_m_axis_tready = '1') then")) == []
 
     # a plain counter has no handshake ports: nothing to enforce
     assert _streaming_checks(SPEC, per_cycle) == []
@@ -535,3 +576,208 @@ def test_a_hold_loop_that_an_idle_row_cannot_leave_is_rejected():
     gated = "if v_s_axis_tvalid = 1 then\n  loop\n ... never rose ...\n  end loop;\nelse wait until rising_edge(aclk); end if;"
     assert _idle_row_hold_issue(gated.splitlines()) is None
     assert _idle_row_hold_issue(["wait until rising_edge(aclk);"]) is None       # no hold loop, nothing to check
+
+
+def test_streaming_rules_apply_without_an_m_axis_tready_port_and_flag_compares_are_caught():
+    """timing_recovery, 2026-10-30: the spec has s_axis_tvalid/m_axis_tvalid but
+    no m_axis_tready ("downstream is always ready"), the streaming checks never
+    ran, and two cycle-by-cycle testbenches went through. The first compared
+    s_axis_tready and m_axis_tvalid on every row (1200 error lines, log cut,
+    marker lost); the second reported 'missing m_axis_tvalid' on every expected
+    row and the RTL's strobe timing was blamed, although the spec leaves the
+    latency L to the RTL."""
+    from agents.testbench_agent.testbench_linter import _streaming_checks
+    stream = {"entity_name": "timing_recovery", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+        ("aclk", "input", "1"), ("aresetn", "input", "1"),
+        ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "24"),
+        ("m_axis_tvalid", "output", "1"), ("m_axis_tdata", "output", "24"), ("m_axis_tuser", "output", "8")]]}
+    reads = """
+      read(lo, v_cycle_out); read(lo, v_s_axis_tready); read(lo, v_m_axis_tvalid); read_wide(lo, v_m_axis_tdata); read(lo, v_m_axis_tuser);
+    """
+    # attempt 1: cycle-exact compare of every output column, flags included
+    cycle_exact = reads + """
+      wait until rising_edge(aclk); wait for 1 ns;
+      if (s_axis_tready = '1') /= (v_s_axis_tready = 1) then
+        report "cycle " & integer'image(v_cycle) & ": s_axis_tready expected " & integer'image(v_s_axis_tready) severity error;
+      end if;
+      if (m_axis_tvalid = '1') /= (v_m_axis_tvalid = 1) then
+        report "cycle " & integer'image(v_cycle) & ": m_axis_tvalid expected " & integer'image(v_m_axis_tvalid) severity error;
+      end if;
+      if m_axis_tdata /= v_m_axis_tdata then report "mismatch" severity error; end if;
+    """
+    codes = [i["code"] for i in _streaming_checks(stream, cycle_exact)]
+    assert codes == ["streaming_row_compare", "streaming_no_handshake_compare", "streaming_flag_cycle_compare"]
+
+    # attempt 2: hold loop and dut_ copies are there, but valid is still checked row by row
+    hybrid = reads + """
+      loop
+        wait until rising_edge(aclk);
+        dut_s_axis_tready := s_axis_tready; dut_m_axis_tvalid := m_axis_tvalid;
+        dut_m_axis_tdata := m_axis_tdata; dut_m_axis_tuser := m_axis_tuser;
+        wait for 1 ns;
+        if cur_s_axis_tvalid = 0 or dut_s_axis_tready = '1' then exit; end if;
+        wait_count := wait_count + 1;
+        if wait_count >= 64 then report "cycle " & integer'image(cur_cycle) & ": s_axis_tready never rose (deadlock)" severity error; exit; end if;
+      end loop;
+      if dut_m_axis_tvalid = '1' then
+        if to_integer(unsigned(dut_m_axis_tuser)) /= to_integer(unsigned(v_m_axis_tuser)) then
+          report "cycle " & integer'image(v_cycle) & ": m_axis_tuser expected " & integer'image(to_integer(unsigned(v_m_axis_tuser))) severity error;
+        end if;
+      end if;
+      if dut_m_axis_tvalid = '1' and v_m_axis_tvalid = 0 then
+        report "cycle " & integer'image(v_cycle) & ": unexpected m_axis_tvalid" severity error;
+      end if;
+      if dut_m_axis_tvalid = '0' and v_m_axis_tvalid = 1 then
+        report "cycle " & integer'image(v_cycle) & ": missing m_axis_tvalid" severity error;
+      end if;
+    """
+    issues = _streaming_checks(stream, hybrid)
+    assert [i["code"] for i in issues] == ["streaming_row_compare", "streaming_flag_cycle_compare"]
+    assert "v_m_axis_tuser" in issues[0]["detail"]                       # any payload column, not only m_axis_tdata
+    assert "no m_axis_tready port" in issues[0]["detail"]                 # the rule text knows the port is missing
+    assert "v_m_axis_tvalid = 0" in issues[1]["detail"] and "unexpected m_axis_tvalid" in issues[1]["detail"]
+
+    # the right shape for this design: beats in order, consumed on every edge with the DUT's valid high
+    beat_order = reads + """
+      if v_m_axis_tvalid = 1 then exp_tdata(n_exp) := v_m_axis_tdata; exp_tuser(n_exp) := v_m_axis_tuser; n_exp := n_exp + 1; end if;
+      wait until rising_edge(aclk);
+      dut_m_axis_tvalid := m_axis_tvalid; dut_m_axis_tdata := m_axis_tdata; dut_m_axis_tuser := m_axis_tuser;
+      wait for 1 ns;
+      if dut_m_axis_tvalid = '1' then
+        if k_exp >= n_exp then report "unexpected output beat" severity error;
+        elsif dut_m_axis_tdata /= exp_tdata(k_exp) or dut_m_axis_tuser /= exp_tuser(k_exp) then
+          report "beat " & integer'image(k_exp) & ": m_axis_tdata expected " & integer'image(to_integer(unsigned(exp_tdata(k_exp)))) & " got " & integer'image(to_integer(unsigned(dut_m_axis_tdata))) severity error;
+        end if;
+        k_exp := k_exp + 1;
+      end if;
+      if k_exp < n_exp then report "missing output beats: expected " & integer'image(n_exp) & " got " & integer'image(k_exp) severity error; end if;
+    """
+    assert _streaming_checks(stream, beat_order) == []
+
+    # correct shapes the checks must not mistake for compares (adversarial review, 2026-10-30):
+    # a grouped declaration with an aggregate default: the '=' of '=>' is not a compare
+    grouped_decl = "    variable v_m_axis_tdata, dut_m_axis_tdata : std_logic_vector(23 downto 0) := (others => '0');\n"
+    assert _streaming_checks(stream, grouped_decl + beat_order) == []
+    # a width attribute on the wire is a size, not the wire's value (the rule file's own to_unsigned(v, port'length))
+    sized = beat_order.replace("exp_tuser(n_exp) := v_m_axis_tuser;",
+                               "exp_tuser(n_exp) := std_logic_vector(to_unsigned(v_m_axis_tuser, m_axis_tuser'length));")
+    assert _streaming_checks(stream, sized) == []
+    ranged = "  variable v_m_axis_tdata : std_logic_vector(m_axis_tdata'range) := (others => '0');\n" + beat_order
+    assert _streaming_checks(stream, ranged) == []
+    # ... but the wire's VALUE next to that attribute is still a row compare
+    still_bad = beat_order.replace("dut_m_axis_tuser /= exp_tuser(k_exp)",
+                                   "dut_m_axis_tuser /= std_logic_vector(to_unsigned(v_m_axis_tuser, m_axis_tuser'length))")
+    assert "streaming_row_compare" in [i["code"] for i in _streaming_checks(stream, still_bad)]
+    # the guard with the flag as the second operand is the same guard
+    for swapped in ("if k_exp < n_exp and dut_m_axis_tvalid = '1' then", "if cur_aresetn = 1 and dut_m_axis_tvalid = '1' then"):
+        assert _streaming_checks(stream, beat_order.replace("if dut_m_axis_tvalid = '1' then", swapped)) == []
+    # legitimate beat-order wording that merely mentions the flag is not a flag compare
+    worded = beat_order.replace('report "unexpected output beat"',
+                                'report "unexpected output beat (m_axis_tvalid high with nothing left to expect)"')
+    assert _streaming_checks(stream, worded) == []
+
+    # a wire the spec does not have gets a clear message instead of a compile error ...
+    with_tready = beat_order.replace("if dut_m_axis_tvalid = '1' then", "if dut_m_axis_tvalid = '1' and m_axis_tready = '1' then")
+    assert [i["code"] for i in _streaming_checks(stream, with_tready)] == ["no_m_axis_tready_port"]
+    # ... and so does a dut_m_axis_tready copy that nothing could ever drive
+    stray_var = "    variable dut_m_axis_tvalid, dut_m_axis_tready : std_logic;\n" + beat_order
+    assert [i["code"] for i in _streaming_checks(stream, stray_var)] == ["no_m_axis_tready_port"]
+
+    # the LLR shape (all four handshake wires) is unchanged: the full handshake is still required
+    from prompts.testbench_agent_prompt import TESTBENCH_AGENT_SYSTEM_PROMPT
+    assert "no m_axis_tready" in TESTBENCH_AGENT_SYSTEM_PROMPT and "FIRST 20" in TESTBENCH_AGENT_SYSTEM_PROMPT
+
+
+def _ports(rows):
+    return [{"name": n, "direction": d, "width": w} for n, d, w in rows]
+
+
+TIMING_RECOVERY_SPEC = {"entity_name": "timing_recovery", "ports": _ports([
+    ("aclk", "input", "1"), ("aresetn", "input", "1"),
+    ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "24"),
+    ("m_axis_tvalid", "output", "1"), ("m_axis_tdata", "output", "24"), ("m_axis_tuser", "output", "8")])}
+LLR_SPEC = {"entity_name": "llr_demap16", "ports": _ports([
+    ("aclk", "input", "1"), ("aresetn", "input", "1"),
+    ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
+    ("m_axis_tvalid", "output", "1"), ("m_axis_tready", "input", "1"), ("m_axis_tdata", "output", "24")])}
+
+
+def test_a_streaming_design_is_named_as_one_before_the_first_draft():
+    """timing_recovery, 2026-10-30 to 2026-11-03: four first drafts in a row
+    copied the counter pattern (every output and both flags compared with the
+    current row), so every run opened with streaming_row_compare,
+    streaming_no_handshake_compare and streaming_flag_cycle_compare. The
+    writer is now told up front, with this design's own columns and wires."""
+    from agents.testbench_agent.testbench_generator import streaming_hint
+    hint = streaming_hint(TIMING_RECOVERY_SPEC)
+    assert "THIS DESIGN IS A STREAMING DESIGN" in hint and "COMPLETE STREAMING TESTBENCH" in hint
+    assert "exp_tdata for m_axis_tdata, exp_tuser for m_axis_tuser" in hint     # its own payload columns
+    assert "NO m_axis_tready port" in hint and "HAS an m_axis_tready" not in hint
+    assert "NO s_axis_tready" not in hint
+    llr = streaming_hint(LLR_SPEC)
+    assert "HAS an m_axis_tready port" in llr and "exp_tdata for m_axis_tdata." in llr
+    no_s_tready = {"ports": [p for p in LLR_SPEC["ports"] if p["name"] != "s_axis_tready"]}
+    assert "NO s_axis_tready port" in streaming_hint(no_s_tready)
+    assert streaming_hint(SPEC) == ""                                            # a counter gets no hint
+    assert "{" not in hint and "{" not in llr                                    # every placeholder filled
+
+    # the hint is the last thing in the system prompt, on the first draft and on a fix
+    class Spy(FakeListChatModel):
+        seen: list = []
+
+        def _call(self, messages, *args, **kwargs):
+            Spy.seen.append(messages)
+            return super()._call(messages, *args, **kwargs)
+
+    Spy.seen = []
+    gen = TestbenchGenerator(llm=Spy(responses=['{"entity_name": "timing_recovery_tb", "code": "x"}'] * 3))
+    rtl = {"entity_name": "timing_recovery", "code": "entity timing_recovery is end;"}
+    gen.generate(TIMING_RECOVERY_SPEC, rtl, SKILLS)
+    gen.generate(TIMING_RECOVERY_SPEC, rtl, SKILLS, previous_testbench={"code": "x"},
+                 lint_issues=[{"code": "streaming_row_compare", "detail": "d"}])
+    gen.generate(SPEC, RTL, SKILLS)
+    first, fix, counter = (call[0].content for call in Spy.seen)
+    assert first.endswith(hint) and fix.endswith(hint) and "You are now FIXING" in fix
+    assert "STREAMING DESIGN" not in counter.split("TESTBENCH RULES (SKILLS)")[-1]
+
+
+def test_the_rules_file_has_a_complete_streaming_testbench_the_checker_accepts():
+    """The rules file used to show a complete counter testbench but only a
+    gappy streaming sketch (lines of '...'), and the model copied the
+    complete one. The streaming example is now a whole file: copied with
+    only the names changed it must pass every static check, and the change
+    lists the hint points to must exist under it. (It was also simulated on
+    2026-11-03: SIMULATION PASSED on llr_demap16 with the m_axis_tready
+    changes applied.)"""
+    import re
+    from pathlib import Path
+    from agents.testbench_agent.testbench_linter import _static_checks
+    rules = (Path(__file__).resolve().parents[1] / "skills" / "TESTBENCH" / "vhdl_2008_testbench_rules.md").read_text(encoding="utf-8")
+    section = rules.split("COMPLETE STREAMING TESTBENCH. Copy this file", 1)[1].split("WITH AN m_axis_tready PORT", 1)[0]
+    code_lines = [line[4:] if line.startswith("    ") else line for line in section.splitlines()]
+    start = next(i for i, line in enumerate(code_lines) if line.startswith("library ieee;"))
+    end = next(i for i, line in enumerate(code_lines) if line.startswith("end architecture"))
+    example = "\n".join(code_lines[start:end + 1])
+    assert not re.search(r"^\s*\.\.\.\s*$", example, re.MULTILINE)                # no gaps left to fill
+    copied = example.replace("stream_core", "timing_recovery")
+    rtl = {"entity_name": "timing_recovery", "code": "entity timing_recovery is end;"}
+    assert _static_checks(TIMING_RECOVERY_SPEC, rtl, {"entity_name": "timing_recovery_tb", "code": copied}) == []
+    for heading in ("WITH AN m_axis_tready PORT", "WITHOUT AN s_axis_tready PORT"):
+        assert heading in rules                                                  # the hint's pointers lead somewhere
+    assert "the COMPLETE STREAMING TESTBENCH under STREAMING DESIGNS instead" in rules   # the counter pattern says so
+
+
+def test_the_rules_tell_closed_loop_designs_to_compare_with_a_tolerance():
+    """timing_recovery, 2026-11-05 (run 3106ab33): the golden model runs the
+    Gardner/NCO/Farrow loop in exact double arithmetic, the RTL rounds, beat 1
+    differed by one step (I=-46/Q=-47 vs -47/-46) and the loop drifted from
+    there; 207 then 181 bit-exact mismatches, the RTL blamed three times. The
+    rules now say such designs compare each field with a tolerance."""
+    from pathlib import Path
+    rules = (Path(__file__).resolve().parents[1] / "skills" / "TESTBENCH" / "vhdl_2008_testbench_rules.md").read_text(encoding="utf-8")
+    section = rules.split("CLOSED-LOOP DESIGNS: COMPARE WITH A TOLERANCE", 1)[1].split("COMPLETE STREAMING TESTBENCH.", 1)[0]
+    assert "TOL_SYM" in section and "TOL_MU" in section and "abs(got_i - exp_i)" in section
+    assert "4096" in section                                   # per field, never the packed word
+    assert "2 %" in section                                    # the beat count may differ by a few
+    assert "TED, NCO, loop filter" in section                  # how the writer recognises such a design
+    assert "TOL_SYM / TOL_MU" in rules.split("CHECK YOURSELF BEFORE ANSWERING", 1)[1]   # and the checklist repeats it

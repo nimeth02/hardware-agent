@@ -110,6 +110,8 @@
         <div class="errors-head">
           <strong>Errors for the FPGA engineer</strong>
           <span id="agent-errors-summary" class="status"></span>
+          <button type="button" id="agent-errors-pdf" class="example-btn pdf-btn" disabled title="Open a print view of this report and save it as a PDF">Download as PDF</button>
+          <span id="agent-errors-pdf-status" class="status error"></span>
         </div>
         <div id="agent-errors-body"></div>
         <div class="errors-ask">
@@ -141,6 +143,7 @@
         </div>
         <span class="status">Click a row to see what the tool or LLM did, in full.</span>
       </div>
+      <div id="agent-events-legend" class="status evt-legend hidden"><span class="evt-legend-swatch"></span>yellow = test vector agent steps (each worker has its own colour)<span class="evt-legend-swatch evt-legend-inner"></span>orange = only the AI + MATLAB loop inside the test vector agent's generate_vectors step (its model / tools steps, LLM calls and MATLAB tool calls), folded under one group row "generate_vectors → test vector generator (N nested events)"; click it to open the indented rows. The test vector agent's other steps (decide, load_skills, validate_vectors, finalize_vectors) and every other worker's rows are shown plain.</div>
       <table class="events-table">
         <thead><tr><th>#</th><th>Event</th><th>Detail</th><th>Status</th><th>Duration</th></tr></thead>
         <tbody id="agent-events"></tbody>
@@ -207,7 +210,7 @@
         <button id="agent-runs-refresh">Refresh</button>
       </div>
       <table>
-        <thead><tr><th>Started</th><th>Agent</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
+        <thead><tr><th>Started</th><th>Agent</th><th>Requirement</th><th>Status</th><th>Duration</th><th>Error / why it stopped</th></tr></thead>
         <tbody id="agent-runs"></tbody>
       </table>
     </div>
@@ -245,6 +248,7 @@
   </section>
 </main>
 
+<script src="vendor/html2pdf.bundle.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

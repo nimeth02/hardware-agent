@@ -49,6 +49,7 @@ class TestbenchAgentState(TypedDict, total=False):
     requirement_id: str | None    # the orchestrator's run this call belongs to (None when called on its own)
     attempt: int                  # which call this is from the orchestrator for that requirement: 1 = first
     attempt_history: list[dict]   # how the earlier calls went, oldest first: {attempt, status, error, issues, downstream?}
+    previous_testbench: dict | None  # the testbench the previous call delivered (revised on a retry, not rewritten)
 
     # --- working data ---
     skills: dict[str, str]        # skill file name -> content, injected into the generator prompt
@@ -70,13 +71,14 @@ class TestbenchAgentState(TypedDict, total=False):
 
 
 def initial_state(spec: dict, rtl: dict, requirement_id: str | None = None, attempt: int = 1,
-                  attempt_history: list[dict] | None = None) -> TestbenchAgentState:
+                  attempt_history: list[dict] | None = None, previous_testbench: dict | None = None) -> TestbenchAgentState:
     return {
         "spec": spec,
         "rtl": rtl,
         "requirement_id": requirement_id,
         "attempt": attempt,
         "attempt_history": attempt_history or [],
+        "previous_testbench": previous_testbench,
         "skills": {},
         "skills_loaded": False,
         "testbench": None,

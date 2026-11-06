@@ -61,11 +61,13 @@ def make_tools() -> list:
     def generate_testbench(runtime: ToolRuntime) -> Command:
         """The spec + RTL -> lint-clean testbench that replays test_vectors_in.csv /
         test_vectors_out.csv during simulation. The testbench agent is told which run
-        this is, whether it is its 1st, 2nd, ... call for it, and how its earlier calls went."""
+        this is, whether it is its 1st, 2nd, ... call for it, how its earlier calls went,
+        and is handed the testbench it delivered last time so a retry revises it
+        instead of starting over."""
         s = runtime.state
         return run_stage(runtime, Stage.GENERATE_TESTBENCH, run_testbench_generation, s["spec"], s["rtl"],
                          s["requirement_id"], attempt_of(s, Stage.GENERATE_TESTBENCH),
-                         attempt_history_of(s, Stage.GENERATE_TESTBENCH), part="testbench")
+                         attempt_history_of(s, Stage.GENERATE_TESTBENCH), s.get("testbench"), part="testbench")
 
     @tool
     def generate_test_vectors(runtime: ToolRuntime) -> Command:

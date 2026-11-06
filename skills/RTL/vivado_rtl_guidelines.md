@@ -42,7 +42,9 @@ do so that Vivado step succeeds.
   logic and speed. Only use an asynchronous reset if the spec says so.
 - Reset only what must be reset: the valid bits and the state. Do NOT reset
   data registers (products, sums, results); they are overwritten by the next
-  valid input. Fewer resets = faster and smaller.
+  valid input. Fewer resets = faster and smaller. The loop values of `p_loop`
+  and the history chain of a tracking loop (x0_s2 .. x5_s2) ARE state: reset
+  them, in their own processes (pipeline_stage_map.md, LOOP VALUES).
 - Write the reset first, then the enable:
       if rst = '1' then ... elsif en = '1' then ... end if;
 - Put reset-free data registers in their OWN clocked process, separate from
@@ -109,6 +111,8 @@ do so that Vivado step succeeds.
 - A shift register / delay line (`d(i) <= d(i-1)`) without reset and
   without enable on its middle stages becomes small SRL logic; a reset on a
   middle stage breaks that. Put the reset only on the first or last stage.
+  Exception: the 4-6 register history chain of a tracking loop is state, not
+  data: reset every register of it (pipeline_stage_map.md, LOOP VALUES).
 - Do not use the memory's address register for anything else (no feedback
   from the address register into an adder that also feeds the RAM).
 

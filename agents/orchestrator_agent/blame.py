@@ -8,7 +8,9 @@
 #   2. We look up which stage made that artifact (BLAMED_STAGE in state.py).
 #   3. We add a "downstream" note to that stage's latest attempt in
 #      attempt_history: which stage failed, its verdict, failures, summary
-#      and suggested fix.
+#      and suggested fix, plus the evidence behind them (the decoded failing
+#      rows and the first error lines of the log) so the agent can check
+#      the analyst's reading rather than take it on trust.
 #   4. The next time the orchestrator calls that stage, steps.run_stage hands
 #      the attempt_history over, so the agent sees why its last result was
 #      rejected even though its own checks had passed.
@@ -44,6 +46,12 @@ SECOND_OPINION_CHECK = {
                         "spec exactly",
 }
 
+# how much of the evidence travels with the note (the analyst already keeps
+# at most MAX_FAILING_ROWS beats and LOG_EXCERPT_CHARS of log; these are a
+# second cap so a note can never grow past them)
+MAX_EVIDENCE_ROWS = 8
+MAX_EVIDENCE_CHARS = 4000
+
 
 def blamed_stage(analysis: dict | None) -> Stage | None:
     """Which stage does this analysis blame?
@@ -62,11 +70,25 @@ def downstream_note(by: Stage, analysis: dict) -> dict:
     parts of its analysis the blamed agent needs: verdict, failures (the exact
     mismatches), summary and suggested_fix, plus "fixed_rule" when a code rule
     (not the LLM) read the mismatches, so that reading reaches the agent
-    word for word even if the LLM's summary softened it."""
+    word for word even if the LLM's summary softened it, and "python_check"
+    (the analyst's own decode-and-recompute script with what it printed)
+    when one was run: the blamed agent sees the arithmetic, not a claim.
+    The evidence the analyst read travels too: "failing_beats" (per failing
+    output beat: the input row the design received, the expected row and the
+    log line with the value it produced) and "log_excerpt" (the first error
+    lines of the simulation or compiler log)."""
     note = {"stage": by.value, "verdict": analysis.get("verdict"), "failures": analysis.get("failures"),
             "summary": analysis.get("summary"), "suggested_fix": analysis.get("suggested_fix")}
     if analysis.get("fixed_rule"):
         note["fixed_rule"] = analysis["fixed_rule"]
+    check = analysis.get("python_check")
+    if isinstance(check, dict) and check.get("status") == "ok":
+        note["python_check"] = {"code": str(check.get("code") or "")[:3000], "stdout": str(check.get("stdout") or "")[:3000]}
+    beats = analysis.get("failing_beats")
+    if isinstance(beats, list) and beats:
+        note["failing_beats"] = beats[:MAX_EVIDENCE_ROWS]
+    if analysis.get("log_excerpt"):
+        note["log_excerpt"] = str(analysis["log_excerpt"])[:MAX_EVIDENCE_CHARS]
     return note
 
 

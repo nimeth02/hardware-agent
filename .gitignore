@@ -11,6 +11,8 @@ venv/
 # ── Live SQLite stores (held open by the dev server) ──────────────────
 observability/*.db
 observability/*.db-journal
+# a stray copy created when a tool is started from the repo root
+traces.db
 checkpoints/
 
 # ── Agent outputs ─────────────────────────────────────────────────────

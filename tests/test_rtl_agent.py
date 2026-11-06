@@ -5,9 +5,11 @@ are real."""
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage
 
 from agents.rtl_agent.rtl_agent import RTLAgent
 from agents.rtl_agent.rtl_decider import Decision, RTLDecider
@@ -274,11 +276,20 @@ def test_invalid_planner_output_falls_back_safely():
     assert ok.action is Action.LINT_RTL and ok.reason == "r"
 
 
-def test_invalid_llm_rtl_output_is_kept_as_code():
-    gen = RTLGenerator(llm=FakeListChatModel(responses=["here is some vhdl, not json"]))
-    rtl = gen.generate(SPEC)
-    assert rtl["code"].startswith("here is")
-    assert "did not return valid JSON" in rtl["notes"][0]
+def test_a_reply_that_is_not_json_or_was_cut_off_has_no_code_and_says_why():
+    """timing_recovery, 2026-11-02: a looping 99k-token reply was cut off mid-JSON,
+    compiled as if it were RTL, and reported as markdown fences / no entity."""
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from agents.rtl_agent.rtl_linter import _static_checks
+    rtl = RTLGenerator(llm=FakeListChatModel(responses=["here is some vhdl, not json"])).generate(SPEC)
+    assert rtl["code"] == "" and "not valid JSON" in rtl["notes"][0]
+    cut = AIMessage(content='```json\n{"entity_name": "counter4", "code": "entity counter4 is',
+                    response_metadata={"finish_reason": "length"})
+    rtl = RTLGenerator(llm=FakeMessagesListChatModel(responses=[cut])).generate(SPEC)
+    assert rtl["code"] == "" and "cut off" in rtl["notes"][0]
+    found = _static_checks(SPEC, rtl)
+    assert [i["code"] for i in found] == ["empty_code"] and "cut off" in found[0]["detail"]
     assert parse_rtl_response(SPEC, '{"entity_name": "counter4", "code": "x"}')["code"] == "x"
 
 
@@ -290,6 +301,22 @@ def test_comparing_with_an_others_aggregate_is_caught_before_xelab_would_refuse_
     assert "line 1" in found[0]["detail"] and "xelab" in found[0]["detail"]
     ok = "count_reg <= (others => '0');\nv := (others => '1');\nif count_reg = 0 then\nif v = \"0000\" then"
     assert _forbidden_constructs(ok, "93") == [] and _forbidden_constructs(ok, "2008") == []
+
+
+def test_vhdl_2008_shift_operators_are_caught_before_xvhdl_in_93_mode():
+    """timing_recovery, 2026-11-02 fix round 3: `to_signed(1, 16) sra 7` and
+    `v2_i sra 1` cost a whole compile round ("found '0' definitions of operator
+    sra"); the rulebook already said to use shift_right."""
+    from agents.rtl_agent.rtl_linter import _forbidden_constructs
+    bad = ("constant K1 : signed(15 downto 0) := to_signed(1, 16) sra 7;\n"
+           "v2_i := v2_i SLL 1;\n"
+           "acc := acc ror 2;  -- `x sra 1` inside a comment is fine")
+    found = _forbidden_constructs(bad, "93")
+    assert [i["code"] for i in found] == ["forbidden_construct"] * 3
+    assert "line 1" in found[0]["detail"] and "sra" in found[0]["detail"] and "shift_right" in found[0]["detail"]
+    assert "shift_left" in found[1]["detail"] and "rotate_right" in found[2]["detail"]
+    ok = "v2_i := shift_right(v2_i, 1);\nsignal sll_count : unsigned(3 downto 0);\nk1 := k1_sra;"
+    assert _forbidden_constructs(ok, "93") == [] and _forbidden_constructs(bad, "2008") == []
 
 
 def test_agent_only_has_restricted_actions():
@@ -406,6 +433,60 @@ def test_linter_catches_unbalanced_parentheses_per_statement():
     assert len(found) == 1 and "line 1" in found[0]["detail"] and "entity counter_4bit_up is" in found[0]["detail"]
 
 
+def test_linter_names_the_if_whose_end_if_is_missing_before_the_compiler_blames_the_label():
+    """timing_recovery 15:11 (2026-11-02): one `end if;` missing after an if/elsif
+    in p_nco; xvhdl said 'syntax error near process' / 'mismatch on label p_nco',
+    the model hunted for a label problem and returned the same file nine times."""
+    from agents.rtl_agent.rtl_linter import _block_balance_issues
+    nco = ("p_nco : process(aclk)\n"
+           "  variable mu_v : signed(16 downto 0);\n"
+           "begin\n"
+           "  if rising_edge(aclk) then\n"
+           "    if aresetn = '0' then\n"
+           "      eta_s1 <= (others => '0');\n"
+           "    else\n"
+           "      if eta_next_v < 0 then\n"
+           "        mu_v := shift_left(eta_s1, 2);\n"
+           "        if mu_v < 0 then mu_v := (others => '0');\n"
+           "        elsif mu_v > to_signed(65536, 17) then mu_v := to_signed(65536, 17);\n"
+           "        eta_next_v := eta_next_v + to_signed(65536, 17);  -- +1\n"
+           "      end if;\n"
+           "      eta_s1 <= eta_next_v;\n"
+           "    end if;\n"
+           "  end if;\n"
+           "end process p_nco;\n")
+    found = _block_balance_issues(nco)
+    assert [i["code"] for i in found] == ["unclosed_block"]
+    d = found[0]["detail"]
+    assert "p_nco" in d and "4 `if`" in d and "closes 3" in d and "line 10" in d and "if mu_v < 0" in d
+    assert "syntax error near process" in d
+    fixed = nco.replace("        eta_next_v := eta_next_v", "        end if;\n        eta_next_v := eta_next_v")
+    assert _block_balance_issues(fixed) == []
+    # one `end if;` too many (2026-10-30 the model deleted an end if to obey a wrong message): the surplus one is named
+    surplus = fixed.replace("      eta_s1 <= eta_next_v;\n", "      eta_s1 <= eta_next_v;\n      end if;\n")
+    found = _block_balance_issues(surplus)
+    assert len(found) == 1 and "too many" in found[0]["detail"] and "line 16" in found[0]["detail"]
+    # case and loop count the same way; elsif/else/when never count; `end if` inside a string is prose
+    ok = ("process(clk) begin if rising_edge(clk) then case st is when A => for i in 0 to 3 loop x(i) <= '0'; end loop;\n"
+          "when others => report \"end if\"; end case; end if; end process;")
+    assert _block_balance_issues(ok) == []
+    assert "`loop`" in _block_balance_issues(ok.replace(" end loop;", ""))[0]["detail"]
+
+
+def test_valid_chain_registers_with_odd_names_are_not_mistaken_for_the_output_flag():
+    """timing_recovery 15:11 (2026-11-02): `valid_s3_f <= valid_s2;` was read as the
+    output flag taken from stage 2, so an eight-deep valid chain was reported
+    as two and the model could not act on the finding."""
+    from agents.rtl_agent.rtl_linter import _valid_data_length_issues
+    clocked = "process(clk) begin if rising_edge(clk) then\n{}\nend if; end process;\n"   # one statement per line, as in real code
+    chain = ("valid_s1 <= in_valid;\na_s1 <= d;\nvalid_s2 <= valid_s1;\na_s2 <= a_s1;\n"
+             "valid_s3_f <= valid_s2;\na_s3 <= a_s2;\nvalid_s4 <= valid_s3_f;\na_s4 <= a_s3;")
+    assert not _valid_data_length_issues(clocked.format(chain) + "m_axis_tvalid <= valid_s4;")
+    short = _valid_data_length_issues(clocked.format(chain + "\na_s5 <= a_s4;") + "m_axis_tvalid <= valid_s4;")
+    assert [i["code"] for i in short] == ["valid_data_length_mismatch"] and "5 registers" in short[0]["detail"]
+    assert "valid flag through 4" in short[0]["detail"]                  # counted to valid_s4, not stopped at valid_s3_f
+
+
 def test_compiler_follow_on_errors_are_hidden_so_the_root_causes_stand_out():
     from agents.lint_utils import compiler_errors
     src = "\n".join(f"line{n}" for n in range(1, 340))
@@ -506,6 +587,621 @@ def test_linter_counts_the_output_register_as_a_stage_the_valid_chain_must_cover
     assert not _valid_data_length_issues(clocked.format("a_s1 <= d; a_s2 <= a_s1; q_reg <= a_s2; m_axis_tvalid <= v;"))
 
 
+# timing_recovery 17:58 (2026-11-02) in small: the output reads stage 3 through an
+# output register, stages 4-5 compute the loop value fed back into stage 1
+LOOP_AFTER_OUTPUT = """
+entity t is port (aclk : in std_logic; s_axis_tdata : in std_logic_vector(11 downto 0); s_axis_tvalid : in std_logic;
+                  m_axis_tdata : out std_logic_vector(11 downto 0); m_axis_tvalid : out std_logic); end;
+architecture rtl of t is
+  signal valid_pipe : std_logic_vector(2 downto 0) := (others => '0');
+  signal m_axis_tdata_reg : std_logic_vector(11 downto 0);
+begin
+  advance <= (not valid_pipe(2));
+  m_axis_tvalid_i <= valid_pipe(2);
+  m_axis_tdata <= m_axis_tdata_reg;
+  p_valid : process(aclk) begin if rising_edge(aclk) then
+    valid_pipe(0) <= s_axis_tvalid;
+    valid_pipe(1) <= valid_pipe(0);
+    valid_pipe(2) <= valid_pipe(1);
+  end if; end process;
+  p_s1 : process(aclk) begin if rising_edge(aclk) then
+    i_s1 <= signed(s_axis_tdata);
+    mu_s1 <= mu_s5;
+  end if; end process;
+  p_s2 : process(aclk) begin if rising_edge(aclk) then
+    x_s2 <= i_s1;
+    mu_s2 <= mu_s1;
+  end if; end process;
+  p_s3 : process(aclk) begin if rising_edge(aclk) then
+    y_s3 <= x_s2 + mu_s2;
+    mu_s3 <= mu_s2;
+  end if; end process;
+  p_s4 : process(aclk) begin if rising_edge(aclk) then
+    e_s4 <= y_s3 - mu_s3;
+  end if; end process;
+  p_s5 : process(aclk) begin if rising_edge(aclk) then
+    mu_s5 <= e_s4;
+  end if; end process;
+  p_out : process(aclk) begin if rising_edge(aclk) then
+    m_axis_tdata_reg <= std_logic_vector(y_s3);
+  end if; end process;
+end architecture;
+"""
+
+
+def test_linter_counts_the_data_path_to_the_output_not_the_loop_rows_after_it():
+    """timing_recovery 17:58 (2026-11-02): the output read _s7 through
+    m_axis_tdata_reg (8 registers) while _s8.._s11 carried loop state back to
+    _s1. The checker said "11 stages", the model obeyed (11 valid bits), the
+    finding went quiet and m_axis_tvalid rose 3 clocks late. Now the count
+    stops at the stage the output reads, and the finding names the lines."""
+    from agents.rtl_agent.rtl_linter import _valid_data_length_issues
+    issues = _valid_data_length_issues(LOOP_AFTER_OUTPUT)
+    assert [i["code"] for i in issues] == ["valid_data_length_mismatch"]
+    d = issues[0]["detail"]
+    assert "4 registers" in d and "_s1.._s3, then `m_axis_tdata_reg`" in d and "11" not in d
+    assert "_s4.._s5 come AFTER the output row and are not counted" in d and "1 clock BEFORE" in d
+    assert "those rows are the old loop ring" in d and "loop_state_ring" in d
+    decl_line = next(n for n, text in enumerate(LOOP_AFTER_OUTPUT.splitlines(), 1) if "signal valid_pipe" in text)
+    assert f"line {decl_line}: `valid_pipe : std_logic_vector(2 downto 0)` -> `(3 downto 0)`" in d
+    assert "`m_axis_tvalid_i <= valid_pipe(2)` -> `valid_pipe(3)`" in d
+    assert "`advance <= (not valid_pipe(2))` -> use valid_pipe(3)" in d
+    assert "in p_valid add `valid_pipe(3) <= valid_pipe(2);`" in d
+    # the model's wrong fix: valid chain sized to the number of rows (5 + the output register)
+    rows = (LOOP_AFTER_OUTPUT.replace("(2 downto 0)", "(5 downto 0)").replace("valid_pipe(2));", "valid_pipe(5));")
+            .replace("m_axis_tvalid_i <= valid_pipe(2);", "m_axis_tvalid_i <= valid_pipe(5);")
+            .replace("    valid_pipe(2) <= valid_pipe(1);\n", "    valid_pipe(2) <= valid_pipe(1);\n    valid_pipe(3) <= valid_pipe(2);\n"
+                     "    valid_pipe(4) <= valid_pipe(3);\n    valid_pipe(5) <= valid_pipe(4);\n"))
+    late = _valid_data_length_issues(rows)
+    assert late and "2 clocks AFTER" in late[0]["detail"] and "exactly 4 bits" in late[0]["detail"]
+    assert "`m_axis_tvalid_i <= valid_pipe(5)` -> `valid_pipe(3)`" in late[0]["detail"]
+    assert "delete the shifts above valid_pipe(3)" in late[0]["detail"]
+    # the right fix: one more bit for the output register, the flag taken from it
+    fixed = (LOOP_AFTER_OUTPUT.replace("(2 downto 0)", "(3 downto 0)").replace("valid_pipe(2));", "valid_pipe(3));")
+             .replace("m_axis_tvalid_i <= valid_pipe(2);", "m_axis_tvalid_i <= valid_pipe(3);")
+             .replace("    valid_pipe(2) <= valid_pipe(1);\n", "    valid_pipe(2) <= valid_pipe(1);\n    valid_pipe(3) <= valid_pipe(2);\n"))
+    assert not _valid_data_length_issues(fixed)
+    # loop rows may keep their own valid bits to gate their updates; the output flag still comes from bit 3
+    gated = fixed.replace("(3 downto 0)", "(5 downto 0)").replace(
+        "    valid_pipe(3) <= valid_pipe(2);\n", "    valid_pipe(3) <= valid_pipe(2);\n    valid_pipe(4) <= valid_pipe(3);\n"
+                                                "    valid_pipe(5) <= valid_pipe(4);\n")
+    assert not _valid_data_length_issues(gated)
+    # the input port is also named tdata: it must not be mistaken for the output
+    assert "s_axis_tdata" not in d
+
+
+# timing_recovery 18:25 (2026-11-02) in small: eta is updated in the last row, but
+# strobe and mu only go round the ring (s1 <- s3, s2 <- s1, s3 <- s2) and are never
+# computed; the output valid flag is the bare last bit although the spec says
+# "output on strobe"
+LOOP_RING = """
+entity t is port (aclk : in std_logic; aresetn : in std_logic; s_axis_tdata : in std_logic_vector(11 downto 0);
+                  s_axis_tvalid : in std_logic; m_axis_tdata : out std_logic_vector(11 downto 0);
+                  m_axis_tvalid : out std_logic); end;
+architecture rtl of t is
+  signal valid_pipe : std_logic_vector(2 downto 0) := (others => '0');
+begin
+  m_axis_tvalid_i <= valid_pipe(2);
+  m_axis_tdata <= std_logic_vector(y_s3);
+  p_valid : process(aclk) begin if rising_edge(aclk) then
+    valid_pipe(0) <= s_axis_tvalid;
+    valid_pipe(1) <= valid_pipe(0);
+    valid_pipe(2) <= valid_pipe(1);
+  end if; end process;
+  p_s1 : process(aclk) begin if rising_edge(aclk) then
+    if aresetn = '0' then
+      eta_s1 <= (others => '0');
+      strobe_s1 <= '0';
+      mu_s1 <= to_unsigned(0, 8);
+    else
+      i_s1 <= signed(s_axis_tdata);
+      eta_s1 <= eta_s3;
+      strobe_s1 <= strobe_s3;
+      mu_s1 <= mu_s3;
+      y_prev_s1 <= y_s3;
+    end if;
+  end if; end process;
+  p_s2 : process(aclk) begin if rising_edge(aclk) then
+    x_s2 <= i_s1;
+    eta_s2 <= eta_s1;
+    strobe_s2 <= strobe_s1;
+    mu_s2 <= mu_s1;
+  end if; end process;
+  p_s3 : process(aclk) begin if rising_edge(aclk) then
+    y_s3 <= x_s2 + mu_s2;
+    eta_s3 <= eta_s2 - to_signed(8192, 16);
+    strobe_s3 <= strobe_s2;
+    mu_s3 <= mu_s2;
+  end if; end process;
+end architecture;
+"""
+
+SPEC_STROBE = {
+    "entity_name": "t",
+    "ports": [{"name": "m_axis_tvalid", "direction": "output"}, {"name": "m_axis_tdata", "direction": "output"}],
+    "behavior": ["On each input sample x[n]: W = 1/N + v; eta_next = eta - W; strobe = (eta_next < 0).",
+                 "If strobe: mu = clamp(eta * N, 0, 1) using eta BEFORE decrement; eta_next = eta_next + 1.",
+                 "Output y_sym and mu on strobe."],
+    "constraints": ["Strobe rate is approximately 1 per 4 clocks."],
+}
+
+
+def test_linter_reports_a_loop_value_that_only_goes_round_the_ring_and_is_never_computed():
+    """timing_recovery 18:25 (2026-11-02): strobe and mu were copied through
+    eleven rows and back to row 1 but never written from anything else, so
+    they kept their reset value; the notes claimed "strobe is generated when
+    eta_next < 0" and the dry run showed 0 on every beat."""
+    from agents.rtl_agent.rtl_linter import _loop_value_never_computed_issues
+    issues = _loop_value_never_computed_issues(SPEC_STROBE, LOOP_RING)
+    assert [i["code"] for i in issues] == ["loop_value_never_computed"] * 2
+    by_name = {re.search(r"`(\w+)` only goes round", i["detail"]).group(1): i["detail"] for i in issues}
+    assert set(by_name) == {"strobe", "mu"}                      # eta is computed, y_prev comes from y_s3
+    strobe_line = next(n for n, t in enumerate(LOOP_RING.splitlines(), 1) if "strobe_s1 <= strobe_s3" in t)
+    assert by_name["strobe"].startswith(f"line {strobe_line}: ")
+    assert "keeps its reset value for the whole run" in by_name["strobe"]
+    assert 'The spec says: "On each input sample x[n]: W = 1/N + v; eta_next = eta - W; strobe = (eta_next < 0)."' \
+        in by_name["strobe"]
+    assert "p_s3 (line" in by_name["strobe"] and "`strobe_s3 <= strobe_s2`" in by_name["strobe"]
+    # the fix points at the one loop process, not at the last row of the ring (2026-11-04)
+    assert "Delete the ring" in by_name["strobe"] and "`p_loop`" in by_name["strobe"]
+    assert "`strobe_s2` / `mu_s2`" in by_name["strobe"]
+    assert "If strobe: mu = clamp(eta * N, 0, 1)" in by_name["mu"]
+    # computed in the last row (from a register, a variable, or a condition): no finding
+    fixed = (LOOP_RING.replace("    strobe_s3 <= strobe_s2;\n",
+                               "    if eta_s2 < 0 then strobe_s3 <= '1'; else strobe_s3 <= '0'; end if;\n")
+             .replace("    mu_s3 <= mu_s2;\n", "    mu_s3 <= resize(unsigned(eta_s2), 8);\n"))
+    assert not _loop_value_never_computed_issues(SPEC_STROBE, fixed)
+    via_variable = LOOP_RING.replace("    strobe_s3 <= strobe_s2;\n", "    strobe_s3 <= strobe_v;\n")
+    assert [i["detail"] for i in _loop_value_never_computed_issues(SPEC_STROBE, via_variable)
+            if "`strobe`" in i["detail"]] == []
+    # an advance/valid guard with `and` in it is still a control guard, not a computation (v73, 2026-11-03)
+    guarded = (LOOP_RING.replace("  p_s3 : process(aclk) begin if rising_edge(aclk) then\n",
+                                 "  p_s3 : process(aclk) begin if rising_edge(aclk) then\n"
+                                 "    if advance = '1' and valid_pipe(1) = '1' then\n")
+               .replace("    mu_s3 <= mu_s2;\n  end if; end process;\n", "    mu_s3 <= mu_s2;\n    end if;\n  end if; end process;\n"))
+    assert len(_loop_value_never_computed_issues(SPEC_STROBE, guarded)) == 2
+    # a value the spec does not mention is still reported, with a different ask
+    spec_without = {**SPEC_STROBE, "behavior": ["Output y on strobe."], "constraints": []}
+    mu = next(i for i in _loop_value_never_computed_issues(spec_without, LOOP_RING) if "`mu`" in i["detail"])
+    assert "The spec does not name it" in mu["detail"]
+    assert not _loop_value_never_computed_issues(SPEC_STROBE, SIX_STAGES)     # no loop: nothing to report
+
+
+# timing_recovery 14:51 and 18:41 (2026-11-03) in small: eta, mu and v are COMPUTED in
+# the last row (from the copy that went down the rows) and copied back into row 1;
+# acc only goes round and is never computed
+RING_COMPUTED = """
+entity t is port (aclk : in std_logic; aresetn : in std_logic; s_axis_tdata : in std_logic_vector(11 downto 0);
+                  s_axis_tvalid : in std_logic; m_axis_tdata : out std_logic_vector(11 downto 0);
+                  m_axis_tvalid : out std_logic); end;
+architecture rtl of t is
+  signal valid_pipe : std_logic_vector(2 downto 0) := (others => '0');
+begin
+  m_axis_tvalid <= valid_pipe(2) and strobe_s3;
+  m_axis_tdata <= std_logic_vector(y_s3);
+  p_valid : process(aclk) begin if rising_edge(aclk) then
+    valid_pipe(0) <= s_axis_tvalid;
+    valid_pipe(1) <= valid_pipe(0);
+    valid_pipe(2) <= valid_pipe(1);
+  end if; end process;
+  p_s1 : process(aclk) begin if rising_edge(aclk) then
+    i_s1 <= signed(s_axis_tdata);
+    eta_s1 <= eta_s3;
+    mu_s1 <= resize(mu_s3, 8);
+    v_s1 <= v_s3;
+    acc_s1 <= acc_s3;
+  end if; end process;
+  p_s2 : process(aclk) begin if rising_edge(aclk) then
+    x0_s2 <= i_s1;
+    x1_s2 <= x0_s2;
+    eta_s2 <= eta_s1;
+    mu_s2 <= mu_s1;
+    v_s2 <= v_s1;
+    acc_s2 <= acc_s1;
+  end if; end process;
+  p_s3 : process(aclk)
+    variable eta_next_v : signed(15 downto 0);
+  begin if rising_edge(aclk) then
+    if aresetn = '0' then
+      eta_s3 <= (others => '0'); v_s3 <= (others => '0'); acc_s3 <= (others => '0');
+      mu_s3 <= (others => '0'); strobe_s3 <= '0';
+    elsif valid_pipe(1) = '1' then
+      y_s3 <= x1_s2 + mu_s2;
+      acc_s3 <= acc_s2;
+      eta_next_v := eta_s2 - to_signed(8192, 16) - v_s2;
+      if eta_next_v < 0 then
+        strobe_s3 <= '1';
+        eta_s3 <= eta_next_v + to_signed(32767, 16);
+        mu_s3 <= resize(eta_s2, 8);
+        v_s3 <= v_s2 + resize(y_s3, 16);
+      else
+        strobe_s3 <= '0';
+        eta_s3 <= eta_next_v;
+        mu_s3 <= mu_s2;
+        v_s3 <= v_s2;
+      end if;
+    end if;
+  end if; end process;
+end architecture;
+"""
+
+
+def test_a_loop_value_computed_down_the_rows_and_copied_back_is_reported_as_one_ring():
+    """timing_recovery 14:51 and 18:41 (2026-11-03): eta was computed in the
+    last row from the copy that had gone down 10 (then 15) rows and copied
+    back into row 1, so the design ran 11 (16) loops side by side, one beat
+    came per 16 clocks instead of per 4, and no checker said a word because
+    the never-computed check skips a ring that is computed."""
+    from agents.rtl_agent.rtl_linter import _loop_state_ring_issues, _loop_value_never_computed_issues
+    issues = _loop_state_ring_issues(RING_COMPUTED)
+    assert [i["code"] for i in issues] == ["loop_state_ring"]
+    d = issues[0]["detail"]
+    lines = {key: next(n for n, t in enumerate(RING_COMPUTED.splitlines(), 1) if key in t)
+             for key in ("eta_s1 <= eta_s3", "mu_s1 <= resize(mu_s3, 8)", "v_s1 <= v_s3")}
+    assert d.startswith(f"line {lines['eta_s1 <= eta_s3']}: `eta_s1 <= eta_s3;` copies `eta` from row 3 back into row 1")
+    assert (f"the same ring carries `mu` (line {lines['mu_s1 <= resize(mu_s3, 8)']}), "
+            f"`v` (line {lines['v_s1 <= v_s3']})") in d
+    assert "`acc`" not in d                                   # never computed: the older check owns it
+    assert "3 different copies of `eta`" in d and "3 samples ago" in d and "3 separate loops" in d
+    # the fix is built by name: eta and v become _r registers, mu stays a carried value
+    assert "every `<name>_s<K>` register of `eta`, `v`" in d and "(`eta_r`, `v_r`)" in d and "`p_loop`" in d
+    assert "`mu` is decided in `p_loop` in the same update as eta and written as `strobe_s2` / `mu_s2`" in d
+    assert "`mu_r`" not in d and "pipeline_stage_map.md, LOOP VALUES" in d and d.endswith(">> eta_s1 <= eta_s3;")
+    assert [re.search(r"`(\w+)` only goes round", i["detail"]).group(1)
+            for i in _loop_value_never_computed_issues(SPEC_STROBE, RING_COMPUTED)] == ["acc"]
+    # the 2026-11-02 ring: eta computed in the last row, strobe and mu copied only -> eta is the ring finding
+    only_eta = _loop_state_ring_issues(LOOP_RING)
+    assert len(only_eta) == 1 and "`eta_s1 <= eta_s3;` copies `eta` from row 3 back into row 1." in only_eta[0]["detail"]
+    assert "`strobe`" not in only_eta[0]["detail"] and "`mu`" not in only_eta[0]["detail"]
+    # the pattern the rules teach (eta_r in p_loop, strobe_s2 / mu_s2 from p_loop): nothing
+    assert not _loop_state_ring_issues(_design_around_the_rules_p_loop())
+    assert not _loop_state_ring_issues(SIX_STAGES)
+
+
+def _rows(*bodies: str, labels=None, concurrent: str = "", decls: str = "") -> str:
+    """One clocked process per body (`p_s1`, `p_s2`, ... or the labels given)
+    inside a minimal design; `decls` go before `begin`, `concurrent` before
+    the processes."""
+    procs = []
+    for n, body in enumerate(bodies, 1):
+        label = labels[n - 1] if labels else f"p_s{n}"
+        inner = "\n".join("    " + l for l in body.strip().splitlines())
+        procs.append(f"  {label} : process(aclk) begin if rising_edge(aclk) then\n{inner}\n  end if; end process;")
+    return ("entity t is port (aclk : in std_logic; din : in std_logic_vector(11 downto 0)); end;\n"
+            "architecture rtl of t is\n" + decls + "begin\n" + concurrent + "\n".join(procs) + "\nend architecture;\n")
+
+
+def test_the_ring_check_follows_the_value_through_any_name_and_stays_quiet_on_plain_pipelines():
+    """2026-11-04 review of the first version: a ring hid behind a second
+    statement on a line, a case alternative, a label, a nested index, a
+    variable, a wire or register with another name, a renamed row or a
+    record field; a delay line numbered the wrong way round inside one
+    process, a two-line `if` compare and a `/* */` comment set off wrong
+    alarms. The value is now followed through the signals themselves."""
+    from agents.rtl_agent.rtl_linter import (
+        _loop_state_ring_issues as ring, _loop_value_never_computed_issues as never, _pipeline_stage_skip_issues,
+    )
+    codes = lambda code: [i["code"] for i in ring(code)]
+    chain = ["eta_s2 <= eta_s1;", "eta_s3 <= eta_s2 - w;"]
+    # the same ring, written every way a model has written it
+    assert codes(_rows("i_s1 <= signed(din); eta_s1 <= eta_s3;", *chain)) == ["loop_state_ring"]       # 2nd statement on a line
+    assert codes(_rows("case mode is\n  when NORMAL => eta_s1 <= eta_s3;\n  when others => eta_s1 <= (others => '0');\n"
+                       "end case;", *chain)) == ["loop_state_ring"]
+    assert codes(_rows("l1: eta_s1 <= eta_s3;", *chain)) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= signed(resize(unsigned(eta_s3), 16));", *chain)) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= eta_s3 when strobe_s3 = '1' else eta_s1;", *chain)) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= eta_s3 - step;", "eta_s2 <= eta_s1;", "eta_s3 <= eta_s2;")) == ["loop_state_ring"]
+    assert codes(_rows("mem_s1(to_integer(k)) <= mem_s3(to_integer(k));", "mem_s2 <= mem_s1;",
+                       "mem_s3(0) <= mem_s2(0) - w;")) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= eta_s3;", "eta_s2 <= eta_s1;",
+                       "eta_next_v := eta_s2 - w;\nif eta_next_v < 0 then strobe_s3 <= '1'; else strobe_s3 <= '0'; end if;\n"
+                       "eta_s3 <= eta_next_v;")) == ["loop_state_ring"]
+    one_process = ("  p_main : process(aclk)\n    variable fb_v : signed(15 downto 0);\n  begin if rising_edge(aclk) then\n"
+                   "    fb_v := eta_s3;\n    eta_s1 <= fb_v;\n    eta_s2 <= eta_s1;\n    eta_s3 <= eta_s2 - w;\n"
+                   "  end if; end process;\n")
+    assert codes(one_process) == ["loop_state_ring"]
+    # ... and through another name: a register, a wire, a renamed row, a record
+    assert codes(_rows("eta_s1 <= eta_fb;", "eta_s2 <= eta_s1;", "eta_s3 <= eta_s2 - w;\neta_fb <= eta_s3;")) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= eta_fb;", *chain, concurrent="  eta_fb <= eta_s3;\n")) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= eta_s3;", "eta_s2 <= eta_s1;", "eta_s3 <= tmp;", concurrent="  tmp <= eta_s2 - w;\n")) == ["loop_state_ring"]
+    assert codes(_rows("eta_s1 <= phase_s3;", "phase_s2 <= eta_s1;", "phase_s3 <= phase_s2 - w;")) == ["loop_state_ring"]
+    assert codes(_rows("pipe_s1.eta <= pipe_s3.eta;", "pipe_s2.eta <= pipe_s1.eta;", "pipe_s3.eta <= pipe_s2.eta - w;")) == ["loop_state_ring"]
+    # a value of a later row fed back under another name is the same fault (the y_prev ring of 14:51)
+    assert codes(_rows("i_s1 <= signed(din);\nyprev_s1 <= y_s3;", "x_s2 <= i_s1 - yprev_s1;", "y_s3 <= x_s2 + 1;")) == ["loop_state_ring"]
+    # a ring re-entering at row 2 names its own rows; an unjoined copy of the same name elsewhere hides nothing
+    re_entry = ring(_rows("i_s1 <= signed(din);", "eta_s2 <= eta_s9;", *[f"eta_s{k} <= eta_s{k - 1};" for k in range(3, 9)],
+                          "eta_s9 <= eta_s8 - w;"))
+    assert len(re_entry) == 1 and "copies `eta` from row 9 back into row 2" in re_entry[0]["detail"]
+    assert "8 different copies of `eta`" in re_entry[0]["detail"]
+    hidden = ring(_rows("eta_s5 <= eta_s7;", "eta_s6 <= signed(din);", "eta_s7 <= eta_s6 + 1;", "eta_s1 <= eta_s3;", *chain,
+                        labels=["p_a", "p_b", "p_c", "p_s1", "p_s2", "p_s3"]))
+    assert len(hidden) == 1 and hidden[0]["detail"].split(":")[1].strip().startswith("`eta_s1 <= eta_s3;`")
+    # a ring nothing computes that the older check cannot see (re-entry at row 2, a copy through resize) is reported here
+    at_row_2 = ring(_rows("i_s1 <= signed(din);", "strobe_s2 <= strobe_s5;", "strobe_s3 <= strobe_s2;", "strobe_s4 <= strobe_s3;",
+                          "strobe_s5 <= strobe_s4;\ny_s5 <= i_s1;"))
+    assert [i["code"] for i in at_row_2] == ["loop_value_never_computed"] and "no line ever computes it" in at_row_2[0]["detail"]
+    assert "`strobe_s2` / `mu_s2`" in at_row_2[0]["detail"]
+    assert codes(_rows("mu_s1 <= resize(mu_s3, 8);", "mu_s2 <= mu_s1;", "mu_s3 <= mu_s2;")) == ["loop_value_never_computed"]
+    # ... while the plain shape stays with the older check, which now sees both copies on one line
+    two_on_a_line = _rows("strobe_s1 <= strobe_s3; mu_s1 <= mu_s3;", "strobe_s2 <= strobe_s1;\nmu_s2 <= mu_s1;",
+                          "strobe_s3 <= strobe_s2;\nmu_s3 <= mu_s2;")
+    assert not ring(two_on_a_line)
+    assert sorted(re.search(r"`(\w+)` only goes round", i["detail"]).group(1)
+                  for i in never(SPEC_STROBE, two_on_a_line)) == ["mu", "strobe"]
+    # quiet on everything that is not a ring
+    assert not codes(_rows("i_s1 <= signed(din);", "x0_s2 <= i_s1;\nx1_s2 <= x0_s2;\nx2_s2 <= x1_s2;", "y_s3 <= x2_s2 + x0_s2;"))
+    assert not codes(_rows("a_s1 <= signed(din);", "a_s2 <= a_s1;", "a_s3 <= a_s2;", "y_s4 <= a_s3 + 1;"))
+    for taps in (_rows("tap_s1 <= tap_s2;", "tap_s2 <= tap_s3;", "tap_s3 <= signed(din);", "y_s4 <= tap_s1 + tap_s3;"),
+                 _rows("tap_s3 <= signed(din);\ntap_s2 <= tap_s3;\ntap_s1 <= tap_s2;\ny_s4 <= tap_s1 + tap_s3;", labels=["p_d"]),
+                 _rows("tap_s3 <= signed(din); tap_s2 <= tap_s3; tap_s1 <= tap_s2;\ny_s4 <= tap_s1 + tap_s3;", labels=["p_d"])):
+        assert not codes(taps)                               # a delay line numbered the wrong way round never comes back
+    assert not codes(_rows("i_s1 <= signed(din);", "eta_s2 <= eta_r;\nx_s2 <= i_s1;", "w_s3 <= eta_s2 + v_r;\ny_s3 <= x_s2;",
+                           "if rst = '1' then\n  eta_r <= (others => '0');\n  v_r <= (others => '0');\n"
+                           "elsif valid_pipe(0) = '1' then\n  eta_r <= eta_r - W;\n  v_r <= v_r + resize(w_s3, 16);\nend if;",
+                           labels=["p_s1", "p_s2", "p_s3", "p_loop"]))                     # rows reading the loop registers
+    assert not codes(_rows("if rst = '1' then\n  state_s1 <= IDLE;\n  cnt_s2 <= (others => '0');\nelse\n  cnt_s2 <= cnt_s2 + 1;\n"
+                           "  if cnt_s2 = 15 then state_s1 <= RUN; end if;\nend if;", labels=["p_fsm"]))
+    assert not codes(_rows("pipe_s1.eta <= signed(din);\npipe_s1.v <= pipe_s1.v;", "mem_s2(3) <= mem_s1(3);\nmem_s2(0) <= signed(din);"))
+    assert not codes(_rows("i_s1 <= signed(din);   -- old ring: eta_s1 <= eta_s11; eta_s2 <= eta_s1;",
+                           "eta_s2 <= eta_r;\nreport \"ring check: eta_s1 <= eta_s11; eta_s11 <= eta_s10 - w\";", "eta_s3 <= eta_s2 - w;"))
+    assert not codes(_rows("i_s1 <= signed(din);\n/* old version:\n   eta_s1 <= eta_s3;\n*/\neta_s1 <= eta_r;", *chain))
+    two_line_if = _rows("i_s1 <= signed(din);\neta_s1 <= eta_r;", "eta_s2 <= eta_s1;",
+                        "if valid_pipe(1) = '1' and\n   eta_s1 <= eta_s3 then\n  flag_s3 <= '1';\nend if;\neta_s3 <= eta_s2 - w;")
+    assert not codes(two_line_if) and not _pipeline_stage_skip_issues(two_line_if)      # a compare, not a write
+    assert not codes(_rows("data_s1 <= din;", "data_s2 <= data_s1;",
+                           "data_s3(7 downto 0) <= data_s1(7 downto 0);\ndata_s3(11 downto 8) <= data_s2(11 downto 8);"))
+    # the stage-skip check reads the second statement on a line too now
+    skip = _pipeline_stage_skip_issues(_rows("a_s1 <= signed(din);", "a_s2 <= a_s1;", "b_s3 <= a_s2; c_s3 <= a_s1;"))
+    assert [i["code"] for i in skip] == ["pipeline_stage_skip"] and "c_s3 is computed from a_s1" in skip[0]["detail"]
+
+
+VALID_CHAIN = ("if rst = '1' then\n  valid_pipe <= (others => '0');\nelsif advance = '1' then\n"
+               "  valid_pipe(0) <= s_axis_tvalid;\n  valid_pipe(1) <= valid_pipe(0);\n  valid_pipe(2) <= valid_pipe(1);\n"
+               "  valid_pipe(3) <= valid_pipe(2);\nend if;")
+
+
+def _loop_design(gate: str, close: str = "", extra: str = "", with_valid: bool = True) -> str:
+    """A 4-row pipeline whose loop process loads `v_r` from row 4 (`e_s4`)
+    under the `gate` given (`if ... then`, closed by `close`); eta_r is
+    updated under valid_pipe(0) and reads v_r, so v_r is a loop register."""
+    sample = "valid_pipe(0) = '1'" if with_valid else "run = '1'"
+    loop = (f"if rst = '1' then\n  eta_r <= (others => '0');\n  v_r <= (others => '0');\nelsif advance = '1' then\n"
+            f"  if {sample} then\n    eta_r <= eta_r - v_r;\n  end if;\n  {gate}\n"
+            f"    v_r <= v_r + resize(e_s4, 16);\n  {close}\nend if;")
+    bodies = [VALID_CHAIN] if with_valid else []
+    bodies += ["i_s1 <= signed(din);", "x_s2 <= i_s1 + resize(eta_r, 12);", "y_s3 <= x_s2 - 1;",
+               "e_s4 <= y_s3 * y_s3;", loop]
+    labels = (["p_valid"] if with_valid else []) + ["p_s1", "p_s2", "p_s3", "p_s4", "p_loop"]
+    return _rows(*bodies, labels=labels, concurrent=extra)
+
+
+def test_a_loop_register_loaded_before_its_row_is_valid_is_reported_with_the_bit_to_wait_for():
+    """timing_recovery 18:41 (2026-11-03): p_s16 updated eta, v and acc from
+    row 15 under no valid bit at all; at the first clocks row 15 was still
+    'U', 13 of 16 loop copies went 'X' and never recovered, one beat came
+    per 16 clocks. 14:51 waited for the right bit but its history chain was
+    not reset: the other half of the same fault."""
+    from agents.rtl_agent.rtl_linter import _history_chain_reset_issues, _state_read_before_valid_issues
+    no_gate = _state_read_before_valid_issues(_loop_design(""))
+    assert [i["code"] for i in no_gate] == ["state_read_before_valid"]
+    d = no_gate[0]["detail"]
+    line = next(n for n, t in enumerate(_loop_design("").splitlines(), 1) if "v_r <= v_r + resize(e_s4, 16);" in t)
+    assert d.startswith(f"line {line}: `v_r <= v_r + resize(e_s4, 16);` in `p_loop` loads the loop register `v_r` "
+                        f"from row 4 (`e_s4`) without any valid gate")
+    assert "if valid_pipe(3) = '1' then v_r <= ...; end if;" in d and "and strobe_s4 = '1'" in d
+    assert "never recovers" in d and d.endswith(">> v_r <= v_r + resize(e_s4, 16);")
+    early = _state_read_before_valid_issues(_loop_design("if valid_pipe(1) = '1' then", "end if;"))
+    assert [i["code"] for i in early] == ["state_read_before_valid"]
+    assert "under valid_pipe(1) only, the bit of row 2" in early[0]["detail"] and "valid_pipe(3)" in early[0]["detail"]
+    # the right bit, with or without the strobe: nothing
+    assert not _state_read_before_valid_issues(_loop_design("if valid_pipe(3) = '1' then", "end if;"))
+    assert not _state_read_before_valid_issues(_loop_design("if valid_pipe(3) = '1' and strobe_s4 = '1' then", "end if;"))
+    # a later bit stores a younger sample's value
+    late = _state_read_before_valid_issues(_loop_design("if valid_pipe(5) = '1' then", "end if;"))
+    assert [i["code"] for i in late] == ["state_read_after_valid"]
+    assert "under valid_pipe(5), the bit of row 6" in late[0]["detail"] and "2 tick(s) younger" in late[0]["detail"]
+    assert "valid_pipe(3)" in late[0]["detail"]
+    # a reset register that only feeds a port (an output register) is not a loop register
+    out_reg = _loop_design("if valid_pipe(3) = '1' then", "end if;",
+                           extra="  m_axis_tdata <= m_axis_tdata_reg;\n  p_o : process(aclk) begin if rising_edge(aclk) then\n"
+                                 "    if rst = '1' then m_axis_tdata_reg <= (others => '0');\n"
+                                 "    elsif advance = '1' then m_axis_tdata_reg <= std_logic_vector(y_s3); end if;\n"
+                                 "  end if; end process;\n")
+    assert not _state_read_before_valid_issues(out_reg)
+    # no valid chain at all: nothing to wait for (the dry run judges that design)
+    assert not _state_read_before_valid_issues(_loop_design("", with_valid=False))
+    # the old shape: the loop row's else branch reads row 2 under no bit -> reported; RING_COMPUTED waits right
+    old = _rows("i_s1 <= signed(din);\nvalid_pipe(0) <= s_axis_tvalid;", "x_s2 <= i_s1;",
+                "if aresetn = '0' then\n  acc_s3 <= (others => '0');\nelse\n  acc_s3 <= acc_s3 + x_s2;\nend if;",
+                "y_s4 <= acc_s3;")
+    assert [i["code"] for i in _state_read_before_valid_issues(old)] == ["state_read_before_valid"]
+    assert "`acc_s3 <= acc_s3 + x_s2;` in `p_s3`" in _state_read_before_valid_issues(old)[0]["detail"]
+    assert not _state_read_before_valid_issues(RING_COMPUTED)
+    # the design the rules teach waits for the right bit everywhere, and its chain is reset
+    assert not _state_read_before_valid_issues(_design_around_the_rules_p_loop())
+    assert not _history_chain_reset_issues(_design_around_the_rules_p_loop())
+    # a history chain without reset: the taps are 'U' for as many samples as the chain is long
+    chain = _rows("i_s1 <= signed(din);", "x0_s2 <= i_s1;\nx1_s2 <= x0_s2;\nx2_s2 <= x1_s2;", "y_s3 <= x2_s2 + x0_s2;")
+    found = _history_chain_reset_issues(chain)
+    assert [i["code"] for i in found] == ["history_chain_not_reset"]
+    chain_line = next(n for n, t in enumerate(chain.splitlines(), 1) if "x1_s2 <= x0_s2;" in t)
+    assert found[0]["detail"].startswith(f"line {chain_line}: the history chain in row 2 (`x0_s2`, `x1_s2`, `x2_s2`) has no reset")
+    assert "`x0_s2`, `x1_s2`, `x2_s2` start undefined" in found[0]["detail"]
+    assert "if rst = '1' then x0_s2 <= (others => '0'); ... elsif advance = '1' and valid_pipe(1) = '1' then" in found[0]["detail"]
+    partly = _rows("i_s1 <= signed(din);",
+                   "if rst = '1' then\n  x1_s2 <= (others => '0');\n  x2_s2 <= (others => '0');\n"
+                   "elsif advance = '1' and valid_pipe(0) = '1' then\n  x0_s2 <= i_s1;\n  x1_s2 <= x0_s2;\n  x2_s2 <= x1_s2;\nend if;",
+                   "y_s3 <= x2_s2 + x0_s2;")
+    assert "`x0_s2` start undefined" in _history_chain_reset_issues(partly)[0]["detail"]      # the head counts too
+    whole = partly.replace("  x1_s2 <= (others => '0');\n", "  x0_s2 <= (others => '0');\n  x1_s2 <= (others => '0');\n")
+    assert not _history_chain_reset_issues(whole)
+    initial = _rows("i_s1 <= signed(din);", "x0_s2 <= i_s1;\nx1_s2 <= x0_s2;\nx2_s2 <= x1_s2;", "y_s3 <= x2_s2 + x0_s2;",
+                    decls="  signal x0_s2, x1_s2, x2_s2 : signed(11 downto 0) := (others => '0');\n")
+    assert not _history_chain_reset_issues(initial)
+    # plain forward copies and the valid chain are not history chains
+    assert not _history_chain_reset_issues(SIX_STAGES) and not _history_chain_reset_issues(_loop_design(""))
+
+
+def _design_around_the_rules_p_loop() -> str:
+    """The p_loop process exactly as skills/RTL/pipeline_stage_map.md shows
+    it, inside the smallest design that has every row it reads: a reset
+    history chain in s2, copy rows s3..s7 standing in for the Farrow
+    interpolator, d from yprev_*_r in s8, and the error rows s9..s10 that
+    carry y_sym and mu along, so the output row is the last row s10."""
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1] / "skills" / "RTL" / "pipeline_stage_map.md").read_text(encoding="utf-8")
+    found = re.search(r"^( *)p_loop : process\(aclk\).*?end process p_loop;", text, re.DOTALL | re.MULTILINE)
+    p_loop = "\n".join("  " + line[len(found.group(1)):] for line in found.group(0).splitlines())
+    lanes = ("ysym_i", "ysym_q", "ymid_i", "ymid_q")
+    decls = "".join(f"  signal strobe_s{k} : std_logic;\n" for k in range(2, 11))
+    decls += "".join(f"  signal mu_s{k} : signed(MU_W-1 downto 0);\n" for k in range(2, 11))
+    decls += "".join(f"  signal {', '.join(f'{n}_s{k}' for n in lanes)} : signed(X_W-1 downto 0);\n" for k in range(3, 9))
+    decls += "".join(f"  signal ysym_i_s{k}, ysym_q_s{k} : signed(X_W-1 downto 0);\n" for k in (9, 10))
+
+    def row(k: int, body: str) -> str:
+        return (f"  p_s{k} : process(aclk)\n  begin\n    if rising_edge(aclk) then\n      if advance = '1' then\n"
+                f"{body}      end if;\n    end if;\n  end process p_s{k};\n")
+
+    carry = lambda k: (f"        strobe_s{k} <= strobe_s{k - 1};\n        mu_s{k} <= mu_s{k - 1};\n"
+                       + ("".join(f"        {n}_s{k} <= {n}_s{k - 1};\n" for n in ("ysym_i", "ysym_q")) if k >= 9 else ""))
+    first = {"ysym_i": "x0_i_s2", "ysym_q": "x0_q_s2", "ymid_i": "x1_i_s2", "ymid_q": "x1_q_s2"}
+    rows = row(3, "".join(f"        {n}_s3 <= {first[n]};\n" for n in lanes) + carry(3))
+    for k in range(4, 9):
+        rows += row(k, "".join(f"        {n}_s{k} <= {n}_s{k - 1};\n" for n in lanes) + carry(k)
+                    + ("        d_i_s8 <= resize(ysym_i_s7, D_W) - resize(yprev_i_r, D_W);\n"
+                       "        d_q_s8 <= resize(ysym_q_s7, D_W) - resize(yprev_q_r, D_W);\n" if k == 8 else ""))
+    rows += row(9, "        pr_i_s9 <= ymid_i_s8 * d_i_s8;\n        pr_q_s9 <= ymid_q_s8 * d_q_s8;\n" + carry(9))
+    rows += row(10, "        e_s10 <= resize(pr_i_s9, E_W) + resize(pr_q_s9, E_W);\n" + carry(10))
+    shifts = "".join(f"        valid_pipe({k}) <= valid_pipe({k - 1});\n" for k in range(1, 10))
+    return f"""library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity t is
+  port (aclk : in std_logic; aresetn : in std_logic;
+        s_axis_tvalid : in std_logic; s_axis_tdata : in std_logic_vector(23 downto 0);
+        m_axis_tvalid : out std_logic; m_axis_tdata : out std_logic_vector(23 downto 0));
+end entity t;
+
+architecture rtl of t is
+  constant X_W     : integer := 12;
+  constant D_W     : integer := X_W + 1;
+  constant PR_W    : integer := X_W + D_W;
+  constant E_W     : integer := PR_W + 1;
+  constant MU_F    : integer := 16;
+  constant MU_W    : integer := MU_F + 2;
+  constant MU_ONE  : integer := 2**MU_F;
+  constant ETA_F   : integer := 30;
+  constant ETA_W   : integer := ETA_F + 2;
+  constant ONE     : signed(ETA_W-1 downto 0) := shift_left(to_signed(1, ETA_W), ETA_F);
+  constant QUARTER : signed(ETA_W-1 downto 0) := shift_left(to_signed(1, ETA_W), ETA_F - 2);
+  signal rst, advance : std_logic;
+  signal valid_pipe : std_logic_vector(9 downto 0) := (others => '0');
+  signal eta_r, acc_r, v_r : signed(ETA_W-1 downto 0);
+  signal yprev_i_r, yprev_q_r : signed(X_W-1 downto 0);
+  signal i_s1, q_s1 : signed(X_W-1 downto 0);
+  signal x0_i_s2, x1_i_s2, x0_q_s2, x1_q_s2 : signed(X_W-1 downto 0);
+{decls}  signal d_i_s8, d_q_s8 : signed(D_W-1 downto 0);
+  signal pr_i_s9, pr_q_s9 : signed(PR_W-1 downto 0);
+  signal e_s10 : signed(E_W-1 downto 0);
+begin
+  rst     <= not aresetn;
+  advance <= '1';
+
+  p_valid : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      if rst = '1' then
+        valid_pipe <= (others => '0');
+      elsif advance = '1' then
+        valid_pipe(0) <= s_axis_tvalid;
+{shifts}      end if;
+    end if;
+  end process p_valid;
+
+{p_loop}
+
+  p_s1 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      if advance = '1' then
+        i_s1 <= signed(s_axis_tdata(23 downto 12));
+        q_s1 <= signed(s_axis_tdata(11 downto 0));
+      end if;
+    end if;
+  end process p_s1;
+
+  p_s2 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      if rst = '1' then
+        x0_i_s2 <= (others => '0');
+        x1_i_s2 <= (others => '0');
+        x0_q_s2 <= (others => '0');
+        x1_q_s2 <= (others => '0');
+      elsif advance = '1' and valid_pipe(0) = '1' then
+        x0_i_s2 <= i_s1;
+        x1_i_s2 <= x0_i_s2;
+        x0_q_s2 <= q_s1;
+        x1_q_s2 <= x0_q_s2;
+      end if;
+    end if;
+  end process p_s2;
+
+{rows}
+  m_axis_tdata  <= std_logic_vector(ysym_i_s10) & std_logic_vector(ysym_q_s10);
+  m_axis_tvalid <= valid_pipe(9) and strobe_s10;
+end architecture rtl;
+"""
+
+
+def test_the_loop_process_the_rules_teach_passes_every_loop_and_stage_check():
+    """2026-11-04: the RTL rules replaced the ring (eta, acc, v, y_prev
+    copied down 11 rows and back into row 1, which runs 11 separate loops)
+    with one process p_loop that updates eta every input sample and writes
+    strobe_s2 / mu_s2. The full timing_recovery design built that way
+    compiled, passed the smoke dry run and locked at +100 and -1000 ppm.
+    This keeps the checker from ever rejecting the pattern the rules teach."""
+    from agents.rtl_agent import rtl_linter as lint
+    code = _design_around_the_rules_p_loop()
+    assert "eta_r <= eta_next;" in code and "strobe_s2 <= '1';" in code        # the rules' p_loop is in it
+    checks = [lint._process_declaration_issues(code), lint._declaration_after_begin_issues(code),
+              lint._unbalanced_parentheses_issues(code), lint._block_balance_issues(code),
+              lint._width_issues(code), lint._literal_width_issues(code), lint._multiple_driver_issues(code),
+              lint._pipeline_stage_skip_issues(code), lint._stage_register_declaration_issues(code),
+              lint._valid_data_length_issues(code), lint._constant_output_valid_issues(SPEC_STROBE, code),
+              lint._loop_value_never_computed_issues(SPEC_STROBE, code), lint._loop_state_ring_issues(code),
+              lint._state_read_before_valid_issues(code), lint._history_chain_reset_issues(code),
+              lint._output_valid_without_strobe_issues(SPEC_STROBE, code)]
+    assert [i for found in checks for i in found] == []
+
+
+def test_linter_requires_the_output_valid_to_carry_the_strobe_when_the_spec_says_output_on_strobe():
+    """timing_recovery 18:32 (2026-11-02): m_axis_tvalid_i <= valid_pipe(10)
+    raised a beat on every input sample; the testbench expected 198 strobe
+    beats, saw ~785, and reported 998 mismatches with every beat "got 0"."""
+    from agents.rtl_agent.rtl_linter import _output_valid_without_strobe_issues, _valid_data_length_issues
+    issues = _output_valid_without_strobe_issues(SPEC_STROBE, LOOP_RING)
+    assert [i["code"] for i in issues] == ["output_valid_without_strobe"]
+    d = issues[0]["detail"]
+    line = next(n for n, t in enumerate(LOOP_RING.splitlines(), 1) if "m_axis_tvalid_i <= valid_pipe(2);" in t)
+    assert d.startswith(f"line {line}: `m_axis_tvalid_i <= valid_pipe(2);` raises an output beat for EVERY input sample")
+    assert '"Output y_sym and mu on strobe."' in d
+    assert "Write `m_axis_tvalid_i <= valid_pipe(2) and strobe_s3;`" in d      # the strobe bit of the output row (s3)
+    gated = LOOP_RING.replace("m_axis_tvalid_i <= valid_pipe(2);", "m_axis_tvalid_i <= valid_pipe(2) and strobe_s3;")
+    assert not _output_valid_without_strobe_issues(SPEC_STROBE, gated)
+    assert not _valid_data_length_issues(gated)                 # the gated flag still counts as bit 2 of 3
+    by_if = LOOP_RING.replace("  m_axis_tvalid_i <= valid_pipe(2);\n",
+                              "  p_o : process(aclk) begin if rising_edge(aclk) then\n"
+                              "    if strobe_s3 = '1' then m_axis_tvalid_i <= valid_pipe(2); else m_axis_tvalid_i <= '0'; end if;\n"
+                              "  end if; end process;\n")
+    assert not _output_valid_without_strobe_issues(SPEC_STROBE, by_if)
+    # a spec with no strobe (one beat out per beat in): the bare bit is right
+    plain = {**SPEC_STROBE, "behavior": ["Output y_sym every sample."], "constraints": []}
+    assert not _output_valid_without_strobe_issues(plain, LOOP_RING)
+    assert not _output_valid_without_strobe_issues(plain, SIX_STAGES)
+
+
 CALC_MMSB = """
   function calc_mmsb(x : signed) return signed is
     variable abs_x : signed(12 downto 0);
@@ -561,6 +1257,164 @@ def test_dry_run_crash_names_the_assignment_behind_an_array_size_mismatch():
     assert "line 119" not in text                                         # the correct shift line is not blamed
 
 
+# timing_recovery 11:10 (2026-11-03) in small: every width is a constant, so the
+# old width check saw nothing; the 16-bit v_s12 is given a 24-bit sum
+CONSTANT_WIDTHS = """
+entity t is
+  generic (ACC_BITS : integer := 24);
+  port (aclk : in std_logic; s_axis_tdata : in std_logic_vector(23 downto 0));
+end;
+architecture rtl of t is
+  constant E_BITS : integer := 24;
+  constant V_BITS : integer := 16;
+  constant P_BITS : integer := 2*E_BITS;
+  signal e_s11 : signed(E_BITS-1 downto 0);
+  signal acc_s11 : signed(ACC_BITS-1 downto 0);
+  signal v_s12 : signed(V_BITS-1 downto 0);
+  signal p : signed(P_BITS-1 downto 0);
+  signal q : signed(E_BITS downto 0);
+  signal unknown : signed(MYSTERY-1 downto 0);
+begin
+  p_s12 : process(aclk) begin if rising_edge(aclk) then
+    v_s12 <= shift_right(e_s11, 7) + acc_s11;
+  end if; end process;
+end architecture;
+"""
+
+
+def test_width_checks_read_widths_given_as_constants_and_generics():
+    """timing_recovery 11:10 (2026-11-03): `signed(V_BITS-1 downto 0)` everywhere,
+    so the static width check never fired and the dry run crashed six rounds
+    in a row with only "16 vs 24 in p_s12"; the model returned the same file."""
+    from agents.rtl_agent.rtl_linter import _assignment_width_issues
+    from agents.rtl_agent.rtl_smoke_check import _width_mismatch_hint
+    from agents.rtl_agent.rtl_widths import declared_widths, expr_width, int_value, scoped_widths
+    w = scoped_widths(CONSTANT_WIDTHS).at(1)
+    assert (w["e_s11"], w["acc_s11"], w["v_s12"], w["p"], w["q"]) == (24, 24, 16, 48, 25)
+    assert "unknown" not in w and w.constants["v_bits"] == 16 and w.types["v_s12"] == "signed(V_BITS-1 downto 0)"
+    assert declared_widths(CONSTANT_WIDTHS)["p"] == 48
+    assert int_value("2**4 - 1", {}) == 15 and int_value("W-1", {"w": 8}) == 7 and int_value("x'length", {}) is None
+    assert expr_width("resize(e_s11, V_BITS)", w) == 16 and expr_width("e_s11(E_BITS-1 downto 8)", w) == 16
+    assert expr_width("e_s11 + V_BITS", w) == 24                     # an integer constant is like an integer literal
+    issues = _assignment_width_issues(CONSTANT_WIDTHS, set())
+    line = next(n for n, t in enumerate(CONSTANT_WIDTHS.splitlines(), 1) if "v_s12 <= shift_right" in t)
+    assert [i["code"] for i in issues] == ["assignment_width"]
+    assert f"line {line}: 'v_s12' is 16 bits but the right-hand side is 24 bits" in issues[0]["detail"]
+    assert "resize(<that>, 16)" in issues[0]["detail"]
+    hint = _width_mismatch_hint("ERROR: Array sizes do not match, left array has 16 elements, right array has 24 elements",
+                                CONSTANT_WIDTHS)
+    assert f"line {line}:" in hint
+
+
+LITERAL_WIDTHS = """
+entity t is
+  port (aclk : in std_logic);
+end;
+architecture rtl of t is
+  constant E_BITS : integer := 16;
+  constant ONE : integer := 2**16;
+  constant W0 : signed(15 downto 0) := to_signed(16384, 16);
+  signal eta_s8 : signed(E_BITS-1 downto 0);
+  signal cnt : unsigned(7 downto 0);
+  signal word : std_logic_vector(7 downto 0);
+  signal flag : std_logic;
+begin
+  p_s8 : process(aclk)
+    variable eta_n : signed(15 downto 0);
+    variable mu_raw : signed(15 downto 0);
+  begin
+    if rising_edge(aclk) then
+      eta_n := eta_s8 - W0;
+      mu_raw := shift_left(eta_s8, 2);
+      if mu_raw > 65535 then
+        flag <= '1';
+      elsif mu_raw < -32768 then
+        flag <= '0';
+      end if;
+      if cnt >= 256 then
+        cnt <= to_unsigned(255, 8);
+      elsif cnt <= 300 and word = "00000000" then
+        cnt <= (others => '0');
+      end if;
+      if eta_n < 0 then
+        eta_s8 <= eta_n + to_signed(65536, 16);
+      else
+        eta_s8 <= eta_n + to_signed(ONE, E_BITS);
+      end if;
+    end if;
+  end process p_s8;
+end architecture;
+"""
+
+
+def test_a_number_that_does_not_fit_its_width_is_reported_with_the_register_to_widen():
+    """timing_recovery 12:30 (2026-11-03): `eta_s8 <= eta_n + to_signed(65536, 16)`
+    was meant to add 1.0 to the NCO phase; numeric_std kept the low 16 bits
+    (0) and only warned, the phase never wrapped back, the strobe count was
+    wrong for four attempts and the testbench was blamed. `if mu_raw > 65535`
+    in the same file could never be true."""
+    from agents.rtl_agent.rtl_linter import _literal_width_issues
+    issues = _literal_width_issues(LITERAL_WIDTHS)
+    assert [i["code"] for i in issues] == ["literal_width"] * 5
+    by_line = {int(re.match(r"line (\d+):", i["detail"]).group(1)): i["detail"] for i in issues}
+    lines = {n: t.strip() for n, t in enumerate(LITERAL_WIDTHS.splitlines(), 1)}
+
+    def detail(key):
+        n = next(n for n, t in lines.items() if key in t)
+        assert n in by_line, (key, n, sorted(by_line))
+        return by_line[n]
+
+    sixty = detail("to_signed(65536, 16)")
+    assert "65536 does not fit in 16 signed bits (range -32768..32767)" in sixty
+    assert "silently becomes 0" in sixty and "needs at least 18 signed bits" in sixty
+    assert "widen `eta_s8` (`signed(E_BITS-1 downto 0)`)" in sixty and "`signed(17 downto 0)`" in sixty
+    assert "1.0 = 2**14 = 16384" in sixty and "Do not just change the number" in sixty
+    assert "`to_signed(ONE, E_BITS)`: 65536 does not fit in 16 signed bits" in detail("to_signed(ONE, E_BITS)")
+
+    gt = detail("mu_raw > 65535")
+    assert "`mu_raw > 65535` is never true" in gt and "16 signed bits (range -32768..32767)" in gt and "dead" in gt
+    ge = detail("cnt >= 256")
+    assert "`cnt >= 256` is never true" in ge and "8 unsigned bits (range 0..255)" in ge
+    le = detail("cnt <= 300")
+    assert "`cnt <= 300` is always true" in le and "taken every time" in le
+    # in range, a std_logic_vector, a signal on the right: no finding
+    assert not any("-32768" in i["detail"] and "mu_raw <" in i["detail"] for i in issues)
+    assert _literal_width_issues("signal a : signed(7 downto 0);\nsignal b : unsigned(3 downto 0);\n"
+                                 "if a > b then a <= to_signed(-128, 8); end if;\n"
+                                 "if b = 15 then b <= to_unsigned(15, 4); end if;\n"
+                                 "if a'length > 65535 then b <= to_unsigned(x, 4); end if;") == []
+
+
+def test_width_fix_follows_the_value_to_the_register_it_is_stored_in():
+    """timing_recovery 11:17 (2026-11-03): the check told `v_next` (17 bits) to
+    resize to 17, but v_next then went into the 16-bit v_s12 and the next
+    round crashed on that line. Now the advice names the final register's
+    width, and a plain name that is too wide gets the one-line fix."""
+    from agents.rtl_agent.rtl_linter import _assignment_width_issues
+    code = (CONSTANT_WIDTHS
+            .replace("p_s12 : process(aclk) begin",
+                     "p_s12 : process(aclk)\n    variable v_sum : signed(24 downto 0);\n"
+                     "    variable v_next : signed(16 downto 0);\n  begin")
+            .replace("    v_s12 <= shift_right(e_s11, 7) + acc_s11;\n",
+                     "    v_sum := resize(shift_right(e_s11, 7), 25) + resize(acc_s11, 25);\n"
+                     "    v_next := v_sum;\n"
+                     "    v_s12 <= v_next;\n"))
+    issues = _assignment_width_issues(code, set())
+    assert [i["code"] for i in issues] == ["assignment_width"] * 2
+    first, second = (i["detail"] for i in issues)
+    assert "'v_next' is 17 bits but the right-hand side is 25 bits" in first
+    assert "write `v_next := resize(v_sum, 16);` on this line" in first
+    assert "16, not 17, because `v_next` is stored in `v_s12` (16 bits, line" in first
+    assert "declare `v_next` as `signed(V_BITS-1 downto 0)` like `v_s12`" in first
+    assert "'v_s12' is 16 bits but the right-hand side is 17 bits" in second
+    assert "write `v_s12 <= resize(v_next, 16);` on this line" in second
+    assert "declare it as `signed(V_BITS-1 downto 0)` instead" in second and "`v_next := v_sum` -> resize to 16 there" in second
+    # the helper declared with the register's width name, as the recipe says: nothing to report
+    fixed = code.replace("variable v_next : signed(16 downto 0)", "variable v_next : signed(V_BITS-1 downto 0)") \
+                .replace("v_next := v_sum;", "v_next := resize(v_sum, V_BITS);")
+    assert not _assignment_width_issues(fixed, set())
+
+
 def test_width_arithmetic_of_simple_expressions():
     from agents.rtl_agent.rtl_widths import expr_width
     w = {"a": 12, "b": 8, "p": 20}
@@ -590,3 +1444,393 @@ def test_linter_rejects_an_absolute_value_written_as_a_bare_negation():
     assert not _abs_without_sign_check_issues("abs_i <= unsigned(-x) when x < 0 else unsigned(x);")
     # a binary minus is a subtraction, not a negation
     assert not _abs_without_sign_check_issues("abs_diff <= to_signed(2048, 16) - resize(x, 16);")
+
+
+# ── timing_recovery, 2026-10-30 12:59: seven fix rounds for one design ──────
+
+def test_a_label_after_end_process_is_not_a_missing_variable_declaration():
+    """`p_strobe : process(aclk)` after `end process p_main;` was reported as
+    a declaration without `variable` in all seven rounds (the word "process"
+    in `end process` opened a fake declarative region), and the model deleted
+    an `end if;` trying to obey."""
+    from agents.rtl_agent.rtl_linter import _process_declaration_issues
+    code = ("p_main : process(aclk)\n  variable w : signed(15 downto 0);\nbegin\n  w := eta;\nend process p_main;\n"
+            "p_strobe : process(aclk)\nbegin\n  strobe <= '1';\nend process p_strobe;\n"
+            "u_sub : entity work.sub port map (a => b);\n"
+            "g_gen : for i in 0 to 3 generate\n  x(i) <= y(i);\nend generate;\n"
+            "p_last : process(aclk)\n  temp : signed(3 downto 0);\nbegin\n  temp := x;\nend process;\n")
+    found = _process_declaration_issues(code)
+    assert [i["code"] for i in found] == ["missing_variable_keyword"]        # only the real one (line 15)
+    assert "line 15" in found[0]["detail"] and "'temp'" in found[0]["detail"]
+
+
+def test_multiplier_width_fix_is_one_exact_declaration_and_one_exact_line():
+    """`p1 <= resize(v2, 22) * resize(signed('0' & mu_q8), 22);` into a 22-bit
+    p1 was told "make p1 44 bits"; the next round, the resize() gone as the
+    same message asked, "make p1 23 bits". One message now, at the natural
+    widths."""
+    from agents.rtl_agent.rtl_linter import _multiplier_width_issues
+    code = ("signal v2 : signed(13 downto 0);\nsignal mu_q8 : unsigned(7 downto 0);\nsignal p1 : signed(21 downto 0);\n"
+            "p1 <= resize(v2, 22) * resize(signed('0' & mu_q8), 22);\n")
+    [issue] = _multiplier_width_issues(code)
+    assert issue["detail"].startswith("line 4: `p1 <= resize(v2, 22) * resize(signed('0' & mu_q8), 22);` "
+                                      "puts a 44-bit product into the 22-bit 'p1'")
+    assert "declare `signal p1 : signed(22 downto 0);`" in issue["detail"]
+    assert "write `p1 <= v2 * signed('0' & mu_q8);` (14 + 9 = 23 bits" in issue["detail"]
+    # p1 already the natural width: only the resize() wrappers are wrong
+    [issue] = _multiplier_width_issues(code.replace("21 downto", "22 downto"))
+    assert "'p1' is already 23 bits: write `p1 <= v2 * signed('0' & mu_q8);`" in issue["detail"]
+    # the natural form, and the wrapped form into a really 44-bit target, are both accepted
+    natural = code.replace("21 downto", "22 downto").replace(
+        "resize(v2, 22) * resize(signed('0' & mu_q8), 22)", "v2 * signed('0' & mu_q8)")
+    assert not _multiplier_width_issues(natural)
+    assert not _multiplier_width_issues(code.replace("21 downto", "43 downto"))
+
+
+TYPED_PRODUCT = (
+    "constant MU_F : integer := 16;\nconstant MU_W : integer := MU_F+2;\n"
+    "signal v2i_s4 : signed(13 downto 0);\nsignal mu_s4 : signed(MU_W-1 downto 0);\n"
+    "signal p2i_s5 : signed(29 downto 0);\n"
+    "p_s5 : process(aclk)\n  variable ymid_i_s7 : signed(12 downto 0);\n  variable d_i_s7 : signed(13 downto 0);\n"
+    "  variable p1 : signed(25 downto 0);\nbegin\n"
+    "  p2i_s5 <= v2i_s4 * mu_s4;\n  p1 := ymid_i_s7 * d_i_s7;\nend process;\n")
+
+
+def test_multiplier_width_requires_the_product_declared_from_width_names():
+    """2026-11-05, every run: the first draft typed `p2i_s5 : signed(29 downto 0)`
+    for a 14 x 18 product (mu counted at 16 bits) and `p1 : signed(25 downto 0)`
+    for 13 x 14; fix round 3 typed 31 and 26, and the same slip was back the
+    next run. For `p <= a * b` with two declared names the fix now names the
+    widths (`signed(A_W+B_W-1 downto 0)`), and a typed-in product width is
+    reported even when the number is right, so later rounds cannot go stale."""
+    from agents.rtl_agent.rtl_linter import _multiplier_width_issues, _width_issues
+    first, second = _multiplier_width_issues(TYPED_PRODUCT)
+    assert first["detail"].startswith("line 11: `p2i_s5 <= v2i_s4 * mu_s4;` puts a 32-bit product into the 30-bit 'p2i_s5'")
+    assert ("declare `constant V2I_W : integer := 14;` and change `signal v2i_s4 : signed(13 downto 0)` to "
+            "`signal v2i_s4 : signed(V2I_W-1 downto 0)`") in first["detail"]           # stage suffix dropped
+    assert "declare `signal p2i_s5 : signed(V2I_W+MU_W-1 downto 0);` (14 + 18 = 32 bits)" in first["detail"]
+    assert "signed(31 downto 0)" not in first["detail"]                                 # no typed number offered
+    assert "declare `variable p1 : signed(YMID_I_W+D_I_W-1 downto 0);` (13 + 14 = 27 bits)" in second["detail"]
+    assert "`variable d_i_s7 : signed(D_I_W-1 downto 0)`" in second["detail"]          # variables keep their keyword
+    # the right number, typed in: still reported, with the same fix, and the general width check stays quiet
+    typed = TYPED_PRODUCT.replace("29 downto", "31 downto").replace("25 downto", "26 downto")
+    [a, b] = _width_issues(typed)
+    assert a["code"] == "multiplier_width" and a["detail"].startswith(
+        "line 11: `p2i_s5 <= v2i_s4 * mu_s4;` stores the product in 'p2i_s5', declared with a typed-in width "
+        "`signed(31 downto 0)`. The number is right today (14 + 18 = 32 bits)")
+    assert "signed(V2I_W+MU_W-1 downto 0)" in a["detail"] and "line 12" in b["detail"]
+    # declared from names: accepted, and a wrong named width is still a plain width error
+    named = (TYPED_PRODUCT.replace("signal v2i_s4 : signed(13 downto 0)", "constant V2I_W : integer := 14;\n"
+                                   "signal v2i_s4 : signed(V2I_W-1 downto 0)")
+             .replace("signed(29 downto 0)", "signed(V2I_W+MU_W-1 downto 0)")
+             .replace("variable ymid_i_s7 : signed(12 downto 0)", "constant Y_W : integer := 13;\n  variable ymid_i_s7 : signed(Y_W-1 downto 0)")
+             .replace("variable d_i_s7 : signed(13 downto 0)", "constant D_W : integer := 14;\n  variable d_i_s7 : signed(D_W-1 downto 0)")
+             .replace("signed(25 downto 0)", "signed(Y_W+D_W-1 downto 0)"))
+    assert _width_issues(named) == []
+    [stale] = _multiplier_width_issues(named.replace("signed(V2I_W+MU_W-1 downto 0)", "signed(V2I_W+MU_F-1 downto 0)"))
+    assert "puts a 32-bit product into the 30-bit 'p2i_s5'" in stale["detail"]
+    assert "declare `signal p2i_s5 : signed(V2I_W+MU_W-1 downto 0);`" in stale["detail"]
+    # a wrapped factor (`signed('0' & mu)`) is not the plain shape: the exact-number fix of the older tests stays
+
+
+TWO_PROCESSES_SAME_VARIABLE = (
+    "signal v2_s2 : signed(12 downto 0);\nsignal mu_s2 : unsigned(7 downto 0);\n"
+    "signal p1_s3 : signed(21 downto 0);\nsignal mu_s3 : unsigned(7 downto 0);\n"
+    "signal p2_s4 : signed(30 downto 0);\n"
+    "p_s3 : process(aclk)\n  variable prod_v : signed(21 downto 0);\nbegin\n  if rising_edge(aclk) then\n"
+    "    prod_v := v2_s2 * signed('0' & mu_s2);\n    p1_s3 <= prod_v;\n  end if;\nend process p_s3;\n"
+    "p_s4 : process(aclk)\n  variable prod_v : signed(30 downto 0);\nbegin\n  if rising_edge(aclk) then\n"
+    "    prod_v := p1_s3 * signed('0' & mu_s3);\n    p2_s4 <= prod_v;\n  end if;\nend process p_s4;\n")
+
+
+def test_width_checks_use_the_variable_declared_in_the_same_process():
+    """timing_recovery 2026-11-02 17:52: `prod_v` was 22 bits in p_s3 and 31
+    bits in p_s4, both right. The file-wide width map said 31 everywhere, so
+    p_s3's product lines were flagged for nine fix rounds with a fix the file
+    already contained. Each process is now checked against its own
+    declaration, and the message quotes `:=` for a variable, not `<=`."""
+    from agents.rtl_agent.rtl_linter import _width_issues
+    from agents.rtl_agent.rtl_smoke_check import _width_mismatch_hint
+    from agents.rtl_agent.rtl_widths import scoped_widths
+    assert _width_issues(TWO_PROCESSES_SAME_VARIABLE) == []
+    scopes = scoped_widths(TWO_PROCESSES_SAME_VARIABLE)
+    assert scopes.at(10)["prod_v"] == 22 and scopes.at(18)["prod_v"] == 31 and "prod_v" not in scopes.at(1)
+    assert scopes.at(10)["v2_s2"] == 13                      # file-level signals are visible inside
+    # a real mistake in p_s3 is still reported, at p_s3's width and with the variable's operator
+    bad = TWO_PROCESSES_SAME_VARIABLE.replace("variable prod_v : signed(21 downto 0)", "variable prod_v : signed(29 downto 0)")
+    [mult, *rest] = _width_issues(bad)
+    assert mult["code"] == "multiplier_width" and mult["detail"].startswith(
+        "line 10: `prod_v := v2_s2 * signed('0' & mu_s2);` puts a 22-bit product into the 30-bit 'prod_v'")
+    assert "declare `variable prod_v : signed(21 downto 0);` and write `prod_v := v2_s2 * signed('0' & mu_s2);`" in mult["detail"]
+    assert [i["code"] for i in rest] == ["assignment_width"] and "line 11" in rest[0]["detail"]   # p1_s3 <= prod_v (30 into 22)
+    # the dry-run hint finds the line by the same scoped widths
+    hint = _width_mismatch_hint("Array sizes do not match, left array has 30 elements, right array has 22 elements", bad)
+    assert "line 10:" in hint and "line 18" not in hint
+
+
+def test_assignment_width_fix_is_the_exact_line_when_the_right_side_is_narrower():
+    """`y_sym_i <= std_logic_vector(y_sat);` (12 bits into 24) was told to
+    "compute at the natural width, then resize as a separate step", the
+    advice for a WIDER right side, and survived two rounds."""
+    from agents.rtl_agent.rtl_linter import _assignment_width_issues
+    code = ("signal y_sat : signed(11 downto 0);\nsignal y_sym_i : std_logic_vector(23 downto 0);\n"
+            "signal mu_q8 : unsigned(7 downto 0);\nsignal eta : signed(15 downto 0);\nsignal w : unsigned(23 downto 0);\n"
+            "y_sym_i <= std_logic_vector(y_sat);\n"
+            "mu_q8 <= unsigned(shift_left(resize(eta, 16), 2));\n"
+            "w <= unsigned(y_sym_i(11 downto 0));\n")
+    narrow, wide, conv = _assignment_width_issues(code, set())
+    assert "line 6: 'y_sym_i' is 24 bits but the right-hand side is 12 bits" in narrow["detail"]
+    assert "`y_sym_i <= std_logic_vector(resize(y_sat, 24));`" in narrow["detail"]
+    assert "line 7: 'mu_q8' is 8 bits but the right-hand side is 16 bits" in wide["detail"]
+    assert "exactly 16 bits, then `mu_q8 <= resize(<that>, 8);`" in wide["detail"]
+    assert "`w <= resize(unsigned(y_sym_i(11 downto 0)), 24);`" in conv["detail"]
+
+
+def test_multiple_drivers_names_the_processes_the_lines_and_the_stray_reset_line():
+    """p_main reset `strobe` while p_strobe computed it; "process #1, process
+    #2" was all the model got, for six rounds."""
+    from agents.rtl_agent.rtl_linter import _multiple_driver_issues
+    code = ("p_main : process(aclk)\nbegin\n  if rising_edge(aclk) then\n    if aresetn = '0' then\n"
+            "      cnt <= 0;\n      strobe <= '0';\n    end if;\n  end if;\nend process p_main;\n"
+            "p_strobe : process(aclk)\nbegin\n  if rising_edge(aclk) then\n    if eta < 0 then\n"
+            "      strobe <= '1';\n    else\n      strobe <= '0';\n    end if;\n  end if;\nend process p_strobe;\n")
+    [issue] = _multiple_driver_issues(code)
+    assert "'strobe' is written in 2 places: process p_main (line 6); process p_strobe (lines 14, 16)" in issue["detail"]
+    assert "process p_main writes it only once (line 6), most likely its reset line" in issue["detail"]
+    assert "reset 'strobe' in process p_strobe instead" in issue["detail"]
+
+
+def test_linter_catches_a_declaration_after_the_process_begin():
+    """The retry put a `variable` line after `begin` and a `signal` line inside
+    the process: 'syntax error near variable' plus 13 follow-on errors, twice."""
+    from agents.rtl_agent.rtl_linter import _declaration_after_begin_issues
+    code = ("p_main : process(aclk)\n  variable w : signed(15 downto 0);\nbegin\n"
+            "  variable eta_next : signed(15 downto 0);\n  if rising_edge(aclk) then\n"
+            "    signal x_m1 : signed(11 downto 0);\n    w := eta;\n  end if;\nend process p_main;\n")
+    found = _declaration_after_begin_issues(code)
+    assert [i["code"] for i in found] == ["declaration_after_begin"] * 2
+    assert "line 4: `variable eta_next`" in found[0]["detail"]
+    assert "between `process(...)` and its `begin`" in found[0]["detail"]
+    assert "line 6: `signal x_m1`" in found[1]["detail"]
+    assert "a signal can never be declared inside a process" in found[1]["detail"]
+    fixed = code.replace("  variable eta_next : signed(15 downto 0);\n", "").replace(
+        "    signal x_m1 : signed(11 downto 0);\n", "")
+    assert not _declaration_after_begin_issues(fixed)
+
+
+# ── timing_recovery, 2026-11-02 09:31: one unfinished file came back eight times ──
+
+def test_linter_reads_leaked_planning_comments_as_placeholders():
+    """The NCO process body was only the model's own notes ("-- I will generate
+    the full code in the final answer", "-- Placeholder for the rest of the
+    code"); TODO/FIXME/`...` never matched, so the file reached the dry run
+    eight times and got the same canned valid_pipe hint every time."""
+    from agents.rtl_agent.rtl_linter import _static_checks
+    spec = {"entity_name": "timing_recovery", "ports": []}
+    base = ("entity timing_recovery is port (aclk : in std_logic); end entity;\n"
+            "architecture rtl of timing_recovery is\nbegin\n"
+            "  -- wait for the handshake before the I and Q samples are latched\n"
+            "  -- this lets the counter wrap at 15 (0 -> ... -> 15)\n"
+            "end architecture;\n")
+    assert not [i for i in _static_checks(spec, {"code": base}) if i["code"] == "placeholder"]
+    stub = base.replace("end architecture;",
+                        "  -- I will generate the full code in the final answer.\n"
+                        "  -- Placeholder for the rest of the code\n"
+                        "  -- For now, let's just output the code with the corrected NCO process.\n"
+                        "end architecture;")
+    found = [i["detail"] for i in _static_checks(spec, {"code": stub}) if i["code"] == "placeholder"]
+    assert len(found) == 3
+    assert found[0].startswith("line 6:") and "not written yet" in found[0] and "final answer" in found[0]
+    # a flood of such notes is cut to five lines plus a count
+    flood = base.replace("end architecture;", "  -- placeholder\n" * 9 + "end architecture;")
+    found = [i["detail"] for i in _static_checks(spec, {"code": flood}) if i["code"] == "placeholder"]
+    assert len(found) == 5 and "4 more" in found[-1]
+
+
+def test_linter_catches_an_output_valid_tied_to_zero_before_the_dry_run():
+    """`m_axis_tvalid <= m_axis_tvalid_i;` ... `m_axis_tvalid_i <= '0';` was
+    the whole output logic; the 400-cycle dry run then reported
+    smoke_output_never_valid with a hint about valid_pipe/advance, names the
+    file did not contain, and the model changed nothing."""
+    from agents.rtl_agent.rtl_linter import _constant_output_valid_issues
+    spec = {"ports": [{"name": "s_axis_tvalid", "direction": "input", "width": "1"},
+                      {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
+                      {"name": "m_axis_tdata", "direction": "output", "width": "24"}]}
+    stub = ("m_axis_tvalid <= m_axis_tvalid_i;\nm_axis_tdata <= m_axis_tdata_i;\n"
+            "m_axis_tvalid_i <= '0';  -- stub\nm_axis_tdata_i <= (others => '0');\n")
+    [issue] = _constant_output_valid_issues(spec, stub)
+    assert issue["code"] == "output_valid_stuck_at_zero"
+    assert "line 3: output valid 'm_axis_tvalid'" in issue["detail"]
+    assert "(through 'm_axis_tvalid_i')" in issue["detail"] and "smoke_output_never_valid" in issue["detail"]
+    assert issue["detail"].endswith(">> m_axis_tvalid_i <= '0';")
+    # written straight on the port
+    assert _constant_output_valid_issues(spec, "m_axis_tvalid <= '0';")
+    # a reset write of '0' next to a real write is fine
+    ok = ("process(aclk) begin if rising_edge(aclk) then if aresetn = '0' then m_axis_tvalid_i <= '0';\n"
+          "else m_axis_tvalid_i <= valid_pipe(3); end if; end if; end process;\nm_axis_tvalid <= m_axis_tvalid_i;\n")
+    assert not _constant_output_valid_issues(spec, ok)
+    assert not _constant_output_valid_issues(spec, "m_axis_tvalid <= '1' when busy = '1' else '0';")
+    # an input valid, or a valid driven by a sub-block (no `<=` write), is not this check's business
+    assert not _constant_output_valid_issues(spec, "s_axis_tvalid <= '0';")
+    assert not _constant_output_valid_issues(spec, "u0 : entity work.core port map (m_axis_tvalid => m_axis_tvalid);")
+
+
+# ── the generator re-asks once when the answer is the file it was asked to change ──
+
+class RecordingLLM:
+    """Stand-in chat model: hands out the queued replies and keeps every request."""
+
+    def __init__(self, *replies):
+        self.replies, self.calls = list(replies), []
+
+    def invoke(self, messages, config=None):
+        self.calls.append(messages)
+        return AIMessage(content=self.replies.pop(0))
+
+
+OLD = json.dumps({"entity_name": "counter4", "notes": [],
+                  "code": "entity counter4 is end;\n-- placeholder for the rest of the code\ncount_i <= '0';"})
+NEW = json.dumps({"entity_name": "counter4", "notes": [],
+                  "code": "entity counter4 is end;\ncount_i <= count_i + 1;"})
+ISSUES = [{"code": "placeholder", "detail": "line 2: this comment says the code is not written yet"}]
+
+
+def test_generator_re_asks_once_with_a_warmer_client_when_the_fix_is_a_copy():
+    """timing_recovery, 2026-11-02 09:31: eight byte-identical answers while
+    the notes said "I have rewritten the entire architecture"; each one cost
+    a compile and a dry run before unchanged_on_retry / the stall rule spoke."""
+    first, second = RecordingLLM(OLD), RecordingLLM(NEW)
+    gen = RTLGenerator(llm=first, retry_llm=second)
+    previous = json.loads(OLD)
+    rtl = gen.generate(SPEC, SKILLS, previous_rtl=previous, lint_issues=ISSUES)
+    assert rtl["code"] == json.loads(NEW)["code"]
+    assert len(first.calls) == 1 and len(second.calls) == 1
+    system, user = second.calls[0][0].content, json.loads(second.calls[0][1].content)
+    assert 'returning "previous_code" unchanged is refused' in system        # the fix addendum came along
+    assert [i["code"] for i in user["lint_issues"]] == ["placeholder", "unchanged_answer"]
+    assert "changed 0 lines" in user["lint_issues"][-1]["detail"] and "(placeholder)" in user["lint_issues"][-1]["detail"]
+    assert user["previous_code"] == previous["code"]
+    assert rtl["notes"][-1].startswith("re-asked once")
+
+
+def test_generator_does_not_re_ask_when_the_fix_changed_something():
+    first, second = RecordingLLM(NEW), RecordingLLM()
+    gen = RTLGenerator(llm=first, retry_llm=second)
+    rtl = gen.generate(SPEC, SKILLS, previous_rtl=json.loads(OLD), lint_issues=ISSUES)
+    assert rtl["code"] == json.loads(NEW)["code"] and len(first.calls) == 1 and not second.calls
+
+
+def test_generator_re_asks_only_once_and_leaves_a_second_copy_to_the_linter():
+    from agents.rtl_agent.rtl_linter import unchanged_on_retry_issue
+    first, second = RecordingLLM(OLD), RecordingLLM(OLD)
+    gen = RTLGenerator(llm=first, retry_llm=second)
+    rtl = gen.generate(SPEC, SKILLS, previous_rtl=json.loads(OLD), lint_issues=ISSUES)
+    assert rtl["code"] == json.loads(OLD)["code"] and len(second.calls) == 1
+    assert unchanged_on_retry_issue(rtl, json.loads(OLD), None)["code"] == "unchanged_on_retry"
+
+
+def test_generator_re_asks_when_a_retry_hands_back_the_orchestrators_file_unchanged():
+    """Attempts 2 and 3 this morning: the first write of each retry was the
+    orchestrator's previous_code, byte for byte, before any lint issue existed."""
+    first, second = RecordingLLM(OLD), RecordingLLM(NEW)
+    gen = RTLGenerator(llm=first, retry_llm=second)
+    history = [{"attempt": 1, "status": "NEEDS_REVIEW", "error": "stalled", "issues": ISSUES}]
+    rtl = gen.generate(SPEC, SKILLS, attempt=2, attempt_history=history, starting_rtl=json.loads(OLD))
+    assert rtl["code"] == json.loads(NEW)["code"] and len(second.calls) == 1
+    user = json.loads(second.calls[0][1].content)
+    assert user["previous_code"] == json.loads(OLD)["code"]
+    assert [i["code"] for i in user["lint_issues"]] == ["unchanged_answer"]
+    assert "the downstream failures" in user["lint_issues"][0]["detail"]
+
+
+def test_linter_names_every_stage_register_that_is_used_but_never_declared_or_written():
+    """timing_recovery 16:03 (2026-11-02): `mu_s2 <= mu_s1;` and six more
+    carry lines read stage-1 registers that were never declared or written
+    (loop values fed back from the last stage). xvhdl listed all seven, the
+    follow-on filter showed one, and two fix rounds returned the same file."""
+    from agents.rtl_agent.rtl_linter import _stage_register_declaration_issues
+    code = """architecture rtl of t is
+  signal i_s1, q_s1 : signed(11 downto 0);
+  signal mu_s2, mu_s3 : signed(16 downto 0);
+  signal y_s3 : signed(11 downto 0);
+begin
+  p_s1 : process(clk)
+  begin
+    if rising_edge(clk) then
+      i_s1 <= signed(s_axis_tdata(11 downto 0));
+    end if;
+  end process p_s1;
+  p_s2 : process(clk)
+  begin
+    if rising_edge(clk) then
+      mu_s2 <= mu_s1;                          -- mu_s1: never declared, never written
+      acc_s2 <= acc_s1 + resize(i_s1, 17);     -- acc_s2 written, acc_s1 read: neither declared
+    end if;
+  end process p_s2;
+  p_s3 : process(clk)
+    variable eta_v_s3 : signed(16 downto 0);
+  begin
+    if rising_edge(clk) then
+      eta_v_s3 := mu_s2 + 1;
+      mu_s3 <= mu_s2;
+      y_s3 <= q_s1;                            -- q_s1 declared but never written
+    end if;
+  end process p_s3;
+end architecture;
+"""
+    issues = _stage_register_declaration_issues(code)
+    assert [i["code"] for i in issues] == ["undeclared_stage_register"] * 3 + ["unwritten_stage_register"]
+    assert [i["detail"].split("`")[1] for i in issues] == ["mu_s1", "acc_s2", "acc_s1", "q_s1"]
+    mu, acc2, acc1, q = (i["detail"] for i in issues)
+    assert "line 15" in mu and "add `signal mu_s1 : signed(16 downto 0);` next to `mu_s2` (line 3)" in mu
+    # a loop value is not copied back round the rows any more: it lives in p_loop (2026-11-04)
+    assert "do not copy it back from the last stage (`mu_s1 <= mu_s3;` would run 3 separate loops)" in mu
+    assert "`p_loop`" in mu and "`strobe_s2` / `mu_s2`" in mu and "`p_s1`" in mu
+    assert "<the type of the value it carries>" in acc2 and "write it" not in acc2    # written: only the declaration is missing
+    assert "`acc_s1 <= <input>;`" in acc1
+    assert "line 25" in q and "never written" in q and "`q_s1 <= <input>;`" in q
+    clean = """architecture rtl of t is
+  signal a_s1, c_s1 : signed(11 downto 0);
+  signal b_s2 : signed(12 downto 0);
+  signal mu_s1, mu_s2 : signed(16 downto 0) := (others => '0');
+begin
+  m_axis_tdata <= std_logic_vector(b_s2);
+  u_s1 : my_comp port map (clk => clk, q => c_s1);
+  p_s1 : process(clk) begin if rising_edge(clk) then a_s1 <= signed(d); mu_s1 <= mu_s2; end if; end process p_s1;
+  p_s2 : process(clk) begin if rising_edge(clk) then b_s2 <= resize(a_s1, 13) + resize(c_s1, 13); mu_s2 <= mu_s1; end if; end process p_s2;
+end architecture;"""
+    assert _stage_register_declaration_issues(clean) == []
+    assert _stage_register_declaration_issues("q <= d when en = '1' else q;") == []
+
+
+def test_compiler_undeclared_lines_are_dropped_once_the_linter_explained_the_name():
+    from agents.rtl_agent.rtl_linter import _without_duplicate_undeclared
+    static = [{"code": "undeclared_stage_register", "detail": "line 15: `mu_s1` is used but never declared ..."}]
+    compiled = [{"code": "compile_error",
+                 "detail": "ERROR: [VRFC 10-2989] 'mu_s1' is not declared [t.vhd:15]  >> line 15: mu_s2 <= mu_s1;"},
+                {"code": "compile_error", "detail": "6 follow-on error(s) hidden: they come from the error(s) above ..."}]
+    assert _without_duplicate_undeclared(static, compiled) == []                     # only the note would be left
+    other = {"code": "compile_error", "detail": "ERROR: [VRFC 10-2989] 'mu' is not declared [t.vhd:30]  >> line 30: x := mu;"}
+    assert _without_duplicate_undeclared(static, compiled + [other]) == [compiled[1], other]
+    assert _without_duplicate_undeclared([], compiled) == compiled
+
+
+def test_each_different_missing_name_is_a_root_compiler_error():
+    """timing_recovery 16:03 (2026-11-02): seven stage-1 registers were never
+    declared; xvhdl listed all seven on lines 278-284, the filter kept one and
+    hid six as follow-ons, and the model fixed none of them."""
+    from agents.lint_utils import compiler_errors
+    src = "\n".join(f"line{n}" for n in range(1, 300))
+    names = ["mu_s1", "eta_s1", "v_s1", "acc_s1", "y_prev_i_s1", "y_prev_q_s1", "strobe_s1"]
+    out = "\n".join(f"ERROR: [VRFC 10-2989] '{n}' is not declared [C:/tmp/tmpab12cd/t.vhd:{278 + k}]"
+                    for k, n in enumerate(names))
+    out += "\nERROR: [VRFC 10-2989] 'mu_s1' is not declared [C:/tmp/tmpab12cd/t.vhd:290]"                # same name: follow-on
+    out += "\nERROR: [VRFC 10-3782] unit 'rtl' ignored due to previous errors [C:/tmp/tmpab12cd/t.vhd:18]"  # always noise
+    details = [i["detail"] for i in compiler_errors(out, src, 1)]
+    assert [d.split("'")[1] for d in details[:-1]] == names
+    assert details[-1].startswith("2 follow-on error(s) hidden")
+    broken = ("ERROR: [VRFC 10-4982] syntax error near 'signal' [t.vhd:40]\n"      # a broken declaration ...
+              "ERROR: [VRFC 10-2989] 'foo' is not declared [t.vhd:60]\n"            # ... still hides the names it broke
+              "ERROR: [VRFC 10-2989] 'bar' is not declared [t.vhd:61]")
+    kept = [i["detail"] for i in compiler_errors(broken, src, 1)]
+    assert len(kept) == 2 and "'signal'" in kept[0] and kept[1].startswith("2 follow-on error(s) hidden")

@@ -484,13 +484,23 @@ async function loadAgentRuns() {
     const statusText = r.agent_status
       ? (r.status === "completed" && r.agent_status === "FAILED" ? r.agent_status : `${r.status} · ${r.agent_status}`)
       : r.status;
-    const errorText = r.error || r.agent_error || r.stop_reason || "";
+    // Last column: a real error is red; a plain "why it stopped" sentence
+    // (stop_reason, e.g. "Simulation passed ...") is shown in muted text.
+    const realError = r.error || r.agent_error || "";
+    const lastText = realError || r.stop_reason || "";
+    const lastCls = !lastText ? "" : stopped ? "badge-cancelled" : realError ? "badge-error" : "status";
+    // Requirement column: first line of what the run was asked to build; the
+    // full title is shown on hover.
+    const reqTitle = r.requirement_title || "";
+    const reqShort = reqTitle.length > 60 ? reqTitle.slice(0, 60) + "…" : reqTitle;
     tr.innerHTML = `
       <td>${new Date(r.started_at * 1000).toLocaleString()}</td>
       <td>${escapeHtml(r.agent_name)} v${escapeHtml(r.agent_version || "")}</td>
+      <td>${escapeHtml(reqShort || "-")}</td>
       <td><span class="${cls}">${escapeHtml(statusText)}</span></td>
       <td>${r.duration_ms != null ? formatMs(r.duration_ms) : "-"}</td>
-      <td class="${errorText ? (stopped ? "badge-cancelled" : "badge-error") : ""}">${escapeHtml(errorText.slice(0, 80))}</td>`;
+      <td class="${lastCls}">${escapeHtml(lastText.slice(0, 80))}</td>`;
+    if (reqTitle) tr.children[2].title = reqTitle;
     tr.dataset.runId = r.id;
     tr.addEventListener("click", async () => {
       await showAgentRun(r.id);
@@ -1210,9 +1220,11 @@ function setAllEventDetails(open) {
   evtRows.forEach((r) => { evtOpen.set(r.key, open); r.refresh(); });
 }
 // Hide/show a timeline row together with its detail row (used by the
-// orchestrator's collapsible groups).
+// orchestrator's collapsible groups). A group row nested in another group
+// hides/shows its own children along with it, keeping its own open state.
 function setRowHidden(tr, hidden) {
   if (tr._evt) tr._evt.setHidden(hidden);
+  else if (tr._group) tr._group.setHidden(hidden);
   else tr.classList.toggle("hidden", hidden);
 }
 
@@ -1242,7 +1254,7 @@ function eventRow(e, typeLabel, detail) {
     if (open && !detailRow && tr.parentNode) {
       detailRow = document.createElement("tr");
       detailRow.className = "evt-detail";
-      tr.classList.forEach((c) => { if (c.startsWith("orch-agent-") || c === "orch-nested") detailRow.classList.add(c); });
+      tr.classList.forEach((c) => { if (c.startsWith("orch-agent-") || c === "orch-nested" || c === "evt-inner") detailRow.classList.add(c); });
       const td = document.createElement("td");
       td.colSpan = 5;
       td.appendChild(buildEventDetail(e));
@@ -1263,6 +1275,51 @@ function eventRow(e, typeLabel, detail) {
   tr._evt = row;
   evtRows.push(row);
   return tr;
+}
+
+// Inner-agent rows in a worker's own timeline: the test vector agent (the
+// only worker with one, see INNER_AGENTS) runs a generator loop (AI +
+// MATLAB tool calls) inside its generate_vectors step; those rows are
+// indented and tinted (renderWorkerRows keeps only the rows whose `parent`
+// is that node). New runs carry data.path: the
+// graph nodes that were running when the row was written, outermost first.
+// Old runs (no path) fall back to step numbers and timestamps: the enclosing
+// node of E is the agent_step A with the largest step below E's whose row
+// was written at or after E (an outer node's row is only written when it ends).
+function enclosingStep(e, events) {
+  let best = null;
+  events.forEach((a) => {
+    if (a === e || a.event_type !== "agent_step" || !(a.step < e.step)) return;
+    if (a.timestamp == null || e.timestamp == null || a.timestamp < e.timestamp) return;
+    if (!best || a.step > best.step) best = a;
+  });
+  return best;
+}
+// null for a normal row, else { step: <is an inner agent_step>, parent: <outer node name> }.
+// `base` is the path length of the worker's own top-level step rows: 0 in a
+// worker's own run; inside an orchestrator run the path also starts with the
+// orchestrator's node(s), so the caller measures it (see renderNestedRows).
+// `events` (the fallback's search space) may be restricted to one agent group.
+function innerInfo(e, events, base = 0) {
+  const d = e.data || {};
+  const isStep = e.event_type === "agent_step";
+  // A node's own row: its agent_step, or the error row written when it failed.
+  const nodeRow = isStep || (e.event_type === "error" && d.node != null);
+  if (Array.isArray(d.path)) {
+    const inner = d.path.length >= base + 2 || (nodeRow && d.path.length >= base + 1);
+    return inner ? { step: isStep, parent: d.path[base] || "" } : null;
+  }
+  const enc = enclosingStep(e, events);
+  if (!enc) return null;
+  // Climb past the generator's model/tools wrappers (LangGraph can record two
+  // `tools` rows for one batch of tool calls) to the worker node holding them.
+  const isInnerNode = (x) => ["model", "tools"].includes(((x && x.data) || {}).node);
+  let outer = enc, up = enclosingStep(enc, events);
+  while (up && isInnerNode(outer)) { outer = up; up = enclosingStep(outer, events); }
+  const innerStep = isStep && isInnerNode(e);
+  if (!innerStep && outer === enc && !up) return null;   // no chain: a worker-level row
+  if (outer === enc && up) outer = up;                    // chain two deep: the ancestor is the outer node
+  return { step: isStep, parent: (outer.data || {}).node || "" };
 }
 
 function prettyJson(v) { return typeof v === "string" ? v : JSON.stringify(v, null, 2); }
@@ -1294,8 +1351,8 @@ function collectLogFields(obj, path, out) {
     else if (v && typeof v === "object") collectLogFields(v, p, out);
   });
 }
-const TRUNC_NOTE = "This text was cut when it was captured (marker in the text): the recorder stores at most 4000 chars " +
-  "of a tool output and the Vivado MCP server caps console output at 4000 chars. Raise those caps for new runs; old runs cannot be recovered.";
+const TRUNC_NOTE = "This text was cut when it was captured (marker in the text); a long simulation log keeps its first 180 KB and its last 20 KB, " +
+  "so the result marker at the end is kept. The complete log is in the project folder under work_proj/xsim.log.";
 function noteIfTruncated(box, text) {
   if (/\[truncated[, ]/.test(text)) box.appendChild(panelLine(TRUNC_NOTE, "status warn"));
 }
@@ -1579,14 +1636,203 @@ function setAllOrchGroups(open) {
 // CSS class carrying the per-agent colour band; "write_project" has no agent.
 function orchAgentClass(agent) { return `orch-agent-${agent || "none"}`; }
 
+// A collapsible group header row, appended to `tbody`: the orchestrator's
+// "<tool> → <agent>" rows and a worker's inner-generator rows share this
+// markup. Open/closed state lives in orchGroupOpen under `key` (survives the
+// rebuilds of a live run); `defaultOpen` applies until the user clicks the
+// row or presses Expand/Collapse groups.
+function makeGroupRow(tbody, { key, step, eventLabel, detailHtml, agentCls, defaultOpen }) {
+  const tr = document.createElement("tr");
+  tr.className = `orch-group ${agentCls}`;
+  tr.innerHTML = `
+      <td data-label="#">${step ?? ""}</td>
+      <td data-label="Event">${escapeHtml(eventLabel)}</td>
+      <td data-label="Detail"><span class="orch-toggle"></span>${detailHtml}<span class="orch-count"></span></td>
+      <td data-label="Status"><span class="orch-status">running...</span></td>
+      <td data-label="Duration" class="orch-ms"></td>`;
+  tbody.appendChild(tr);
+  const g = { key, step, agentCls, tr, children: [], hidden: false };
+  // Nested events, counting a nested group's rows in place of its header row.
+  const count = () => {
+    const n = g.children.reduce((s, c) => s + (c._group ? c._group.children.length : 1), 0);
+    tr.querySelector(".orch-count").textContent = ` (${n} nested event${n === 1 ? "" : "s"})`;
+  };
+  g.isOpen = () => (orchGroupOpen.has(key) ? orchGroupOpen.get(key) : defaultOpen);
+  g.refresh = () => {
+    const open = g.isOpen();
+    tr.querySelector(".orch-toggle").textContent = open ? "▾" : "▸";
+    count();
+    tr.classList.toggle("orch-group-open", open);
+    g.children.forEach((c) => setRowHidden(c, g.hidden || !open));
+  };
+  // Hidden by an enclosing group: the row and its children go, the open
+  // state stays, so reopening the enclosing group restores the same view.
+  g.setHidden = (hidden) => {
+    g.hidden = hidden;
+    tr.classList.toggle("hidden", hidden);
+    g.refresh();
+  };
+  g.addChild = (child) => {
+    g.children.push(child);
+    child.classList.add(agentCls);
+    setRowHidden(child, g.hidden || !g.isOpen());
+    count();
+  };
+  g.setOutcome = (label, cls, durationMs) => {
+    const st = tr.querySelector(".orch-status");
+    st.textContent = label;
+    st.className = `orch-status ${cls || ""}`;
+    tr.querySelector(".orch-ms").textContent = durationMs != null ? formatMs(durationMs) : "";
+    g.refresh();
+  };
+  tr.addEventListener("click", () => { orchGroupOpen.set(key, !g.isOpen()); g.refresh(); });
+  tr._group = g;
+  g.refresh();
+  orchGroups.push(g);
+  return g;
+}
+
+// The workers that really run an inner AI worker inside one of their steps:
+// `node` is the worker step that holds the inner loop, `label` the text of
+// its group header row. Only the test vector agent has one (the test vector
+// generator's AI + MATLAB loop, `_tool_loop`, runs only inside its
+// `generate_vectors` step). Rows nested under any other step of that worker
+// (decide, load_skills, validate_vectors, finalize_vectors: the decider's
+// llm_call, skill-loading tool calls, validator rows) and every other
+// worker's model/tools rows render as plain rows (renderWorkerRows skips the
+// inner detection without a config and drops rows under a different node).
+const INNER_AGENTS = {
+  test_vector_agent: { node: "generate_vectors", label: "test vector generator (AI + MATLAB loop)" },
+};
+function innerAgent(agent) { return INNER_AGENTS[agent] || null; }
+
+// The group row "<outer node> → <generator> (N nested events)" an inner
+// generator's rows fold under; closed by default. Orange (evt-inner-group),
+// distinct from the worker's own colour band.
+function makeInnerGroupRow(tbody, { key, step, parentNode, label, agentCls }) {
+  const g = makeGroupRow(tbody, {
+    key, step, eventLabel: "inner generator", agentCls, defaultOpen: false,
+    detailHtml: `<strong>${escapeHtml(parentNode || "?")}</strong> → <span class="orch-agent-badge evt-inner-badge">${escapeHtml(label)}</span>`,
+  });
+  g.tr.classList.add("evt-inner-group");
+  g.parent = parentNode;
+  g.events = [];
+  return g;
+}
+// Indent/tint an inner-generator row (no-op for a normal row).
+function markInnerRow(tr, inner) {
+  if (!inner) return;
+  tr.classList.add("evt-inner");
+  if (inner.step) tr.classList.add("evt-inner-step");
+  tr.dataset.parent = inner.parent;
+  if (inner.parent) tr.title = `Inner generator, running inside the step "${inner.parent}"`;
+}
+// Status / duration of an inner group = the outer node's own row: the
+// agent_step (or error) event for that node with the largest step below the
+// first inner row, written at or after the last inner row, searched in
+// `events`. In a live run that row does not exist yet: the group stays
+// "running...".
+function setInnerGroupOutcome(g, events) {
+  const first = g.events[0], last = g.events[g.events.length - 1];
+  let outer = null;
+  events.forEach((a) => {
+    if (!["agent_step", "error"].includes(a.event_type) || (a.data || {}).node !== g.parent || !(a.step < first.step)) return;
+    if (a.timestamp != null && last.timestamp != null && a.timestamp < last.timestamp) return;
+    if (!outer || a.step > outer.step) outer = a;
+  });
+  if (!outer) return;
+  const st = outer.event_type === "error" ? "error" : outer.status;
+  const text = st === "ok" ? "COMPLETE" : st === "error" ? "FAILED" : (st || "done");
+  const cls = st === "ok" ? "badge-ok" : st === "error" ? "badge-error" : st === "stopped" ? "badge-cancelled" : "";
+  g.setOutcome(text, cls, outer.duration_ms);
+}
+
+// Fold the rows of one worker (its own run, or one sub-agent call of the
+// orchestrator) : each event becomes a row, inner-generator rows (see
+// innerInfo) are collapsed under an inner group row placed where the first
+// inner row is. The outer node's own agent_step row stays where it is (it
+// precedes the inner rows: its step number is taken when the node starts, the
+// row written when it ends). The group key uses the first inner row's step,
+// which is stable across the rebuilds of a live run (the outer step's row
+// does not exist until it ends). `opts.keyPrefix` scopes the keys,
+// `opts.base` is the path length of the worker's top-level steps, and
+// `opts.onRow(tr, group)` places each row (group = its inner group or null).
+// `cfg` ({ node, label }, see INNER_AGENTS) is null for a worker without an
+// inner generator: no row is marked inner and no group row is made. With a
+// config, only rows whose enclosing worker node is cfg.node are inner; rows
+// nested under any other node of the worker stay plain.
+function renderWorkerRows(tbody, events, cfg, agentCls, opts) {
+  const steps = events.filter((e) => e.event_type === "agent_step");
+  const groups = [];
+  let group = null;                       // the group collecting rows right now
+  events.forEach((e) => {
+    let inner = cfg ? innerInfo(e, steps, opts.base || 0) : null;
+    if (inner && inner.parent !== cfg.node) inner = null;
+    // A worker-level node finishing (its own agent_step row) or a different
+    // enclosing node ends the current group.
+    const nodeRow = e.event_type === "agent_step" || (e.event_type === "error" && (e.data || {}).node != null);
+    if (group && ((!inner && nodeRow) || (inner && inner.parent !== group.parent))) group = null;
+    // Old runs (no data.path) only mark the model/tools steps as inner: the
+    // llm_call / tool_call rows between them ran inside the same node.
+    if (group && !inner && !Array.isArray((e.data || {}).path) && !String(e.event_type).startsWith("run_")) inner = { step: false, parent: group.parent };
+    if (inner && !group) {
+      group = makeInnerGroupRow(tbody, { key: `${opts.keyPrefix}:${inner.parent}:${e.step}`, step: e.step, parentNode: inner.parent, label: cfg.label, agentCls });
+      groups.push(group);
+      opts.onRow(group.tr, null);
+    }
+    const tr = e.event_type === "agent_step" && opts.nodeLabel
+      ? eventRow(e, inner && inner.step ? "inner step" : "node", (e.data || {}).node || "")
+      : eventRow(e, inner && inner.step ? "inner step" : undefined);
+    markInnerRow(tr, inner);
+    tbody.appendChild(tr);
+    if (inner) { group.addChild(tr); group.events.push(e); }
+    opts.onRow(tr, inner ? group : null);
+  });
+  groups.forEach((g) => setInnerGroupOutcome(g, events));
+}
+
+// A worker's own timeline (see renderWorkerRows).
+function renderWorkerTimeline(tbody, run) {
+  orchGroups = [];
+  const agentCls = orchAgentClass(run.agent_name);
+  renderWorkerRows(tbody, run.events, innerAgent(run.agent_name), agentCls, { keyPrefix: run.id, base: 0, onRow: () => {} });
+}
+
 // Is `e` the orchestrator's own event (vs. one nested in the open sub-agent
 // call `parent`)? Events come sorted by step, and a tool_result shares the
 // step of its tool_call, so it precedes the nested events: a group is
 // therefore closed by timestamp (parent.endTs), not by the tool_result.
-function isOrchestratorEvent(e, parent) {
+function isOrchestratorEvent(e, parent, events) {
   const d = e.data || {};
+  const isWrapper = (n) => n === "model" || n === "tools";
+  // Written while a worker's own node (decide, generate_vectors, ...) was
+  // running: never the orchestrator's, whatever the event type (an `error`
+  // from the worker's inner tools node used to close the open group).
+  if (Array.isArray(d.path) && !d.path.every(isWrapper)) return false;
   switch (e.event_type) {
-    case "agent_step": return d.node === "model" || d.node === "tools";
+    // A failure: the worker's (its node, tool or LLM call) is nested, the
+    // orchestrator's own is top-level. Without a path (old runs) a wrapper
+    // node's error is the orchestrator's only when no call is open.
+    case "error":
+      if (d.tool) return isOrchTool(d.tool);
+      if (d.node && !isWrapper(d.node)) return false;
+      return !parent || (parent.endTs != null && e.timestamp > parent.endTs);
+    // The orchestrator's own model/tools wrappers, or the worker's inner
+    // generator loop (its own model/tools steps) when a sub-agent call is
+    // open. The orchestrator's `tools` row is written just before its
+    // tool_result, so after the call returned it is told apart by its path
+    // (no worker node around it) or, in old runs without a path, by having
+    // no worker node row enclosing it (lower step inside the call, written
+    // at or after it).
+    case "agent_step": {
+      if (d.node !== "model" && d.node !== "tools") return false;
+      if (!parent) return true;
+      if (Array.isArray(d.path)) return d.path.every((n) => n === "model" || n === "tools");
+      if (parent.endTs == null) return false;          // call still running: only the worker is stepping
+      if (e.timestamp >= parent.endTs) return true;
+      return !(events || []).some((a) => a.event_type === "agent_step" && !["model", "tools"].includes((a.data || {}).node) &&
+        a.step > parent.step && a.step < e.step && a.timestamp != null && a.timestamp >= e.timestamp);
+    }
     case "tool_call":
     case "tool_result": return isOrchTool(d.tool);
     case "llm_call":
@@ -1640,62 +1886,46 @@ function renderOrchestratorTimeline(tbody, run) {
   const startGroup = (e) => {
     const d = e.data || {};
     const agent = ORCH_TOOL_AGENTS[d.tool];
-    const key = `${run.id}:${e.step}`;
     const agentCls = orchAgentClass(agent);
-    const tr = document.createElement("tr");
-    tr.className = `orch-group ${agentCls}`;
-    tr.innerHTML = `
-      <td data-label="#">${e.step ?? ""}</td>
-      <td data-label="Event">tool_call</td>
-      <td data-label="Detail"><span class="orch-toggle"></span><strong>${escapeHtml(d.tool)}</strong> →
-        <span class="orch-agent-badge ${agentCls}">${escapeHtml(agent || "write_project (file writes, no agent)")}</span><span class="orch-count"></span></td>
-      <td data-label="Status"><span class="orch-status">running...</span></td>
-      <td data-label="Duration" class="orch-ms"></td>`;
-    tbody.appendChild(tr);
-    const g = { key, tool: d.tool, agentCls, step: e.step, endTs: null, tr, children: [] };
     // Default: expanded so the sub-agent's inner work is visible; a click (or
-    // Expand/Collapse all) overrides that for the rest of the session.
-    g.isOpen = () => (orchGroupOpen.has(key) ? orchGroupOpen.get(key) : true);
-    g.refresh = () => {
-      const open = g.isOpen();
-      tr.querySelector(".orch-toggle").textContent = open ? "▾" : "▸";
-      tr.querySelector(".orch-count").textContent = ` (${g.children.length} nested event${g.children.length === 1 ? "" : "s"})`;
-      tr.classList.toggle("orch-group-open", open);
-      g.children.forEach((c) => setRowHidden(c, !open));
-    };
-    g.addChild = (child) => {
-      g.children.push(child);
-      child.classList.add(agentCls);
-      setRowHidden(child, !g.isOpen());
-      tr.querySelector(".orch-count").textContent = ` (${g.children.length} nested event${g.children.length === 1 ? "" : "s"})`;
-    };
-    tr.addEventListener("click", () => { orchGroupOpen.set(key, !g.isOpen()); g.refresh(); });
-    g.refresh();
-    orchGroups.push(g);
+    // Expand/Collapse groups) overrides that for the rest of the session.
+    const g = makeGroupRow(tbody, {
+      key: `${run.id}:${e.step}`, step: e.step, eventLabel: "tool_call", agentCls, defaultOpen: true,
+      detailHtml: `<strong>${escapeHtml(d.tool)}</strong> →
+        <span class="orch-agent-badge ${agentCls}">${escapeHtml(agent || "write_project (file writes, no agent)")}</span>`,
+    });
+    g.tool = d.tool;
+    g.agent = agent;
+    g.endTs = null;
+    g.pending = [];   // the call's nested events, rendered together when it closes
     return g;
   };
   const finishGroup = (g, e) => {
     g.endTs = e.timestamp;
     const o = orchToolOutcome(e, records[`${e.step}:${g.tool}`]);
-    const st = g.tr.querySelector(".orch-status");
-    st.textContent = o.label;
-    st.className = `orch-status ${o.cls}`;
-    g.tr.querySelector(".orch-ms").textContent = e.duration_ms != null ? formatMs(e.duration_ms) : "";
-    g.refresh();
+    g.setOutcome(o.label, o.cls, e.duration_ms);
+  };
+  // The nested rows of a sub-agent call go in once all of them are known
+  // (the inner/outer split needs the worker's own step rows as a baseline);
+  // the next top-level row is only appended after this, so the order holds.
+  const flushGroup = (g) => {
+    if (!g || !g.pending) return;
+    renderNestedRows(tbody, g, g.pending);
+    g.pending = null;
   };
 
   let parent = null;
   run.events.forEach((e) => {
     const d = e.data || {};
-    const orch = isOrchestratorEvent(e, parent);
+    const orch = isOrchestratorEvent(e, parent, run.events);
     // An orchestrator event recorded after the open call returned closes it
     // (the `tools` wrapper step, the tool_result itself and the hand-off /
     // notebook events written from inside the tool call do not).
     if (parent && orch && e.event_type !== "tool_result" && !(e.event_type === "agent_step" && d.node === "tools") &&
         !ORCH_META_EVENTS.includes(e.event_type) &&
-        (parent.endTs == null || e.timestamp > parent.endTs)) parent = null;
+        (parent.endTs == null || e.timestamp > parent.endTs)) { flushGroup(parent); parent = null; }
 
-    if (orch && e.event_type === "tool_call") { parent = startGroup(e); return; }
+    if (orch && e.event_type === "tool_call") { flushGroup(parent); parent = startGroup(e); return; }
     if (orch && e.event_type === "tool_result" && parent && parent.tool === d.tool && parent.step === e.step) {
       finishGroup(parent, e);
       return;
@@ -1716,12 +1946,37 @@ function renderOrchestratorTimeline(tbody, run) {
       tbody.appendChild(tr);
       return;
     }
-    // Sub-agent event: graph nodes show their node name ("decide",
-    // "generate_rtl", ...) as the detail, like the standalone timelines.
-    const tr = e.event_type === "agent_step" ? eventRow(e, "node", d.node || "") : eventRow(e);
-    tbody.appendChild(tr);
-    if (parent) { tr.classList.add("orch-nested"); parent.addChild(tr); }
+    // Sub-agent event: collected under the open call (rendered by
+    // renderNestedRows); without one it is shown as a plain row.
+    if (parent) { parent.pending.push(e); return; }
+    tbody.appendChild(e.event_type === "agent_step" ? eventRow(e, "node", d.node || "") : eventRow(e));
   });
+  flushGroup(parent);   // the call still running in a live run
+}
+
+// The nested rows of one sub-agent call `g` in the orchestrator timeline: the
+// worker's steps as "node" rows (their node name as the detail, like the
+// standalone timelines), and its inner generator folded under a second-level
+// group row (see renderWorkerRows). data.path here also holds the
+// orchestrator's node(s) in front of the worker's, so the baseline is the
+// shortest path among the worker's own step rows (while only the first
+// decide's rows exist in a live run, their path is one longer than that).
+function renderNestedRows(tbody, g, events) {
+  const cfg = innerAgent(g.agent);   // null except for generate_test_vectors
+  const pathLens = (list) => list.map((e) => (e.data || {}).path).filter(Array.isArray).map((p) => p.length);
+  let lens = pathLens(events.filter((e) => e.event_type === "agent_step")), base = 0;
+  if (lens.length) base = Math.min(...lens);
+  else if ((lens = pathLens(events)).length) base = Math.max(0, Math.min(...lens) - 1);
+  renderWorkerRows(tbody, events, cfg, g.agentCls, {
+    keyPrefix: g.key, base, nodeLabel: true,
+    onRow: (tr, innerGroup) => {
+      tr.classList.add("orch-nested");
+      // Inner rows belong to their inner group (already added there); the
+      // inner group row and the worker's own rows belong to the agent group.
+      if (!innerGroup) g.addChild(tr);
+    },
+  });
+  g.refresh();   // recount now that the inner groups have their rows
 }
 
 // Only the latest showAgentRun call may touch the DOM: a redraw from an SSE
@@ -1764,14 +2019,21 @@ async function showAgentRun(runId) {
   if (whyStopped) meta.textContent += ` | Why it stopped: ${whyStopped}`;
 
   const isOrch = run.agent_name === "orchestrator";
-  $("#agent-orch-tl-tools").classList.toggle("hidden", !isOrch);
   // Clear and refill the timeline in one synchronous pass (no await between),
   // so every render replaces the rows rather than adding to them.
   const tbody = $("#agent-events");
   tbody.innerHTML = "";
+  // The worker's colour (shared with the orchestrator timeline) tints its
+  // rows and the legend's first swatch; the orchestrator view (every worker
+  // in its own colour) shows the test vector agent's yellow there.
+  tbody.className = isOrch ? "" : orchAgentClass(run.agent_name);
+  const legend = $("#agent-events-legend");
+  legend.className = `status evt-legend ${orchAgentClass(isOrch ? "test_vector_agent" : run.agent_name)}`;
   setEventContext(run);
   if (isOrch) renderOrchestratorTimeline(tbody, run);
-  else { orchGroups = []; run.events.forEach((e) => tbody.appendChild(eventRow(e))); }
+  else renderWorkerTimeline(tbody, run);
+  // Expand/Collapse groups also serve a worker's inner-generator groups.
+  $("#agent-orch-tl-tools").classList.toggle("hidden", !isOrch && !orchGroups.length);
   // Rows are in the table now: reopen the detail panels the user had open.
   evtRows.forEach((r) => r.refresh());
 
@@ -1937,11 +2199,13 @@ async function renderRunErrors(runId, run, seq) {
     const res = await fetch(`/api/agent-runs/${runId}/errors`);
     if (!res.ok) throw new Error("no data");
     data = await res.json();
-  } catch (_) { block.classList.add("hidden"); return; }
+  } catch (_) { block.classList.add("hidden"); errCtx = null; $("#agent-errors-pdf").disabled = true; return; }
   if (seq !== showRunSeq) return;
   const running = run.status === "running";
   const waiting = Boolean(agentSession && agentSession.live && agentSession.runId === runId);
   errCtx = { runId, run, data, waiting };
+  $("#agent-errors-pdf").disabled = false;
+  $("#agent-errors-pdf-status").textContent = "";
   block.classList.remove("hidden");
   block.classList.toggle("clean", data.total === 0);
   const fixedTotal = data.fixed_total || 0;
@@ -2081,6 +2345,263 @@ $("#agent-errors-block").addEventListener("click", async (ev) => {
     status.classList.add("error");
   }
 });
+
+// "Download as PDF": open a print-only copy of the report (everything
+// expanded) in a new window and let the browser's print dialog save it.
+// No server work, no new dependencies. Three visible levels:
+//   level 1 .p-req   numbered requirement, grey band
+//   level 2 .p-step  step / agent, coloured left border
+//   level 3 .p-err   one error, boxed, OPEN / FIXED / NOTE tag first
+// Print-safe tones close to the on-screen tokens: red #b42318, green #15803d, amber #b45309.
+const ERRORS_PRINT_CSS = `
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  html, body { background: #fff; color: #111; }
+  body { font-family: "Segoe UI", Arial, Helvetica, sans-serif; font-size: 11pt; line-height: 1.4; margin: 16mm 14mm; }
+  h1 { font-size: 18pt; margin: 0 0 4px; color: #111; }
+  .meta { font-size: 10.5pt; color: #374151; margin: 0 0 14px; padding-bottom: 8px; border-bottom: 2px solid #374151; }
+  .meta div { margin: 2px 0; }
+  .p-open-count { color: #b42318; font-weight: bold; }
+  .p-fixed-count { color: #15803d; font-weight: bold; }
+  .p-status { font-weight: bold; padding: 0 6px; border-radius: 3px; color: #fff; background: #6b7280; }
+  .p-status-failed { background: #b42318; }
+  .p-status-complete { background: #15803d; }
+  .p-status-review { background: #b45309; }
+  .status { color: #4b5563; font-size: 10.5pt; margin: 2px 0; }
+  .p-stop { margin: 0 0 12px; padding: 8px 10px; background: #fff4dc; border: 1px solid #d99a1a; border-left: 5px solid #b45309; color: #111; font-size: 11pt; break-inside: avoid; }
+  .p-stop b { color: #b45309; }
+  /* level 1: requirement */
+  .p-req { margin: 18px 0 6px; padding: 6px 10px; background: #e5e7eb; border-left: 5px solid #374151; font-size: 13pt; font-weight: bold; color: #111; break-after: avoid; }
+  .p-num { display: inline-block; min-width: 1.6em; color: #374151; }
+  .req-card { margin: 4px 0 8px 16px; padding: 6px 10px; border: 1px solid #cbd5e1; background: #f8fafc; font-size: 10pt; color: #374151; }
+  .req-card .req-body { max-height: none; overflow: visible; }
+  .req-label { font-weight: bold; margin-right: 4px; color: #111; }
+  .req-line { margin: 2px 0; }
+  .req-card ul { margin: 2px 0 4px; padding-left: 18px; }
+  .req-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* level 2: step / agent */
+  .p-step { margin: 10px 0 0 16px; padding: 2px 0 2px 10px; border-left: 4px solid #9ca3af; }
+  .p-step.p-step-open { border-left-color: #b42318; }
+  .p-step.p-step-clear { border-left-color: #15803d; }
+  .p-step summary { font-weight: bold; font-size: 11.5pt; color: #111; list-style: none; break-after: avoid; }
+  .p-step summary::-webkit-details-marker { display: none; }
+  .p-step.zero summary { color: #4b5563; font-weight: bold; }
+  .err-attempt { margin: 4px 0 0 10px; font-size: 10.5pt; color: #374151; }
+  .err-attempt > ul { margin: 4px 0 6px; padding-left: 14px; list-style: none; }
+  /* level 3: one error */
+  .p-err { display: block; margin: 0 0 6px; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #111; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; break-inside: avoid; page-break-inside: avoid; }
+  .p-err.p-open { border-color: #e4a3a3; background: #fdf2f2; }
+  .p-err.p-fixed { border-color: #a3d3b3; background: #f1faf4; color: #4b5563; }
+  .p-err.p-fixed .err-detail, .p-err.p-fixed .p-text { text-decoration: line-through; }
+  .p-err.p-note { border-color: #cbd5e1; background: #f8fafc; color: #4b5563; font-style: italic; }
+  .p-tag { display: inline-block; margin-right: 6px; padding: 0 6px; border-radius: 3px; font-size: 9pt; font-weight: bold; font-style: normal; color: #fff; background: #6b7280; vertical-align: 1px; text-decoration: none; }
+  .p-tag.open { background: #b42318; }
+  .p-tag.fixed { background: #15803d; }
+  .err-tag { display: inline-block; padding: 0 5px; margin: 0 4px 0 0; border-radius: 3px; font-size: 9pt; font-weight: bold; text-decoration: none; }
+  .err-tag.fixed { color: #15803d; border: 1px solid #15803d; }
+  .err-tag.carried { color: #4b5563; border: 1px solid #9ca3af; font-weight: normal; }
+  .err-code { display: inline-block; padding: 0 5px; border-radius: 3px; border: 1px solid #9ca3af; background: #fff; font-family: Consolas, "Courier New", monospace; font-size: 9.5pt; color: #111; }
+  .err-loc { display: inline-block; padding: 0 5px; margin-left: 4px; border-radius: 3px; background: #b42318; color: #fff; font-family: Consolas, "Courier New", monospace; font-size: 9.5pt; }
+  .err-detail { display: block; margin-top: 2px; }
+  .err-explain { margin: 4px 0 6px 10px; padding: 5px 8px; border-left: 3px solid #9ca3af; background: #f8fafc; color: #111; white-space: pre-wrap; overflow-wrap: anywhere; break-inside: avoid; font-size: 10.5pt; }
+  .err-explain ul { margin: 2px 0 4px; padding-left: 14px; list-style: none; }
+  .err-ok { color: #15803d; font-weight: bold; }
+  .err-badge { display: inline-block; min-width: 18px; padding: 0 6px; margin-left: 4px; border-radius: 9px; background: #b42318; color: #fff; font-size: 9.5pt; font-weight: bold; text-align: center; vertical-align: 1px; }
+  .err-badge.zero { background: #15803d; }
+  .req-toggle, button { display: none; }
+  @page { margin: 12mm; }
+`;
+
+// Colour class for the overall status word (same meaning as the on-screen badges:
+// red = failed / gave up, green = done, amber = done but needs a human look).
+function printStatusClass(status) {
+  const s = String(status || "").toLowerCase();
+  if (s.includes("fail") || s.includes("crash") || s.includes("stop")) return "p-status-failed";
+  if (s.includes("review")) return "p-status-review";
+  if (s.includes("complete") || s === "done") return "p-status-complete";
+  return "";
+}
+
+// Add the print-only classes and tags to a copy of the panel body. The
+// on-screen panel is never touched.
+function decorateErrorsCopy(copy) {
+  // Level 1: number each requirement heading.
+  copy.querySelectorAll(".err-req").forEach((el, i) => {
+    el.classList.add("p-req");
+    el.insertAdjacentHTML("afterbegin", `<span class="p-num">${i + 1}.</span> `);
+  });
+  // Level 2: colour each step by its open count (badge text "0" or class zero = clear).
+  copy.querySelectorAll("details.err-step").forEach((d) => {
+    d.classList.add("p-step");
+    const badge = d.querySelector("summary .err-badge");
+    const clear = d.classList.contains("zero") || (badge && badge.classList.contains("zero"));
+    d.classList.add(clear ? "p-step-clear" : "p-step-open");
+  });
+  // Level 3: every error line becomes a box with an OPEN / FIXED / NOTE tag first.
+  copy.querySelectorAll(".err-attempt li, .err-explain li").forEach((li) => {
+    li.classList.add("p-err");
+    let kind = "open", label = "OPEN";
+    if (li.classList.contains("fixed")) { kind = "fixed"; label = "FIXED"; }
+    else if (li.classList.contains("note")) { kind = "note"; label = "NOTE"; }
+    li.classList.add(`p-${kind}`);
+    const oldOpen = li.querySelector(".err-tag.open");   // "Still open" is now the OPEN tag
+    if (oldOpen) oldOpen.remove();
+    li.insertAdjacentHTML("afterbegin", `<span class="p-tag ${kind}">${label}</span>`);
+  });
+  // "Why it stopped" becomes an amber note box.
+  copy.querySelectorAll(":scope > .status").forEach((el) => {
+    const b = el.querySelector("b");
+    if (b && b.textContent.startsWith("Why it stopped")) el.classList.add("p-stop");
+  });
+  return copy;
+}
+
+// "YYYY-MM-DD HH:MM" in the owner's local time from an epoch-seconds number or an
+// ISO string; "" when missing or unreadable.
+function localStamp(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const d = new Date(typeof value === "number" ? value * 1000 : value);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// File name for the report: <design name>_<YYYY-MM-DD_HH-MM> (letters, digits,
+// dash, underscore only, at most 60 chars of name), else errors-<runid8>.
+function reportFileBase(runId, data) {
+  const slug = String(data.requirement_name || "").trim().toLowerCase()
+    .replace(/\s+/g, "_").replace(/[^a-z0-9_-]/g, "").replace(/_+/g, "_").replace(/^[_-]+|[_-]+$/g, "").slice(0, 60);
+  const stamp = localStamp(data.started_at).replace(" ", "_").replace(":", "-");
+  return slug && stamp ? `${slug}_${stamp}` : `errors-${runId.slice(0, 8)}`;
+}
+
+// The report as one HTML string (title block + decorated copy of the panel),
+// shared by the PDF download and the print-window fallback.
+function buildErrorsReport() {
+  const { runId, run, data } = errCtx;
+  const title = reportFileBase(runId, data);
+  const startedText = localStamp(data.started_at);
+
+  // Copy the panel body, open every folded or collapsed part, then add the print levels and tags.
+  const copy = $("#agent-errors-body").cloneNode(true);
+  copy.querySelectorAll("details").forEach((d) => d.setAttribute("open", ""));
+  copy.querySelectorAll(".req-card.folded").forEach((c) => c.classList.remove("folded"));
+  copy.querySelectorAll(".req-toggle").forEach((b) => b.remove());
+  decorateErrorsCopy(copy);
+
+  const now = new Date();
+  const when = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ` +
+    `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  // Summary line with coloured counts and status, same facts as the on-screen line.
+  const fixedTotal = data.fixed_total || 0;
+  const reqStatus = (data.requirements[0] && data.requirements[0].status) || "";
+  const overall = reqStatus || run.status || "";
+  const summary =
+    (data.total === 0 ? '<span class="p-fixed-count">No open errors</span>'
+      : `<span class="p-open-count">${data.total} open error${data.total === 1 ? "" : "s"}</span>`) +
+    (fixedTotal ? `, <span class="p-fixed-count">${fixedTotal} fixed</span>` : "") +
+    (run.status === "running" ? " so far (still running)" : ` | run ${escapeHtml(run.status || "")}`) +
+    (overall ? ` <span class="p-status ${printStatusClass(overall)}">${escapeHtml(overall)}</span>` : "");
+  const body = `<h1>Errors for the FPGA engineer</h1>` +
+    `<div class="meta">` +
+    (data.requirement_name ? `<div><b>Requirement:</b> ${escapeHtml(data.requirement_name)}</div>` : "") +
+    (startedText ? `<div><b>Run started:</b> ${escapeHtml(startedText)}</div>` : "") +
+    `<div><b>Run:</b> ${escapeHtml(runId)}${run.agent_name ? ` (${escapeHtml(run.agent_name)})` : ""}</div>` +
+    `<div><b>Summary:</b> ${summary}</div>` +
+    `<div><b>Printed:</b> ${escapeHtml(when)}</div>` +
+    `</div>` +
+    (data.total === 0 && !copy.innerHTML.trim() ? '<p class="status">No open errors were recorded for this run.</p>' : "") +
+    copy.innerHTML;
+  return { title, body };
+}
+
+// Prefix every selector in ERRORS_PRINT_CSS with the hidden container's id so the
+// report styles cannot leak onto the page while the PDF is being drawn.
+function scopePrintCss(css, prefix) {
+  return css.replace(/@page\s*\{[^}]*\}/g, "").replace(/([^{}]+)\{/g, (m, sel) => {
+    const scoped = sel.split(",").map((s) => {
+      s = s.trim();
+      if (!s) return "";
+      if (s === "html" || s === "body" || s === "html, body") return prefix;
+      return `${prefix} ${s}`;
+    }).filter(Boolean).join(", ");
+    return `${scoped} {`;
+  });
+}
+
+// Fallback when the PDF library is missing or fails: open the report in a new
+// window and let the browser's print dialog save it.
+function printErrorsReport() {
+  const note = $("#agent-errors-pdf-status");
+  if (!errCtx) { note.textContent = "Load a run first."; return; }
+  const { title, body } = buildErrorsReport();
+  const win = window.open("", "_blank");
+  if (!win) {
+    note.textContent = "Your browser blocked the print window. Allow popups for this page, then press the button again.";
+    return;
+  }
+  win.document.open();
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
+    `<style>${ERRORS_PRINT_CSS}</style></head><body>${body}</body></html>`);
+  win.document.close();
+  win.document.title = title;
+  // Short pause so the new window has laid the page out before the print dialog opens.
+  setTimeout(() => { try { win.focus(); win.print(); } catch (_) { /* window closed early */ } }, 250);
+}
+
+// Main path: draw the report in a hidden box on this page and download it as
+// errors-<runid8>.pdf with html2pdf.js (bundled in static/vendor, no internet needed).
+const PDF_RENDER_ID = "agent-errors-pdf-render";
+async function downloadErrorsPdf() {
+  const note = $("#agent-errors-pdf-status");
+  const btn = $("#agent-errors-pdf");
+  note.textContent = "";
+  if (!errCtx) { note.textContent = "Load a run first."; return; }
+  if (typeof html2pdf !== "function") {
+    note.textContent = "The PDF library did not load (static/vendor/html2pdf.bundle.min.js). Opening the print view instead.";
+    printErrorsReport();
+    return;
+  }
+  const { title, body } = buildErrorsReport();
+  const oldLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Building PDF…";
+
+  // Off-screen wrapper holding the report box (A4 width minus the 10 mm margins)
+  // with the report CSS scoped to it. Only the inner box is handed to html2pdf, so
+  // its copy is not carried off-canvas by the wrapper's offset.
+  const wrap = document.createElement("div");
+  wrap.setAttribute("aria-hidden", "true");
+  wrap.style.cssText = "position:absolute; left:-10000px; top:0; width:190mm; overflow:visible;";
+  const box = document.createElement("div");
+  box.id = PDF_RENDER_ID;
+  box.style.cssText = "width:190mm; background:#fff;";
+  box.innerHTML = `<style>${scopePrintCss(ERRORS_PRINT_CSS, "#" + PDF_RENDER_ID)}` +
+    `#${PDF_RENDER_ID} { margin:0; padding:2px; width:190mm; }` +
+    `#${PDF_RENDER_ID} .p-err, #${PDF_RENDER_ID} .err-explain, #${PDF_RENDER_ID} .p-stop, #${PDF_RENDER_ID} .p-req { page-break-inside: avoid; break-inside: avoid; }` +
+    `#${PDF_RENDER_ID} .err-explain, #${PDF_RENDER_ID} .req-text, #${PDF_RENDER_ID} .req-line { word-break: break-word; }</style>` + body;
+  wrap.appendChild(box);
+  document.body.appendChild(wrap);
+  try {
+    await html2pdf().set({
+      filename: `${title}.pdf`,
+      margin: 10,
+      image: { type: "jpeg", quality: 0.95 },
+      html2canvas: { scale: 2, useCORS: true },
+      jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+      pagebreak: { mode: ["avoid-all", "css", "legacy"] },
+    }).from(box).save();
+    note.textContent = "";
+  } catch (err) {
+    note.textContent = `Could not build the PDF (${err && err.message ? err.message : "unknown error"}). Opening the print view instead.`;
+    printErrorsReport();
+  } finally {
+    wrap.remove();
+    btn.textContent = oldLabel;
+    btn.disabled = !errCtx;
+  }
+}
+
+$("#agent-errors-pdf").addEventListener("click", downloadErrorsPdf);
 
 // Clickable suggested answers: clicking copies the text into the answer box.
 function fillAnswerOptions(suggestions) {

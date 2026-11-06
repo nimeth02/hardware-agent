@@ -274,19 +274,38 @@ def answer_agent_run(run_id: str, req: AnswerRequest) -> dict:
 def get_agent_runs(agent_name: str | None = None, limit: int = 50) -> list[dict]:
     runs = run_store.list_runs(agent_name=agent_name, limit=limit)
     if runs:
-        # list_runs drops the saved report, so read stop_reason for these runs separately.
+        # list_runs drops the saved report and input, so read stop_reason and
+        # the requirement title for these runs separately.
         from observability.run_store import _loads
         marks = ",".join("?" for _ in runs)
         with run_store._connect() as conn:
-            rows = conn.execute(f"SELECT id, final_result FROM agent_runs WHERE id IN ({marks})",
+            rows = conn.execute(f"SELECT id, final_result, input FROM agent_runs WHERE id IN ({marks})",
                                 [r["id"] for r in runs]).fetchall()
-        reasons = {}
+        reasons, titles = {}, {}
         for row in rows:
             fr = _loads(row["final_result"])
             reasons[row["id"]] = fr.get("stop_reason") if isinstance(fr, dict) else None
+            titles[row["id"]] = _requirement_title(_loads(row["input"]))
         for r in runs:
             r["stop_reason"] = reasons.get(r["id"])
+            r["requirement_title"] = titles.get(r["id"])
     return runs
+
+
+def _requirement_title(inp) -> str | None:
+    """Short name of what a run was for (Previous-runs list): the first line of
+    the requirement/spec text, else the entity or project name, else None."""
+    if not isinstance(inp, dict):
+        return None
+    if inp.get("requirement_text") or inp.get("spec_text"):
+        title = _requirement_view(inp, None)["title"]
+        return None if title == "(no text)" else title
+    spec = inp.get("spec") if isinstance(inp.get("spec"), dict) else {}
+    for key in ("entity_name", "module_name", "module", "name", "project"):
+        val = spec.get(key) or inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:200]
+    return None
 
 
 @app.get("/api/agent-runs/{run_id}")
@@ -721,7 +740,15 @@ def get_agent_run_errors(run_id: str) -> dict:
     run = run_store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    return collect_run_errors(run)
+    data = collect_run_errors(run)
+    # Two extra fields the UI uses to name the PDF: the design name (entity_name
+    # from the analysed spec, else the requirement's first line) and the start time.
+    reqs = data.get("requirements") or []
+    spec = reqs[0].get("spec") if reqs and isinstance(reqs[0].get("spec"), dict) else {}
+    name = spec.get("entity_name") if isinstance(spec.get("entity_name"), str) else None
+    data["requirement_name"] = (name or "").strip() or _requirement_title(run.get("input"))
+    data["started_at"] = run.get("started_at")
+    return data
 
 
 RUNS_DIR = (REPO_ROOT / "runs").resolve()

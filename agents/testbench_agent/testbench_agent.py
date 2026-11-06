@@ -74,7 +74,8 @@ class TestbenchAgent:
         try:
             testbench = self.tools.generator.generate(
                 state["spec"], state["rtl"], state.get("skills"), state.get("testbench"), lint_issues,
-                attempt=state.get("attempt", 1), attempt_history=state.get("attempt_history"))
+                attempt=state.get("attempt", 1), attempt_history=state.get("attempt_history"),
+                starting_testbench=state.get("previous_testbench"))
         except Exception as e:  # LLM/transport failure: end the run, don't crash the caller
             return {"status": TestbenchStatus.FAILED.value, "error": f"testbench generation failed: {e}"}
         return {"testbench": testbench, "lint": None, "error": None}
@@ -125,11 +126,14 @@ class TestbenchAgent:
 
     # ── public API ───────────────────────────────────────────────────────
     def run(self, spec: dict, rtl: dict, requirement_id: str | None = None, attempt: int = 1,
-            attempt_history: list[dict] | None = None) -> dict:
+            attempt_history: list[dict] | None = None, previous_testbench: dict | None = None) -> dict:
         """requirement_id / attempt / attempt_history: the orchestrator's note saying
         which run this call belongs to, whether it is the 1st, 2nd, ... call for it,
-        and how the earlier calls went ({attempt, status, error, issues, downstream?} each)."""
-        start = initial_state(spec, rtl, requirement_id, attempt, attempt_history)
+        and how the earlier calls went ({attempt, status, error, issues, downstream?} each).
+        previous_testbench: the testbench the earlier call delivered; a retry revises
+        it instead of starting from the spec and RTL alone. It is NOT seeded as
+        `testbench`: the planner would lint and finalize it as-is instead of regenerating."""
+        start = initial_state(spec, rtl, requirement_id, attempt, attempt_history, previous_testbench)
         problem = self.check_inputs(rtl)
         if problem:
             return agent_result_dto({**start, "status": TestbenchStatus.FAILED.value, "error": problem})
@@ -161,7 +165,7 @@ def get_agent() -> TestbenchAgent:
 
 
 def run_testbench_generation(spec: dict, rtl: dict, requirement_id: str | None = None, attempt: int = 1,
-                             attempt_history: list[dict] | None = None) -> dict:
+                             attempt_history: list[dict] | None = None, previous_testbench: dict | None = None) -> dict:
     """Returns dto.agent_result_dto: {"status", "requirement_id", "attempt", "testbench", "lint",
     "skills_used", "iteration", "decision_reason", "warnings", "error"}."""
-    return get_agent().run(spec, rtl, requirement_id, attempt, attempt_history)
+    return get_agent().run(spec, rtl, requirement_id, attempt, attempt_history, previous_testbench)

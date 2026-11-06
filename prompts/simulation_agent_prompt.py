@@ -20,6 +20,8 @@ You will receive:
   [one run_xvhdl result per file: status, stdout, stderr], "error_class"}
 - "sim": result of the simulation, when reached: {"status", "sim_passed",
   "sim_output" (the xsim log tail), "sim_time", "outcome"}
+- optionally "failing_beats", "python_check_allowed", "python_check" and
+  "fixed_rule_hint" — explained below
 
 Classify the outcome:
 
@@ -45,23 +47,73 @@ vectors or the testbench are wrong, not the design.
                    position), or the expected value in test_vectors_out.csv
                    is not what the spec gives for that stimulus.
 - "spec"         — the spec itself is ambiguous/contradictory here.
-The input may carry "failing_input_rows": the test_vectors_in.csv rows
-(every input port, as written) of the cycles the mismatch lines name
-("beat 1 (input cycle 14)" or "cycle 17: ..."). This is the stimulus the
-DUT really received. For the first one or two rows, do this arithmetic
-explicitly in "summary":
-  1. split the input word into the fields the spec defines — for
-     "port[31:20] = I" the field is floor(word / 2^20) mod 2^12, then apply
-     two's complement if the field is signed;
-  2. compute the spec's expected output from those decoded fields;
-  3. compare with the line's "got" and "expected".
-  got == spec's value  -> likely_cause "test_vectors" (the design is right
-  for what it was given; the CSV is wrong — a decoded field that is tiny
-  or wildly off, e.g. I = 1 where the model meant 256, means the golden
-  model packed it with the wrong shift). Never blame the RTL here.
-  expected == spec's value and got differs -> likely_cause "rtl".
-  Without "failing_input_rows" (no CSV in the project) use the stimulus in
-  "testbench_code" instead.
+The input may carry "failing_beats": one entry per mismatch line with
+"input_row" (the test_vectors_in.csv row that carried that beat, every
+input port as written — the stimulus the DUT really received),
+"expected_row" (the test_vectors_out.csv row the testbench compared
+against) and "input_cycle". "beat k" is matched by COUNTING beats (the
+k-th row with s_axis_tvalid = 1 after reset, the k-th row with
+m_axis_tvalid = 1), NOT by the "(input cycle N)" the testbench printed:
+that N has named the cycle the output appeared (input row + latency)
+before. Use "input_cycle" from the entry, never N from the line. An entry
+with "input_row_note" belongs to a design that produces fewer output beats
+than it receives (timing recovery): input_row is then the stimulus on the
+expected row's cycle, and the beat also depends on the rows before it, so
+a one-row check cannot settle it; say so in "summary" and never blame the
+RTL on arithmetic you cannot recompute.
+CLOSED-LOOP DESIGNS (the spec feeds an output back into the next step:
+a timing-recovery loop with TED / NCO / loop filter / interpolator and mu,
+a PLL, DLL, AGC, phase tracker or adaptive equaliser; the behavior names
+an error term e, an accumulator, gains K1 / K2 / alpha). The golden model
+computes the loop in exact double arithmetic and the RTL rounds every
+product, so one or two steps of difference on the first symbol feed back
+and move every later strobe and mu: a bit-exact compare of such a design
+can never pass, whatever the RTL does. When "testbench_code" compares the
+payload exactly (`/=` on the word, no tolerance constant) and the
+mismatches are small steps, a shifted mu, or a beat count off by a few,
+likely_cause is "testbench": it must decode the fields and compare with a
+tolerance (TOL_SYM / TOL_MU in the testbench rules) and allow the beat
+count to differ by 2 %. Never blame the RTL's loop arithmetic, NCO phase or
+Farrow coefficients for this, and never ask for the vectors to be
+regenerated bit-exact.
+
+DO NOT DO THE ARITHMETIC YOURSELF. Decoding a 32-bit word and applying
+the spec's formulas in prose has produced a different wrong answer on
+every attempt. When "python_check_allowed" is true and the verdict would
+be "fail", your reply must be ONLY:
+  {"verdict": "fail", "python_check": "<python code as one JSON string>"}
+The code runs in a fresh Python 3 with FAILING_BEATS (the "failing_beats"
+list) and SPEC (the spec) already defined; no files, no network, no
+input(). It must:
+  1. implement the spec's formulas with plain Python ints (// and >> on
+     Python ints floor like an arithmetic shift; keep the sign, never
+     mask an intermediate value with & or %);
+  2. for every entry in FAILING_BEATS decode the fields of the input word
+     at the spec's [hi:lo] positions (two's complement for signed fields),
+     compute the spec's output, and take "expected" and "got" from the
+     entry's "line" exactly as the testbench prints them (read
+     testbench_code: e.g. hi=/lo= halves of the output word);
+  3. print one readable line per beat (beat, input word, decoded fields,
+     spec value, expected, got), then exactly:
+       CHECK beat=<k> got_matches_spec=yes|no expected_matches_spec=yes|no
+You then receive the same input plus "python_check": {code, status,
+stdout, stderr}. If status is "error" or "timeout" you may return one
+corrected "python_check"; otherwise return the final verdict JSON (no
+"python_check" key). Read the CHECK lines:
+  got matches the spec on every beat and expected does not ->
+  likely_cause "test_vectors": the design is right for what it was given
+  and the golden model is wrong (a decoded field that is tiny or wildly
+  off, e.g. I = 1 where the model meant 256, means it packed the field
+  with the wrong shift; a sign flipped to the saturation value means it
+  wrapped a signed value with mod). Never blame the RTL here.
+  expected does NOT match the spec on ANY beat -> likely_cause
+  "test_vectors", whatever got shows: a golden CSV that is wrong on every
+  beat cannot judge the design, so the RTL is never blamed against it.
+  expected matches the spec and got differs -> likely_cause "rtl".
+  Quote the decoded fields and the spec's value of the first beat in
+  "summary".
+Without "failing_beats" (no CSV in the project) use the stimulus in
+"testbench_code" instead; "python_check_allowed" is then false.
 Known pattern: the vector CSVs store signed ports as their unsigned bit
 pattern (8-bit -127 is written as 129). If every mismatch on an N-bit port
 satisfies expected - 2**N = got (e.g. "expected 129 got -127",
@@ -82,6 +134,19 @@ suggested_fix. When it says every "s_axis_tready never rose (deadlock)"
 cycle is an idle row (s_axis_tvalid = 0 in test_vectors_in.csv), the
 design is not stuck: the testbench waited for a handshake on a row that
 sends no beat; likely_cause "testbench", and copy its suggested exit line.
+When it says the log compares a handshake flag cycle by cycle ("missing
+m_axis_tvalid", "unexpected m_axis_tvalid", "m_axis_tvalid expected 0 got
+'1'", "s_axis_tready expected 0 got '1'"), the testbench checks WHEN the
+design answers, which only the RTL decides (its latency L, its strobe
+pattern; a spec that says "a fixed latency L must be declared" leaves L to
+the RTL): likely_cause "testbench", never the RTL's latency, NCO phase or
+strobe logic, never the vectors; copy its beat-order fix, and treat the
+"expected X got Y" lines of such a log as compared on the wrong cycle.
+A "sim" with "log_truncated_chars" (its sim_output then starts with "[the
+Vivado server cut N chars from this log") lost part of the log at the
+tool's size limit because the testbench reported a mismatch on nearly
+every cycle: a testbench fault (print only the first 20 mismatches; on a
+streaming design compare beats in order), never a short sim_time.
 For "error", use "environment" for tool/licence/path problems, otherwise
 "testbench" for compile errors in the testbench or "rtl" for compile
 errors in the design.

@@ -45,7 +45,7 @@ enforced, not hoped for.
 | LLM | Ollama serving `qwen3-coder-next` (80B, 262k context) locally, or OpenRouter in the cloud (`LLM_PROVIDER=openrouter` + `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` in `.env`); both through the OpenAI-compatible API (`langchain-openai`) |
 | Tool servers | MCP (`mcp<2`, FastMCP) over stdio: file server (scoped read/list/write, no delete), Vivado server (`run_xvhdl`, `run_simulation`, `run_vivado_batch`), MATLAB server (`generate_matlab_script`, `run_matlab_script`) via `langchain-mcp-adapters` |
 | EDA | Xilinx Vivado 2020.1 (`xvhdl`, `xelab`, `xsim`, batch synth/impl) local, or on another machine over SSH (`VIVADO_REMOTE_*` in `.env`, needs `pip install paramiko`); MATLAB R2026a + `matlabengine` |
-| Backend / UI | FastAPI + uvicorn, Server-Sent Events for live run timelines, a Stop button that ends a live run at its next step, vanilla HTML/CSS/JS (no build step), plus an alternative Streamlit UI (`server/streamlit_app.py`) |
+| Backend / UI | FastAPI + uvicorn, Server-Sent Events for live run timelines, a Stop button that ends a live run at its next step, vanilla HTML/CSS/JS (no build step), a "Download as PDF" button for the errors report (html2pdf.js bundled in `server/static/vendor/`, no internet needed), plus an alternative Streamlit UI (`server/streamlit_app.py`) |
 | Observability | SQLite (`observability/traces.db`): LLM traces, per-node step timings, agent runs/events/tool calls (incl. the orchestrator's `agent_input` / `agent_output` / `state` events), queried from the UI |
 | Persistence | LangGraph SQLite checkpointers in `checkpoints/` (resumable spec-analysis sessions) |
 | Tests | pytest, fake tools only (no LLM, MCP, Vivado or MATLAB needed) |
@@ -60,8 +60,9 @@ skills/                 markdown rule files loaded into generator prompts (RTL: 
 mcp_servers/            file_server.py, vivado_server.py (+ vivado_env.py), matlab_server/ (matlab_server.py + matlab_engine.py)
 services/               .env config, LLM client, MCP client, checkpoint store
 observability/          tracing callback, run store, SQLite schema
-server/                 FastAPI app (server/app.py), static UI (server/static/) and Streamlit UI (server/streamlit_app.py)
+server/                 FastAPI app (server/app.py), static UI (server/static/, third-party JS in server/static/vendor/) and Streamlit UI (server/streamlit_app.py)
 projects/               example projects the simulation/implementation agents run as-is (see projects/README.md)
+docs/                   developer notes: how state is handed between orchestrator and agents (state_handover.md), RTL linter review
 tests/                  unit tests per agent
 .claude/agents/         Claude Code subagents used during development (ui-backend, project-guide, source-control)
 .claude/hooks/          Claude Code hooks: pre_commit_tests.py runs the unit tests before any git commit Claude issues
@@ -117,8 +118,9 @@ Open <http://localhost:8000>:
   result; files land in `projects/<requirement id>/`.
 - **Pipeline** tab: the same steps in a fixed order with a pause for you to
   approve the spec before RTL, test vectors and testbench are generated.
-- **Previous runs** / **Observability**: every run, step timing, prompt and
-  response is stored and searchable.
+- **Previous runs** / **Observability**: every run (with the requirement it
+  was for), step timing, prompt and response is stored and searchable; steps
+  of a nested agent are indented under the step that called it.
 
 ### 4. Test
 

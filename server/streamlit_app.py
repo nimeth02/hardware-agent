@@ -466,9 +466,9 @@ ORCH_TOOL_AGENTS = {
     "generate_testbench": "testbench_agent", "generate_test_vectors": "test_vector_agent",
     "write_project": None, "simulate": "simulation_agent", "implement": "implementation_agent",
 }
-TRUNC_NOTE = ("This text was cut when it was captured (marker in the text): the recorder stores at most 4000 chars "
-              "of a tool output and the Vivado MCP server caps console output at 4000 chars. "
-              "Raise those caps for new runs; old runs cannot be recovered.")
+TRUNC_NOTE = ("This text was cut when it was captured (marker in the text); a long simulation log keeps its first 180 KB "
+              "and its last 20 KB, so the result marker at the end is kept. "
+              "The complete log is in the project folder under work_proj/xsim.log.")
 
 
 def strip_trunc(s) -> str:
@@ -1436,11 +1436,13 @@ def history_df(runs: list[dict]) -> tuple[pd.DataFrame, list[str]]:
         if r.get("agent_status"):
             text = f"{text} · {r['agent_status']}"
         err = (r.get("error") or r.get("agent_error") or "")[:80]
+        req = r.get("requirement_title") or "-"
         rows.append({"Started": fmt_time(r.get("started_at")), "Agent": f"{r['agent_name']} v{r.get('agent_version') or ''}",
+                     "Requirement": req if len(req) <= 60 else req[:60] + "…",
                      "Status": f"{STATUS_LABEL.get(raw, raw)} ({text})" if text else "",
                      "Duration": fmt_ms(r["duration_ms"]) if r.get("duration_ms") is not None else "-",
                      "Error": err, "_raw": raw})
-    return pd.DataFrame(rows, columns=["Started", "Agent", "Status", "Duration", "Error", "_raw"]), [r["id"] for r in runs]
+    return pd.DataFrame(rows, columns=["Started", "Agent", "Requirement", "Status", "Duration", "Error", "_raw"]), [r["id"] for r in runs]
 
 
 def render_history(agent_name: str):

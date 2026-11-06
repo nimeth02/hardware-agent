@@ -41,6 +41,12 @@ only when Vivado is reachable):
 | 16 | `x * 4` / `x * to_signed(4, N)` on a vector target (a shift written as a multiply; doubles the width) | regex on assignments, every statement position | `power_of_two_multiply` |
 | 17 | Any `target <= expr` whose computable widths differ (`+`/`-` = widest operand, `*` = sum, `&` = sum, resize/shift/abs) | `rtl_widths.py` width arithmetic | `assignment_width` |
 | 15 | Smoke dry run, output streams (`*tvalid`/`*tdata`/`*tready`): data 0 on every accepted beat, data moved while stalled, valid never rose | Vivado xsim, `SMOKE_STATS` line | `smoke_output_stuck_at_zero`, `smoke_stream_data_changed_while_stalled`, `smoke_output_never_valid` |
+| 18 | A loop value that goes round the pipeline rows (`eta_s1 <= eta_s11` with eta computed down the rows): K separate loops | signal-level dataflow cycle across two or more stage rows | `loop_state_ring` |
+| 19 | A loop value that only goes round a ring and is never computed (keeps its reset value) | regex on `_s1 <= _sK` + write scan | `loop_value_never_computed` |
+| 20 | Output valid taken from the bare last valid bit when the spec outputs on a strobe | regex + spec text | `output_valid_without_strobe` |
+| 21 | A `to_signed`/`to_unsigned` value outside its width, or an `if` compare that can never be true | `rtl_widths` constant evaluation | `literal_width` |
+| 22 | A loop register (reset, read back, depends on its own past) loaded from row K without `valid_pipe(K-1)`: no gate, an earlier bit, or a later bit | dataflow cycle + condition stack per statement | `state_read_before_valid`, `state_read_after_valid` |
+| 23 | A history chain (same-row copies `x1_s2 <= x0_s2`) with neither a reset nor an initial value | same-row copy scan + reset branch / declaration scan | `history_chain_not_reset` |
 
 The design *rules* the LLM is asked to follow (registered outputs, one
 arithmetic step per line, `_i` shadow signals for outputs, numeric_std only,
@@ -82,7 +88,7 @@ Rules applied only when the spec says VHDL-93:
   - `u1 : entity work.sub port map (...)` → flagged
   - `g1: for i in 0 to 3 generate` → flagged
   - `p2: process(clk)` (a second labelled process) → flagged
-  This affects every multi-process design with labels. We will fix it (anchor on `process` not preceded by `end`); listed here so you know the current reports may contain it.
+  This affects every multi-process design with labels. **Fixed 2026-10-30:** `end process` is blanked before the scan, so only a real declarative region (process start to its `begin`) is examined. Reports before that date may contain it (timing_recovery, 12:59: seven rounds).
 
 ### 2.6 `unbalanced_parentheses`
 - Blanks string and character literals, strips comments, then walks the text: a `)` with no open `(` in the current statement, or a `(` still open when the text ends, is reported once with the counts and the first line of the statement. A statement ends at `;` **outside** parentheses, so a port list is one statement.
@@ -93,6 +99,7 @@ Rules applied only when the spec says VHDL-93:
 - Collects widths from `signal|variable NAME : unsigned|signed|std_logic_vector(H downto L)` with numeric bounds. For each `target <= A * B;` / `:=` with exactly one `*` at top level, infers width(A) and width(B) from: names, slices `x(7 downto 0)`, `resize(x, N)`, `to_signed/to_unsigned(v, N)`, `signed(...)`/`unsigned(...)`/`std_logic_vector(...)` wrappers, `'x'` and `"..."` literals, `&` concatenation.
 - Reports when `width(target) ≠ width(A) + width(B)`; silent whenever any width is unknown (generic bounds, integer operands, constants, `a * b + c`, `resize(a*b, N)`).
 - Motivation: numeric_std `*` returns `L'length + R'length` bits; a narrower target compiles but stops xsim with "Array sizes do not match".
+- Plain shape `p <= a * b` (two declared names, no wrapper): the product must also be *declared* from the factors' width names (`signed(A_W+B_W-1 downto 0)`). A typed-in `signed(31 downto 0)` is reported even when the number is right, and the fix text names the constants to declare (a trailing `_sN` stage suffix is dropped so stage copies share one constant). Added 2026-11-05: every run drafted 30 bits for a 14 x 18 product and 26 for 13 x 14, fixed them with new typed numbers, and the same slip returned the next run and after each widening. Wrapped factors (`resize(..)`, `signed('0' & x)`) keep the exact-number fix.
 - Question: is "target must be exactly L+R" the right rule, or should an explicit wider target (e.g. one guard bit) be accepted? Today a *wider* target is also flagged.
 
 ### 2.8 `multiple_drivers`

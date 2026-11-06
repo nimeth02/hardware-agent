@@ -29,7 +29,6 @@ from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import gu
 from agents.test_vector_agent.test_vector_generator_agent.matlab_session import current_session
 from agents.test_vector_agent.test_vector_generator_agent.state import (
     MAX_AGENT_STEPS,
-    MAX_RUN_FAILURES,
     RunAttemptsExceeded,
     failure_result,
     new_run_state,
@@ -118,7 +117,7 @@ class TestVectorGenerator:
                 config={"callbacks": [handler], "recursion_limit": MAX_AGENT_STEPS},
             )
         except RunAttemptsExceeded as e:
-            summary = failure_result(f"Gave up after {MAX_RUN_FAILURES} failed MATLAB runs.", f"Last MATLAB error: {e}")
+            summary = failure_result(e.reason, f"Last MATLAB error: {e}")
         except GraphRecursionError:
             summary = failure_result(f"Agent did not finish within {MAX_AGENT_STEPS} steps.")
         else:

@@ -65,14 +65,17 @@ class SimulationProjectLoader:
                     raise RuntimeError(f"spec.json is not valid JSON: {e}") from e
 
             test_vectors = [n for n in root_files if n.lower().endswith(".csv")]
-            test_vectors_in_csv = None
+            test_vectors_in_csv = test_vectors_out_csv = None
             for csv_name in test_vectors:
                 content = await read(csv_name)
+                # both kept for the analyst: the stimulus row and the expected
+                # row of each failing beat let it recompute the spec's answer
+                # for what the design was really given and compare it with
+                # both sides (simulation_analyst.failing_beats)
                 if csv_name.lower() == "test_vectors_in.csv":
-                    # kept for the analyst: the stimulus rows of the failing
-                    # beats let it recompute the spec's answer for what the
-                    # design was really given (simulation_analyst.failing_input_rows)
                     test_vectors_in_csv = content
+                elif csv_name.lower() == "test_vectors_out.csv":
+                    test_vectors_out_csv = content
                 # xsim runs with work_proj/ as cwd: put the CSVs where a
                 # relative open() in the testbench will find them.
                 out = text(await tools["write_file"].ainvoke(
@@ -89,5 +92,6 @@ class SimulationProjectLoader:
             "spec": spec,
             "test_vectors": test_vectors,
             "test_vectors_in_csv": test_vectors_in_csv,
+            "test_vectors_out_csv": test_vectors_out_csv,
             "testbench_code": testbench_code,
         }

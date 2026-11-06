@@ -119,11 +119,19 @@ REQUIRED PATTERNS
 - Multiplication width: `unsigned * unsigned` (and `signed * signed`) is
   as wide as BOTH inputs added together (26 bits * 8 bits = 34 bits). The
   target must have exactly that width. xvhdl compiles a narrower or wider
-  target, but the simulation stops with "array size mismatch". Declare the
-  product at full width, then trim it afterwards:
-    signal prod : unsigned(33 downto 0);          -- 26 + 8
-    prod  <= a * b;                               -- a: 26 bits, b: 8 bits
+  target, but the simulation stops with "array size mismatch". Write every
+  width of a multiply as a NAME, never as a typed-in number: a width
+  constant for each input, the product as their sum. Declare the product
+  at that full width, then trim it afterwards:
+    constant A_W : integer := 26;                 -- width of a
+    constant B_W : integer := 8;                  -- width of b
+    signal a    : unsigned(A_W-1 downto 0);
+    signal b    : unsigned(B_W-1 downto 0);
+    signal prod : unsigned(A_W+B_W-1 downto 0);   -- always A_W + B_W
+    prod  <= a * b;
     small <= resize(prod, 20);                    -- trim as a separate step
+  To widen an input later, change its constant only; the product follows
+  (a typed-in `(33 downto 0)` stays 34 bits and breaks the dry run).
   The same holds for `+`/`-` after `resize`: size both sides explicitly.
   Never mix widths inside `a * (b & "000000")`; count the bits of every
   operand first.
@@ -227,3 +235,8 @@ not combinational logic. Pattern:
 
 The bare `data_out <= ...` assignment at the end is fine — it's just
 naming. The flop is the `data_out_reg <= ...` inside the process.
+Joining last-row registers with `&` (`m_axis_tdata <= std_logic_vector(b3_s6 & b2_s6)`)
+or gating a registered valid with the registered strobe of the same row
+(`m_axis_tvalid_i <= valid_pipe(9) and strobe_s10`) counts as registered: one
+gate after flip-flops is fine. Do not add a `data_out_reg` for that; it makes
+the valid chain one stage short (valid_data_length_mismatch).

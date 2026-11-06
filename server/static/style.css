@@ -247,10 +247,41 @@ tr.orch-nested td:nth-child(3) { font-family: ui-monospace, Consolas, monospace;
 .orch-agent-spec_analyzer { --agent-color: #2f6fed; }
 .orch-agent-rtl_agent { --agent-color: #7c3aed; }
 .orch-agent-testbench_agent { --agent-color: #0d9488; }
-.orch-agent-test_vector_agent { --agent-color: #d97706; }
+.orch-agent-test_vector_agent { --agent-color: #eab308; } /* yellow; its inner MATLAB loop is orange (--inner-color) */
+.orch-agent-badge.orch-agent-test_vector_agent { color: #422006; } /* dark text: white on yellow is unreadable */
 .orch-agent-simulation_agent { --agent-color: #db2777; }
 .orch-agent-implementation_agent { --agent-color: #059669; }
 .orch-agent-none { --agent-color: #6b7280; }
+/* Inner-generator rows (a worker's own timeline and the orchestrator's): the
+   AI + tool loop running inside one worker step is indented like orch-nested
+   rows, folded under an evt-inner-group row, and coloured orange
+   (--inner-color) so it stands apart from the worker's own colour band. */
+.events-table, .evt-legend { --inner-color: #ea580c; }
+tr.evt-inner { background: color-mix(in srgb, var(--inner-color) 7%, transparent); }
+tr.evt-inner:hover { background: color-mix(in srgb, var(--inner-color) 12%, transparent); }
+tr.evt-inner td:first-child { padding-left: 24px; color: var(--muted); box-shadow: inset 4px 0 0 var(--inner-color); }
+tr.evt-inner td:nth-child(2) { padding-left: 24px; color: var(--muted); font-size: 12px; }
+tr.evt-inner-step td:nth-child(2) { font-style: italic; }
+tr.evt-detail.evt-inner > td { background: color-mix(in srgb, var(--inner-color) 4%, transparent); box-shadow: inset 4px 0 0 var(--inner-color); }
+/* The inner group row: orange band/tint/badge; inside the orchestrator's
+   agent group it sits one level in (orch-nested) and its rows one more. */
+tr.orch-group.evt-inner-group { background: color-mix(in srgb, var(--inner-color) 8%, transparent); }
+tr.orch-group.evt-inner-group td { border-top-color: var(--inner-color); }
+tr.orch-group.evt-inner-group td:first-child { box-shadow: inset 4px 0 0 var(--inner-color); }
+.orch-agent-badge.evt-inner-badge { background: var(--inner-color); color: #fff; }
+tr.orch-nested.evt-inner td:first-child, tr.orch-nested.evt-inner td:nth-child(2) { padding-left: 44px; }
+.evt-legend { margin-top: 6px; }
+.evt-legend-swatch.evt-legend-inner { --agent-color: var(--inner-color); margin-left: 10px; }
+.evt-legend-swatch {
+  display: inline-block;
+  width: 22px;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--agent-color, var(--muted)) 12%, transparent);
+  box-shadow: inset 4px 0 0 var(--agent-color, var(--muted));
+}
 .sim-text { font-size: 13px; color: var(--text); white-space: pre-wrap; }
 /* Event timeline (every agent and the orchestrator): fixed column widths so
    a long payload never widens the page; the summary is one ellipsised line
@@ -327,6 +358,9 @@ table.state-diff td pre { margin: 0; max-height: 220px; overflow: auto; white-sp
   tr.orch-nested td:first-child, tr.orch-nested td:nth-child(2) { padding-left: 10px; }
   tr.orch-top td:first-child, tr.orch-group td:first-child, tr.orch-nested td:first-child { box-shadow: none; }
   tr.orch-top, tr.orch-group, tr.orch-nested { box-shadow: inset 4px 0 0 var(--agent-color, var(--text)); }
+  tr.evt-inner td:first-child, tr.evt-inner td:nth-child(2), tr.orch-nested.evt-inner td:first-child, tr.orch-nested.evt-inner td:nth-child(2) { padding-left: 10px; }
+  tr.evt-inner td:first-child, tr.evt-detail.evt-inner > td, tr.orch-group.evt-inner-group td:first-child { box-shadow: none; }
+  tr.evt-inner, tr.orch-group.evt-inner-group { box-shadow: inset 4px 0 0 var(--inner-color); }
   .evt-summary { max-width: 100%; }
 }
 /* Implementation metrics: a compact, non-clickable key/value table. */
@@ -434,6 +468,8 @@ details.msg-block summary { cursor: pointer; font-family: -apple-system, Segoe U
 .errors-panel { margin-top: 12px; border: 1px solid var(--border); border-left: 4px solid var(--error); border-radius: 6px; padding: 12px; background: var(--panel); }
 .errors-panel.clean { border-left-color: var(--ok); }
 .errors-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.errors-head .pdf-btn { margin-left: auto; }
+.errors-head .pdf-btn:disabled { color: var(--muted); border-color: var(--border); }
 .err-req { margin-top: 10px; font-weight: 600; }
 .err-step { margin: 6px 0 0 8px; }
 .err-step summary { cursor: pointer; font-weight: 600; }

@@ -131,8 +131,10 @@ COMMON COMPILE ERRORS AND HOW TO AVOID THEM
   pipeline stage mixes std_logic, signed and unsigned.
 - Multiplying signed by unsigned is not defined: convert the unsigned
   operand first, e.g. `a * signed('0' & b)` where `a : signed`, and give
-  the product a signal/variable of exactly `a'length + b'length + 1` bits
-  (or `resize` it). Do not nest conversions of unresolved width such as
+  the product a signal/variable of exactly A_W + B_W + 1 bits, written with
+  the width constants of a and b (`signed(A_W+B_W downto 0)`), never a
+  typed-in number and never `a'length` (the linter cannot read `'length`,
+  so it could no longer check that product); then `resize` it. Do not nest conversions of unresolved width such as
   `signed('0' & x(3 downto 0))` inside an expression the compiler cannot
   type; put the converted value in a named variable first.
 - `-x` on a `signed` is fine; on an `unsigned` it is not. Negate as signed,
@@ -207,3 +209,8 @@ not combinational logic. Pattern:
 
 The bare `data_out <= ...` assignment at the end is fine — it's just
 naming. The flop is the `data_out_reg <= ...` inside the process.
+Joining last-row registers with `&` (`m_axis_tdata <= std_logic_vector(b3_s6 & b2_s6)`)
+or gating a registered valid with the registered strobe of the same row
+(`m_axis_tvalid_i <= valid_pipe(9) and strobe_s10`) counts as registered: one
+gate after flip-flops is fine. Do not add a `data_out_reg` for that; it makes
+the valid chain one stage short (valid_data_length_mismatch).

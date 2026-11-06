@@ -113,12 +113,16 @@ def _prompt_version(messages: list[BaseMessage]) -> str | None:
 
 # Full payloads (tool inputs/outputs) are kept up to this size so the UI can
 # show the complete xsim/xvhdl log; the short *_preview fields stay small.
-FULL_PAYLOAD_LIMIT = 200_000
+# Above the Vivado server's own 200 KB log cap, so a capped simulation result
+# (log plus its status fields) is stored whole; anything larger keeps its
+# head AND its tail, where a testbench prints its result marker and totals.
+FULL_PAYLOAD_LIMIT = 300_000
+PAYLOAD_TAIL = 20_000
 
 
-def _preview(value: Any, limit: int = FULL_PAYLOAD_LIMIT) -> Any:
+def _preview(value: Any, limit: int = FULL_PAYLOAD_LIMIT, tail: int = PAYLOAD_TAIL) -> Any:
     if isinstance(value, str) and len(value) > limit:
-        return value[:limit] + f"... [truncated {len(value) - limit} chars]"
+        return value[:limit - tail] + f"... [truncated {len(value) - limit} chars in the middle] ..." + value[-tail:]
     return value
 
 
@@ -140,6 +144,17 @@ class AgentRunRecorder(BaseCallbackHandler):
         if self.stop.is_set():
             raise RunStopped(STOP_MESSAGE)
 
+    def _open_path(self) -> list[str]:
+        """Names of the graph nodes currently running, outermost first. A
+        nested agent (the test-vector generator inside `generate_vectors`,
+        say) makes this ["generate_vectors", "model"]; the UI uses it to
+        indent inner steps under the outer one. Nodes run one at a time in
+        these agents, so insertion order is nesting order."""
+        return [o["name"] for o in self._open.values() if o.get("kind") == "step"]
+
+    def _event(self, o: dict, event_type: EventType, ms: float | None, status: str, data: dict) -> None:
+        self.store.add_event(self.run_id, event_type, o["step"], ms, status, {**data, "path": o.get("path", [])})
+
     # ── graph nodes → AGENT_STEP ─────────────────────────────────────────
     def on_chain_start(self, serialized: dict[str, Any], inputs: dict[str, Any], *, run_id: UUID,
                        parent_run_id: UUID | None = None, metadata: dict[str, Any] | None = None,
@@ -150,25 +165,24 @@ class AgentRunRecorder(BaseCallbackHandler):
         parent = self._open.get(str(parent_run_id)) if parent_run_id else None
         if parent and parent.get("kind") == "step" and parent["name"] == metadata["langgraph_node"]:
             return  # LangGraph wraps a node's callable in a second run with the same metadata
-        self._open[str(run_id)] = {"kind": "step", "name": metadata["langgraph_node"],
+        self._open[str(run_id)] = {"kind": "step", "name": metadata["langgraph_node"], "path": self._open_path(),
                                    "step": self._next_step(), "t0": time.perf_counter()}
 
     def on_chain_end(self, outputs: Any, *, run_id: UUID, **kwargs: Any) -> None:
         o = self._open.pop(str(run_id), None)
         if o:
-            self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], self._ms(o), "ok", {"node": o["name"]})
+            self._event(o, EventType.AGENT_STEP, self._ms(o), "ok", {"node": o["name"]})
 
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         o = self._open.pop(str(run_id), None)
         if not o:
             return
         if isinstance(error, GraphInterrupt):
-            self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], self._ms(o), "interrupted", {"node": o["name"]})
+            self._event(o, EventType.AGENT_STEP, self._ms(o), "interrupted", {"node": o["name"]})
         elif isinstance(error, RunStopped):
-            self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], self._ms(o), "stopped", {"node": o["name"]})
+            self._event(o, EventType.AGENT_STEP, self._ms(o), "stopped", {"node": o["name"]})
         else:
-            self.store.add_event(self.run_id, EventType.ERROR, o["step"], self._ms(o), "error",
-                                 {"node": o["name"], "error": str(error)})
+            self._event(o, EventType.ERROR, self._ms(o), "error", {"node": o["name"], "error": str(error)})
 
     # ── LLM calls ────────────────────────────────────────────────────────
     def on_chat_model_start(self, serialized: dict[str, Any], messages: list[list[BaseMessage]], *,
@@ -177,6 +191,7 @@ class AgentRunRecorder(BaseCallbackHandler):
         kw = (serialized or {}).get("kwargs") or {}
         msgs = messages[0] if messages else []
         self._open[str(run_id)] = {"kind": "llm", "step": self._next_step(), "t0": time.perf_counter(),
+                                   "path": self._open_path(),
                                    "model": kw.get("model") or kw.get("model_name"),
                                    "input": [_message_to_dict(m) for m in msgs],
                                    "prompt_version": _prompt_version(msgs)}
@@ -194,11 +209,11 @@ class AgentRunRecorder(BaseCallbackHandler):
                                 usage.get("prompt_tokens"), usage.get("completion_tokens"), ms, "ok", None)
         # Token counts go on the event too, so the live timeline can show the
         # context size of every call without waiting for the full llm_calls record.
-        self.store.add_event(self.run_id, EventType.LLM_CALL, o["step"], ms, "ok",
-                             {"model": o["model"], "tool_calls": [t.get("name") for t in output.get("tool_calls", [])],
-                              "input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens"),
-                              "messages": len(o["input"]),
-                              "output_preview": _preview(str(output.get("content", "")), 200)})
+        self._event(o, EventType.LLM_CALL, ms, "ok",
+                    {"model": o["model"], "tool_calls": [t.get("name") for t in output.get("tool_calls", [])],
+                     "input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens"),
+                     "messages": len(o["input"]),
+                     "output_preview": _preview(str(output.get("content", "")), 200)})
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         o = self._open.pop(str(run_id), None)
@@ -207,7 +222,7 @@ class AgentRunRecorder(BaseCallbackHandler):
         ms = self._ms(o)
         self.store.add_llm_call(self.run_id, o["step"], o["model"], o["prompt_version"], o["input"], None,
                                 None, None, ms, "error", str(error))
-        self.store.add_event(self.run_id, EventType.ERROR, o["step"], ms, "error", {"llm_error": str(error)})
+        self._event(o, EventType.ERROR, ms, "error", {"llm_error": str(error)})
 
     # ── tool calls ───────────────────────────────────────────────────────
     def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: UUID,
@@ -215,10 +230,9 @@ class AgentRunRecorder(BaseCallbackHandler):
         self._check_stop()
         name = (serialized or {}).get("name") or "tool"
         o = {"kind": "tool", "name": name, "step": self._next_step(), "t0": time.perf_counter(),
-             "input": inputs if inputs is not None else input_str}
+             "path": self._open_path(), "input": inputs if inputs is not None else input_str}
         self._open[str(run_id)] = o
-        self.store.add_event(self.run_id, EventType.TOOL_CALL, o["step"], None, "started",
-                             {"tool": name, "input": _preview(o["input"])})
+        self._event(o, EventType.TOOL_CALL, None, "started", {"tool": name, "input": _preview(o["input"])})
 
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
         o = self._open.pop(str(run_id), None)
@@ -227,8 +241,7 @@ class AgentRunRecorder(BaseCallbackHandler):
         content = getattr(output, "content", output)
         ms = self._ms(o)
         self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], _preview(content), ms, "ok", None)
-        self.store.add_event(self.run_id, EventType.TOOL_RESULT, o["step"], ms, "ok",
-                             {"tool": o["name"], "output_preview": _preview(str(content), 300)})
+        self._event(o, EventType.TOOL_RESULT, ms, "ok", {"tool": o["name"], "output_preview": _preview(str(content), 300)})
 
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         o = self._open.pop(str(run_id), None)
@@ -237,27 +250,25 @@ class AgentRunRecorder(BaseCallbackHandler):
         ms = self._ms(o)
         if isinstance(error, RunFinished):
             self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], str(error), ms, "finished", None)
-            self.store.add_event(self.run_id, EventType.TOOL_RESULT, o["step"], ms, "finished",
-                                 {"tool": o["name"], "output_preview": str(error)})
+            self._event(o, EventType.TOOL_RESULT, ms, "finished", {"tool": o["name"], "output_preview": str(error)})
             return
         if isinstance(error, RunStopped):
             self._close_stopped(o)
             return
         self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], None, ms, "error", str(error))
-        self.store.add_event(self.run_id, EventType.ERROR, o["step"], ms, "error", {"tool": o["name"], "error": str(error)})
+        self._event(o, EventType.ERROR, ms, "error", {"tool": o["name"], "error": str(error)})
 
     def _close_stopped(self, o: dict) -> None:
         """Record a tool call / LLM call / node that was open when the run stopped."""
         ms = self._ms(o)
         if o["kind"] == "tool":
             self.store.add_tool_call(self.run_id, o["step"], o["name"], o["input"], None, ms, "stopped", STOP_MESSAGE)
-            self.store.add_event(self.run_id, EventType.TOOL_RESULT, o["step"], ms, "stopped",
-                                 {"tool": o["name"], "output_preview": STOP_MESSAGE})
+            self._event(o, EventType.TOOL_RESULT, ms, "stopped", {"tool": o["name"], "output_preview": STOP_MESSAGE})
         elif o["kind"] == "llm":
             self.store.add_llm_call(self.run_id, o["step"], o["model"], o["prompt_version"], o["input"], None,
                                     None, None, ms, "stopped", STOP_MESSAGE)
         else:
-            self.store.add_event(self.run_id, EventType.AGENT_STEP, o["step"], ms, "stopped", {"node": o["name"]})
+            self._event(o, EventType.AGENT_STEP, ms, "stopped", {"node": o["name"]})
 
     def close_all_stopped(self) -> None:
         """RunStopped is a BaseException, which some LangChain wrappers do not

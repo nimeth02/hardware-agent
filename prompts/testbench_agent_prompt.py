@@ -47,9 +47,11 @@ For every request:
    and width.
 3. Generate the clock as specified (use "frequency_mhz" if given, else
    100 MHz). The reset comes from the vectors (its column), not from you.
-4. REPLAY the CSVs (see the TEST-VECTOR REPLAY rule; for a design with
-   s_axis_tvalid/m_axis_tvalid handshakes use the STREAMING DESIGNS rule
-   instead: compare output beats in order, not cycle by cycle): derive each file's
+4. REPLAY the CSVs (see the TEST-VECTOR REPLAY rule; for a design whose
+   ports include s_axis_tvalid AND m_axis_tvalid use the STREAMING DESIGNS
+   rule instead, also when it has no m_axis_tready or s_axis_tready port:
+   compare output beats in order, never the valid/ready flags or the data
+   cycle by cycle — the cycle the design answers on is its own): derive each file's
    column order from the spec's ports; per cycle read one row from each
    file (check their cycle numbers agree), drive the inputs, and after the
    rising edge compare every output with the outputs row. The CSVs are
@@ -59,9 +61,11 @@ For every request:
    or later values land in the wrong variables. A port of 32 bits or more
    must be read with the read_wide procedure from the WIDE PORTS rule,
    never into an `integer` (textio's integer read stops at 2**31-1).
-5. Count the mismatches, report each one with severity error, and at the
-   end print EXACTLY one of these two marker lines — the simulation runner
-   greps for them verbatim:
+5. Count every mismatch, but print only the FIRST 20 of them with severity
+   error (a report on every cycle makes the log so long that the tool has
+   to cut it, and the evidence of the first mismatches is lost), then one
+   line with the total, and at the end print EXACTLY one of these two
+   marker lines — the simulation runner greps for them verbatim:
      SIMULATION PASSED
      SIMULATION FAILED
    (`report "SIMULATION PASSED" severity note;` — never use severity
@@ -97,6 +101,48 @@ They are mandatory: naming, DUT hookup, result markers and run control
 must follow them exactly.
 
 """
+
+
+# Appended last, on every call, when the spec is a streaming design
+# (s_axis_tvalid and m_axis_tvalid among its ports; testbench_linter.
+# streaming_shape decides). On 2026-11-03 the first draft for timing_recovery
+# was a copy of the counter pattern from TEST-VECTOR REPLAY: every output and
+# both handshake flags compared with the current outputs row, cycle by cycle.
+# The same three findings (streaming_row_compare, streaming_no_handshake_compare,
+# streaming_flag_cycle_compare) opened each of the four runs from 2026-10-30
+# to 2026-11-03: the streaming rule sat as a bracket inside step 4, and the
+# rules file had a complete counter testbench but only a gappy streaming sketch. {PAYLOAD} and
+# {WIRES} are filled in by testbench_generator.streaming_hint.
+TESTBENCH_STREAMING_HINT = """
+
+THIS DESIGN IS A STREAMING DESIGN (its ports include s_axis_tvalid and
+m_axis_tvalid). Write the testbench by copying the
+COMPLETE STREAMING TESTBENCH from the STREAMING DESIGNS rule
+and change only the entity name, the ports, their widths and the CSV
+columns. Do NOT use the counter pattern of TEST-VECTOR REPLAY, and ignore
+"after the rising edge compare every output with the outputs row" in
+step 4: that is for designs without a stream handshake. For this design:
+- One expected-beat array per payload column: {PAYLOAD}. Fill them from the
+  outputs rows with m_axis_tvalid = 1, in order, before replaying the inputs.
+- Every rising edge goes through next_edge, which compares the DUT's beat
+  with the next expected beat. Never compare an output with the CURRENT
+  outputs row (v_m_axis_tdata, v_m_axis_tuser, ...).
+- Never compare s_axis_tready or m_axis_tvalid with the CSV, and never
+  report "missing m_axis_tvalid" or "unexpected m_axis_tvalid".
+{WIRES}
+"""
+
+# The {WIRES} lines of TESTBENCH_STREAMING_HINT, one per handshake wire.
+STREAMING_NO_M_TREADY = """- This spec has NO m_axis_tready port: keep the example's guard
+  `if dut_m_axis_tvalid = '1' then` and do not declare, drive or read
+  m_axis_tready anywhere (it does not exist, so it does not compile)."""
+STREAMING_WITH_M_TREADY = """- This spec HAS an m_axis_tready port (an input, so a column of the inputs
+  file): make the "WITH AN m_axis_tready PORT" changes listed under the
+  example; the guard in next_edge becomes
+  `if dut_m_axis_tvalid = '1' and dut_m_axis_tready = '1' then`."""
+STREAMING_NO_S_TREADY = """- This spec has NO s_axis_tready port: make the "WITHOUT AN s_axis_tready
+  PORT" changes listed under the example (no hold loop: every inputs row
+  lasts exactly one edge)."""
 
 
 # Appended when regenerating after the linter reported problems.
@@ -141,6 +187,18 @@ marker) and "suggested_fix" says what to change. Fix that first — a clean
 lint was not enough last time. Remember the expected values come from
 test_vectors_out.csv: fix how the testbench reads, times and compares them,
 not the values themselves.
+A "downstream" note may carry "fixed_rule": a reading of the log made by
+code, not by a model (a handshake flag compared cycle by cycle, a log cut
+at the size limit, a hold loop that waits on idle rows). It overrides the
+note's own "summary" and "suggested_fix": do exactly what it says first.
+A "downstream" note may also carry the evidence itself: "failing_beats",
+one entry per failing output beat with "input_row" (the test_vectors_in.csv
+row that carried the beat), "expected_row" (the test_vectors_out.csv row
+the testbench compared against) and "line" (the log line as printed); and
+"log_excerpt", the first error lines of the simulation (or compiler) log.
+Use them to check which CSV row your compare really used and when: if
+"line" names a beat or cycle whose "expected_row" is not the row the spec's
+latency and handshake put there, the compare timing or row order is wrong.
 A "downstream" note with "second_opinion": true means the RTL was blamed
 first and rewritten without effect, so the fault may be in this testbench
 after all: check what its "summary" asks for (compare order, latency,
@@ -149,6 +207,28 @@ running the flow said to do. Follow it.
 
 Avoid every listed problem from the start of this testbench. A testbench
 that repeats any of them will be rejected again.
+"""
+
+
+# Appended on a retry when the orchestrator also hands over the testbench
+# the previous call delivered: revise that code, do not write a new one.
+TESTBENCH_REVISE_ADDENDUM = """
+
+The user message also carries "previous_code": the testbench your previous
+attempt delivered. It compiled and passed lint; it failed only on what
+"attempt_history" reports (usually a "downstream" simulation failure).
+REVISE that code, do not start again:
+- Edit "previous_code" in place and return the SAME file with only the
+  parts the reported failures need changed. Keep the entity name, the DUT
+  instance, the CSV reading, the clock and reset, and every compare that
+  was not reported as wrong.
+- Trace each reported failure to the lines that cause it (the compare
+  timing, the row order, a file name, a missing handshake input) and change
+  those; do not rewrite working parts in a new style, that only adds new
+  mistakes.
+- Keep the testbench-rule skills satisfied in the parts you touch.
+- If a failure cannot be fixed without restructuring one process (for
+  example the compare loop), change that one part and say so in "notes".
 """
 
 

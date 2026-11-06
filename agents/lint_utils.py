@@ -15,8 +15,15 @@ _QUOTED_RE = re.compile(r"'(\w+)'")
 # errors about the same symbols and the statements around them. Those kinds
 # are never the root cause; the first error of the region is.
 _FOLLOW_ON_RE = re.compile(
-    r"is not a variable|is illegal in an expression|is not declared|is not a signal"
+    r"is not a variable|is illegal in an expression|is not a signal"
     r"|syntax error near '(?:begin|end|if|then|else|;|\)|,)'", re.IGNORECASE)
+# "'mu_s1' is not declared" is a follow-on only when a broken declaration (a
+# kept error that is not itself a missing name) sits in the same region.
+# Seven different missing names are seven root errors: timing_recovery
+# 16:03 (2026-11-02) showed one, hid six, and two fix rounds changed nothing.
+_UNDECLARED_RE = re.compile(r"is not declared", re.IGNORECASE)
+# the summary xvhdl prints after any error: never information on its own
+_ALWAYS_HIDDEN_RE = re.compile(r"ignored due to previous errors", re.IGNORECASE)
 CASCADE_WINDOW = 40          # lines after a kept error within which follow-ons are hidden
 
 
@@ -24,27 +31,34 @@ def collapse_follow_on_errors(errors: list[tuple[int | None, str]]) -> tuple[lis
     """Keep the root compiler errors, hide their follow-ons. `errors` are
     (line number or None, text) in compiler order. An error is a follow-on
     when it comes within CASCADE_WINDOW lines of the previous error (so a
-    dense chain counts as one region) and either has a follow-on wording or
-    names a symbol quoted in a kept error. Returns (kept texts, number
+    dense chain counts as one region) and either has a follow-on wording,
+    names a symbol quoted in a kept error, or is a missing name after a
+    broken declaration in the same region. Returns (kept texts, number
     hidden). Identical texts are kept once."""
     kept: list[str] = []
     seen: set[str] = set()
     symbols: set[str] = set()
     hidden = 0
     previous: int | None = None
+    broken_region = False        # a kept error in this region that is not a missing name
     for line, text in errors:
-        if text in seen:
+        if text in seen or _ALWAYS_HIDDEN_RE.search(text):
             hidden += 1
             continue
         near = line is not None and previous is not None and 0 <= line - previous <= CASCADE_WINDOW
         previous = line if line is not None else previous
+        if not near:
+            broken_region = False
         names = set(_QUOTED_RE.findall(text))
-        if near and (_FOLLOW_ON_RE.search(text) or names & symbols):
+        undeclared = bool(_UNDECLARED_RE.search(text))
+        follow_on = _FOLLOW_ON_RE.search(text) or (undeclared and broken_region)
+        if near and (follow_on or names & symbols):
             hidden += 1
             continue
         kept.append(text)
         seen.add(text)
         symbols |= names
+        broken_region = broken_region or not undeclared
     return kept, hidden
 
 

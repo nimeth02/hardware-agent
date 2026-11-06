@@ -49,26 +49,74 @@ A design that needs more than about 250 lines is almost always repeating
 itself; shorten it before adding more.
 
 ═══════════════════════════════════════════════════════════════════
-3. ONE CLOCKED PROCESS FOR THE PIPELINE
+3. ONE SHORT CLOCKED PROCESS PER PIPELINE STAGE
 ═══════════════════════════════════════════════════════════════════
 
-Put all pipeline registers in ONE clocked process. Then each signal has one
-writer by construction.
+Write ONE clocked process per row of the stage map (pipeline_stage_map.md),
+labelled after the row (`p_s1`, `p_s2`, ...), plus ONE small process
+`p_valid` for the valid chain. Keep every process under about 40 lines
+(one screen). A 200-line process is where variables get declared after
+`begin`, a stage reads two rows back and the valid chain is miscounted
+(timing_recovery, 2026-11-02: 8 misplaced declarations in one process).
+If a row needs more than 40 lines, move its arithmetic into a function
+(section 2) or split it into two stages (section 3b).
 
-    process(clk)
-    begin
+    p_valid : process(clk)             -- has the reset (so do p_loop and a history
+    begin                              -- chain, nothing else); the ONLY writer of valid_pipe
       if rising_edge(clk) then
         if rst = '1' then                -- use the spec's reset polarity
           valid_pipe <= (others => '0');
         elsif advance = '1' then
-          -- stage 1
-          a_s1 <= ...;   valid_pipe(0) <= in_valid;
-          -- stage 2 reads stage-1 registers
-          b_s2 <= f(a_s1);   valid_pipe(1) <= valid_pipe(0);
+          valid_pipe(0) <= s_axis_tvalid;    -- one line per stage-map row
+          valid_pipe(1) <= valid_pipe(0);
           ...
         end if;
       end if;
-    end process;
+    end process p_valid;
+
+    p_s1 : process(clk)                -- row s1: writes ONLY *_s1 names,
+    begin                              -- reads only the entity inputs
+      if rising_edge(clk) then
+        if advance = '1' then          -- no reset on data registers
+          a_s1  <= signed(s_axis_tdata(11 downto 0));
+          c_s1  <= signed(s_axis_tdata(23 downto 12));
+          ns_s1 <= ns;
+        end if;
+      end if;
+    end process p_s1;
+
+    p_s2 : process(clk)                -- row s2: reads *_s1 (and its own row in a history chain), writes *_s2
+                                       -- (strobe_s2 / mu_s2 are the exception: p_loop writes them, not p_s2)
+      variable sum_v : signed(12 downto 0);   -- variables go HERE, before begin
+    begin
+      if rising_edge(clk) then
+        if advance = '1' then
+          sum_v := resize(a_s1, 13) + resize(c_s1, 13);   -- 12 -> 13 bits
+          b_s2  <= sum_v;                                  -- 13 bits
+          ns_s2 <= ns_s1;                                  -- carried along
+        end if;
+      end if;
+    end process p_s2;
+
+- `p_s<K>` writes only registers named `_s<K>` and reads only `_s<K-1>`
+  names (for K = 1, the entity inputs) plus, where needed, the loop values
+  of `p_loop`. In a tracking loop `strobe_s2` and `mu_s2` are the one
+  exception: `p_loop` writes them, `p_s2` does not. Every signal then has
+  exactly one writer by construction, and a stage can only read the row
+  above it.
+- No stage process touches `valid_pipe`, and data registers have no reset:
+  they are simply overwritten by the next valid beat
+  (vivado_rtl_guidelines.md section 3). The exception is a tracking loop
+  (timing recovery, phase or gain control; pipeline_stage_map.md, LOOP
+  VALUES): ONE process `p_loop` holds the loop values (`eta_r`, `acc_r`,
+  `v_r`, `yprev_i_r`: no stage number), resets them, updates eta every
+  input sample, and also writes `strobe_s2` and `mu_s2`; the history chain
+  it reads (`x0_i_s2` ..) is reset too. Never copy loop values round the
+  rows back into row 1 (`eta_s1 <= eta_s11`): that runs 11 separate loops.
+  Only `p_valid` writes `valid_pipe`; two processes writing it (one the
+  reset, one a bit) give an 'X' valid flag that no checker reports.
+- Label every process (`p_valid`, `p_s1`, ...): the linter names the process
+  in its messages.
 
 - Stage N reads ONLY stage N-1 registers. Never let stage 3 read `a_s1`
   directly (skipping `b_s2`): the data then arrives at the output one
@@ -80,7 +128,7 @@ writer by construction.
   never merge stages to save latency if that breaks the timing rules in
   section 3b.
 - `valid_pipe` is a std_logic_vector, one bit per stage, shifted every
-  advance.
+  advance inside `p_valid` and nowhere else.
 - EVERY value a stage uses comes from the PREVIOUS stage's registers —
   including side inputs such as a noise/scale value `ns`, a mode or an
   index that enters with the beat. Carry them along: `ns_s1 <= ns;
@@ -95,13 +143,14 @@ writer by construction.
   data, every output beat shows the NEXT beat's data and the first beat
   is lost; one stage shorter and the testbench sees stale data.
 - AN OUTPUT REGISTER IS A STAGE. `m_axis_tdata_reg <= ... b3_s6 ...` inside
-  the clocked process is a 7th register after stages 1-6, so it needs a 7th
-  valid bit (`valid_pipe(6) <= valid_pipe(5);` on the line next to it) and
+  a clocked process is a 7th register after stages 1-6 (row s7 of the map,
+  its own process), so it needs a 7th valid bit (`valid_pipe(6) <=
+  valid_pipe(5);` in `p_valid`) and
   `m_axis_tvalid_i <= valid_pipe(6)`. With only valid_pipe(5 downto 0) the
   valid flag rises one clock BEFORE the register is written and every beat
   is read as 0 (linter: `valid_data_length_mismatch`). Simplest and
   preferred: NO separate output register — join the last stage's registers
-  with a plain assignment outside the process:
+  with a plain assignment outside any process:
       m_axis_tdata <= std_logic_vector(b3_s6 & b2_s6 & b1_s6 & b0_s6);
   Then valid_pipe has exactly as many bits as there are stages.
 - COUNT BEFORE YOU RETURN: list every register one input bit passes through
@@ -115,7 +164,26 @@ writer by construction.
     s_tready_i    <= advance;                           -- accept only when advancing
     m_tvalid_i    <= valid_pipe(last);
   An input is accepted when `s_tvalid = '1' and advance = '1'`; when
-  `advance = '0'` every register holds its value.
+  `advance = '0'` every register holds its value. On a strobe design use
+  the output flag itself, `advance <= m_tready or not m_tvalid_i;`
+  (m_tvalid_i = valid_pipe(last) and strobe_s<last>): with the bare valid
+  bit a non-strobe row would stall the whole pipeline while m_tready is
+  low, and a sink that waits for tvalid before raising tready would never
+  see a beat.
+- OUTPUT ON STROBE (timing recovery, symbol sync, any spec that says
+  "output ... on strobe" or "one output per N inputs"): the output valid
+  flag is the last valid bit AND the strobe bit of the SAME row, never the
+  bare valid bit:
+      m_tvalid_i <= valid_pipe(9) and strobe_s10;   -- s10 = the output row, the last row
+  The bare bit raises a beat for every input sample; the testbench expects
+  one beat per strobe and sees about 4x too many (timing_recovery
+  2026-11-02 18:32: 998 mismatches, every beat "got 0"; linter:
+  `output_valid_without_strobe`). The strobe and mu are COMPUTED in
+  `p_loop`, in the same update as eta (`if eta_next < 0 then strobe_s2 <=
+  '1'; ...`), and carried down the rows to the output row like data
+  (pipeline_stage_map.md, LOOP VALUES). Never send them round a ring
+  (`strobe_s1 <= strobe_s11; strobe_s2 <= strobe_s1; ...`): copied only,
+  they keep their reset value for ever (linter: `loop_value_never_computed`).
 - Do not add extra "state machines" for plain pipelines.
 
 ═══════════════════════════════════════════════════════════════════
@@ -155,10 +223,27 @@ target with exactly that width.
 - `a * b` (signed*signed or unsigned*unsigned only; never mix): width is
   width(a) + width(b). 12 bits * 8 bits = 20 bits. A 32-bit by 32-bit
   product is 64 bits.
-- Declare the product signal at the full width, then trim:
-      signal prod : signed(19 downto 0);        -- 12 + 8
-      prod  <= a * b;                           -- a: 12, b: 8
-      small <= resize(prod, 16);                -- separate step
+- THE WIDTHS OF A MULTIPLY ARE NAMES, NEVER TYPED-IN NUMBERS. Give every
+  value that goes into a multiply a width constant, declare it (and every
+  stage copy of it) with that name, and declare the product as the SUM of
+  the names. Never add the two widths in your head and type the total.
+  Declare the product at that full width, then trim it in a separate step:
+      -- architecture, before begin:
+      constant A_W : integer := 12;                    -- width of a
+      constant B_W : integer := 8;                     -- width of b
+      signal a_s3  : signed(A_W-1 downto 0);
+      signal b_s3  : signed(B_W-1 downto 0);
+      -- inside the stage-4 process:
+      variable prod : signed(A_W+B_W-1 downto 0);      -- always A_W + B_W
+      prod  := a_s3 * b_s3;
+      small := resize(prod, 16);                       -- trim as a separate step
+  To make a value wider later, change its constant (`A_W := 13`), never
+  the declaration lines: every stage copy and every product then follow by
+  themselves. A typed-in product width goes stale: timing_recovery
+  2026-11-03 12:30 widened `v2i_s3` from 12 to 13 bits and kept
+  `variable p2i : signed(27 downto 0)`, so 13 + 16 = 29 bits went into 28
+  (linter: `multiplier_width`; the dry run stops with "Array sizes do not
+  match"). The linter reads these names, so it still checks every product.
   Do NOT widen the inputs to the target width with resize() and then
   multiply: that makes the product twice as wide as the target.
 - Shifts, powers of two and division (VHDL-93 + numeric_std):
@@ -199,6 +284,17 @@ target with exactly that width.
       m_msb_v := shift_left(x_v, 2);                    -- x_v is only 12 bits
   The same goes for `signed(abs_v)` of an unsigned value: it needs one extra
   top bit (`signed('0' & abs_v)`) before it is used as a signed number.
+- THE LAST HELPER BEFORE A REGISTER HAS THE REGISTER'S WIDTH NAME. When a
+  register is declared with a constant (`signal v_s12 : signed(V_BITS-1
+  downto 0)`), the variable that feeds it is declared with the SAME name
+  and resized to it, never to a typed-in number:
+      variable v_next : signed(V_BITS-1 downto 0);
+      v_next := resize(v_sum, V_BITS);
+      v_s12  <= v_next;
+  `v_next : signed(16 downto 0)` ("17 bits, final v") into the 16-bit
+  `v_s12` cost two crash rounds (timing_recovery 2026-11-03 11:17). The
+  linter reads the constants and reports every such line at once
+  (`assignment_width`); fix them all in one round.
 - Both sides of every `<=` / `:=` must have the SAME width, or the dry run
   stops with "Array sizes do not match, left array has 24 elements, right
   array has 33 elements" (the compiler does not catch it). Typical causes:
@@ -225,9 +321,12 @@ target with exactly that width.
   unsigned one: `a * signed('0' & b)` (b gains one sign bit: 8 -> 9 bits).
   So when the spec says "signed 16 x unsigned 8 -> signed 24", the VHDL
   product is 16 + 9 = 25 bits, NOT 24. Declare the product signal with the
-  real width and narrow it afterwards; never store the product in the
-  spec's width directly:
-      signal p_full : signed(24 downto 0);                 -- 16 + 9 = 25 bits
+  real width, written with the width names (the extra sign bit is the
+  `+ 1`), and narrow it afterwards; never store the product in the spec's
+  width directly:
+      constant M_W  : integer := 16;                       -- width of m (signed)
+      constant NS_W : integer := 8;                        -- width of ns (unsigned)
+      signal p_full : signed(M_W+NS_W downto 0);           -- M_W + (NS_W + 1) = 25 bits
       p_full <= m * signed('0' & ns);                      -- natural widths
       p      <= resize(p_full, 24);                        -- the spec's 24 bits
   (`p <= m * signed('0' & ns);` into a 24-bit p is the "multiplier_width"
@@ -245,7 +344,17 @@ target with exactly that width.
 [ ] every function/type is declared before `begin`; no records for pipeline stages
 [ ] every expression mixing `and`/`or` has brackets
 [ ] each signal assigned in exactly one process / one concurrent line
-[ ] every `*` target is exactly width(a) + width(b)
+[ ] one clocked process per stage-map row (`p_s1`, `p_s2`, ...) plus `p_valid`
+    (and `p_loop` for a tracking loop), none longer than about 40 lines; only
+    `p_valid` writes `valid_pipe`; only `p_valid`, `p_loop` and a history
+    chain have a reset
+[ ] tracking loop: eta, acc, v and y_prev are `_r` registers written only by
+    `p_loop`; eta changes every input sample; strobe_s2 and mu_s2 come from
+    `p_loop` and are carried down to the output row; no `_s1` register is
+    copied from a later row (`eta_s1 <= eta_s11` is the 11-loops bug)
+[ ] every `*` target is exactly width(a) + width(b), declared with the width
+    names (`signed(A_W+B_W-1 downto 0)`), never with a typed-in number; every
+    value that goes into a multiply is declared with its width name too
 [ ] left and right side of every assignment (and every `&` join) have equal widths
 [ ] stage count ≤ the spec's latency limit (without breaking section 3b)
 [ ] every multiply result is registered; no stage mixes multiply/add/saturate

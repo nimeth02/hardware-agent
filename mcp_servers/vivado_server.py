@@ -89,13 +89,20 @@ _ERROR_LINE_RE = re.compile(r'^ERROR:', re.MULTILINE)
 _SIM_TIME_RE = re.compile(r'^\s*\d+(?:\.\d+)?\s*(?:fs|ps|ns|us|ms|s)\s*$', re.IGNORECASE)
 
 
-def _cap(text: str, limit: int = 200_000) -> str:
-    """Cap output at limit chars. The cap is generous (200 KB) so the full
-    xvhdl/xsim log reaches the run store and the UI; consumers that feed an
-    LLM must trim to a tail themselves (see simulation_analyst)."""
+def _cap(text: str, limit: int = 200_000, tail: int = 20_000) -> str:
+    """Cap output at limit chars, keeping the START and the END of the log.
+    The cap is generous (200 KB) so the full xvhdl/xsim log reaches the run
+    store and the UI; consumers that feed an LLM must trim to a tail
+    themselves (see simulation_analyst). The end is kept because that is
+    where the testbench prints SIMULATION PASSED/FAILED: a testbench that
+    reported a mismatch on every one of 1200 cycles (timing_recovery,
+    2026-10-30) overflowed a head-only cap, the marker was cut off, and the
+    run was judged "no marker" and rerun with a longer sim_time to no effect."""
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n... [truncated {len(text) - limit} chars] ..."
+    dropped = len(text) - limit
+    return (text[:limit - tail] + f"\n... [truncated {dropped} chars in the middle of the log] ...\n"
+            + text[-tail:])
 
 
 # ── Remote execution helpers ────────────────────────────────────────────
@@ -241,7 +248,8 @@ def _remote_simulation(tb_file: str, top_entity: str, project_dir: str, sim_time
         status = "ok" if (sim_passed and not sim_failed and not has_error and rc4 == 0) else "error"
 
         _remote_run(client, f"rm -rf {tmpdir}")
-        return {"status": status, "sim_passed": sim_passed, "sim_output": _cap(out4), "vcd_path": None}
+        return {"status": status, "sim_passed": sim_passed, "sim_failed": sim_failed,
+                "sim_output": _cap(out4), "vcd_path": None}
 
     finally:
         client.close()
@@ -497,7 +505,8 @@ def run_simulation(tb_file: str, top_entity: str, project_dir: str,
     Returns:
         status:      "ok" or "error"
         sim_passed:  bool — True only if "SIMULATION PASSED" found and no errors
-        sim_output:  xsim stdout (capped at 200 KB)
+        sim_failed:  bool — "SIMULATION FAILED" found (checked on the full log)
+        sim_output:  xsim stdout (capped at 200 KB: head and tail kept)
         vcd_path:    path to the waveform file, or None if not generated
     """
     if is_remote_mode():
@@ -607,6 +616,7 @@ def run_simulation(tb_file: str, top_entity: str, project_dir: str,
     return {
         "status":     status,
         "sim_passed": sim_passed,
+        "sim_failed": sim_failed,     # read on the FULL log, before the cap
         "sim_output": _cap(sim_stdout),
         "vcd_path":   vcd_path,
     }

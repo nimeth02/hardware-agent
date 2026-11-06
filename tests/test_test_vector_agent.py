@@ -246,6 +246,165 @@ def test_an_input_beat_on_a_blocked_row_is_rejected(monkeypatch):
     assert [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]] == []
 
 
+def _stream_spec(constraints=()):
+    return {"ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
+        ("aclk", "input", "1"), ("aresetn", "input", "1"), ("s_axis_tvalid", "input", "1"),
+        ("s_axis_tdata", "input", "24"), ("m_axis_tready", "input", "1"), ("s_axis_tready", "output", "1"),
+        ("m_axis_tvalid", "output", "1"), ("m_axis_tdata", "output", "24")]],
+        "reset": {"name": "aresetn", "active": "low"},
+        "constraints": list(constraints)}
+
+
+def _stream_files(in_values, out_beat_every, out_value=None):
+    """Rows 0-1 hold reset; one input beat per later row with the given data
+    values; an expected output beat on every `out_beat_every`-th input row
+    (0 = never). The beat's m_axis_tdata is the input value of that row, or
+    `out_value(beat_index)` when given."""
+    in_lines, out_lines = ["cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata,m_axis_tready"], ["cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata"]
+    for c in range(2):
+        in_lines.append(f"{c},1,0,0,0,1")
+        out_lines.append(f"{c},1,0,0")
+    nbeat = 0
+    for i, val in enumerate(in_values):
+        c = i + 2
+        beat = 1 if out_beat_every and (i + 1) % out_beat_every == 0 else 0
+        data = (out_value(nbeat) if out_value else val) if beat else 0
+        nbeat += beat
+        in_lines.append(f"{c},1,1,1,{val},1")
+        out_lines.append(f"{c},1,{beat},{data}")
+    return {"test_vectors_in.csv": "\n".join(in_lines) + "\n", "test_vectors_out.csv": "\n".join(out_lines) + "\n"}
+
+
+def test_a_constant_input_column_is_rejected(monkeypatch):
+    """timing_recovery run 2026-11-05 15:54: the golden model divided 0 by 0,
+    every input became 8390656 and only one output beat was expected; every
+    layout check passed and the analyst blamed the RTL."""
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
+    files = _stream_files([8390656] * 40, out_beat_every=4)
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    constant = [i for i in issues if i["code"] == "constant_input"]
+    assert len(constant) == 1 and "8390656" in constant[0]["detail"] and "isfinite" in constant[0]["detail"]
+    assert "beat_rate_mismatch" not in [i["code"] for i in issues]         # 10 beats for 40 inputs is right
+
+    files = _stream_files(list(range(100, 140)), out_beat_every=4)           # varying input: clean
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+    files = _stream_files([7] * 5, out_beat_every=0)                          # too small to judge
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+
+def test_an_expected_beat_count_far_from_the_spec_rate_is_rejected(monkeypatch):
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
+    files = _stream_files(list(range(100, 140)), out_beat_every=40)          # 1 beat for 40 inputs
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    rate = [i for i in issues if i["code"] == "beat_rate_mismatch"]
+    assert len(rate) == 1 and "40 input beats but 1 expected" in rate[0]["detail"] and "per 4 input" in rate[0]["detail"]
+    # The fix text names the real cause seen on 2026-11-06 (loop run on
+    # integer codes) and the two asserts that make MATLAB catch it itself.
+    assert "raw integer codes" in rate[0]["detail"] and "abs(v) < 1/N" in rate[0]["detail"]
+
+    files = _stream_files(list(range(100, 140)), out_beat_every=1)           # 40 beats: too many
+    assert "beat_rate_mismatch" in [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]
+
+    files = _stream_files(list(range(100, 140)), out_beat_every=3)           # 13 beats for ~10: within 2x
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+    # No rate in the spec: only "never any output beat" is reported.
+    no_rate = _stream_spec(["Output is saturated to 12 bits."])
+    files = _stream_files(list(range(100, 140)), out_beat_every=40)
+    assert v.validate_test_vectors(no_rate, "x", {})["issues"] == []
+    files = _stream_files(list(range(100, 140)), out_beat_every=0)
+    assert [i["code"] for i in v.validate_test_vectors(no_rate, "x", {})["issues"]] == ["no_output_beats"]
+
+
+def test_a_nearly_constant_input_is_rejected_for_rated_designs(monkeypatch):
+    """timing_recovery run 2026-11-06 11:45: 99 identical symbols plus one
+    flipped symbol (396 of 400 beats the same) slipped past the exact
+    'one constant' check and the loop had nothing to lock onto."""
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
+    files = _stream_files([4195328] * 39 + [12585984], out_beat_every=4, out_value=lambda k: 100 + k)
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    constant = [i for i in issues if i["code"] == "constant_input"]
+    assert len(constant) == 1 and "39 of 40 input beats" in constant[0]["detail"] and "randi" in constant[0]["detail"]
+
+    # 8 of 40 identical (80 %) is a normal stimulus.
+    files = _stream_files([5] * 8 + list(range(100, 132)), out_beat_every=4, out_value=lambda k: 100 + k)
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+    # No rate in the spec (a plain filter): a step response is allowed to sit on one value.
+    no_rate = _stream_spec(["Output is saturated to 12 bits."])
+    files = _stream_files([4195328] * 39 + [12585984], out_beat_every=1)
+    assert v.validate_test_vectors(no_rate, "x", {})["issues"] == []
+
+
+def test_a_nearly_constant_output_is_rejected_for_rated_designs(monkeypatch):
+    """Same run: 190 of 193 expected beats were 4195328 because the loop
+    repeated the first symbol forever; every earlier check passed."""
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
+    files = _stream_files(list(range(100, 140)), out_beat_every=2, out_value=lambda k: 4195328 if k else 0)
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    constant = [i for i in issues if i["code"] == "constant_output"]
+    assert len(constant) == 1 and "4195328 on 19 of 20" in constant[0]["detail"] and "abs(v) < 1/N" in constant[0]["detail"]
+
+    # Mostly-zero output (impulse response, warm-up zeros) is not a loop blow-up.
+    files = _stream_files(list(range(100, 140)), out_beat_every=2, out_value=lambda k: 0 if k < 19 else 777)
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+    # 9 of 10 identical (90 %) stays under the 95 % line.
+    files = _stream_files(list(range(100, 140)), out_beat_every=4, out_value=lambda k: 4195328 if k else 0)
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+    files = _stream_files(list(range(100, 140)), out_beat_every=4)              # varying output: clean
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+
+def test_output_beats_on_many_consecutive_rows_are_rejected(monkeypatch):
+    """Same run: the strobe fired on every cycle from cycle 12 on (193 beats
+    for 400 inputs), which the 2x beat-count tolerance accepted."""
+    import agents.test_vector_agent.test_vector_validator as v
+    spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
+    # 400 inputs, 193 beats: 8 spaced beats then one on every row -> count passes, run fails.
+    in_lines, out_lines = ["cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata,m_axis_tready"], ["cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata"]
+    for i in range(400):
+        beat = 1 if (i < 32 and i % 4 == 3) or 200 <= i < 385 else 0
+        in_lines.append(f"{i},1,1,1,{1000 + i},1")
+        out_lines.append(f"{i},1,{beat},{2000 + i if beat else 0}")
+    files = {"test_vectors_in.csv": "\n".join(in_lines) + "\n", "test_vectors_out.csv": "\n".join(out_lines) + "\n"}
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    assert "beat_rate_mismatch" not in [i["code"] for i in issues]            # 193 for 400 is inside 2x
+    run = [i for i in issues if i["code"] == "consecutive_output_beats"]
+    assert len(run) == 1 and "185 consecutive rows" in run[0]["detail"] and "real values" in run[0]["detail"]
+
+    # Two neighbouring beats now and then (rate error) are fine; 8 in a row are not.
+    files = _stream_files(list(range(100, 140)), out_beat_every=3)
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+
+def test_spec_output_rate_reads_the_common_phrasings():
+    from agents.test_vector_agent.test_vector_validator import spec_output_rate
+    assert spec_output_rate({"constraints": ["Output strobe rate is approximately one per 4 input clocks."]}) == 4
+    assert spec_output_rate({"behavior": "Emit 1 symbol every 8 samples."}) == 8
+    assert spec_output_rate({"description": "Decimate by 16 then filter."}) == 16
+    assert spec_output_rate({"description": "A 2:1 decimation stage."}) == 2
+    assert spec_output_rate({"behavior": "Produces every 5th cycle one output"}) == 5
+    assert spec_output_rate({"description": "A plain FIR filter with 12-bit output."}) is None
+    assert spec_output_rate(None) is None
+
+
 def test_run_guard_rejects_unknown_scripts_without_counting_a_failure():
     import asyncio
     from langchain_core.tools import StructuredTool
@@ -338,6 +497,51 @@ def test_scripts_using_non_matlab_operators_are_rejected_before_being_written():
         out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "r = floor((p + 4096) / 2^13);", "project_dir": "x"})
         assert "REJECTED" not in out and written == ["gen_test_vectors.m"]
     asyncio.run(scenario())
+
+
+def test_scripts_that_wrap_a_signed_value_before_a_shift_or_saturation_are_rejected():
+    """llr_demap16, 2026-10-30 11:51: `min(max(floor((mod(mm*nsv, 2^24) + 4096)
+    / 2^13), -32), 31)` meant "signed 24-bit product" but mod() made every
+    negative LLR +31; 14 of 20 expected beats were wrong, the RTL was right."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools, wrapped_signed_math
+
+    bad = "llr = @(m, ns) arrayfun(@(mm, nsv) min(max(floor((mod(mm*nsv, 2^24) + 4096) / 2^13), -32), 31), m, ns);"
+    assert wrapped_signed_math(bad) == ["mod(mm*nsv, 2^24)"]
+    assert wrapped_signed_math("v = min(max(mod(8*256 - 4*abs(x), 2^16), -32), 31);") == ["mod(8*256 - 4*abs(x), 2^16)"]
+    assert wrapped_signed_math("r = floor(mod(a - b, 2^12) / 4);") == ["mod(a - b, 2^12)"]
+    # the right way, and the legitimate uses of mod(): pack, wrap a counter, extract a field, stimulus patterns
+    assert wrapped_signed_math("r = floor((m * ns + 4096) / 2^13); v = min(max(r, -32), 31); w = mod(v, 2^6) * 2^12;") == []
+    assert wrapped_signed_math("tdata = mod(I, 2^12) * 2^20 + mod(Q, 2^12) * 2^8 + mod(ns, 2^8);") == []
+    assert wrapped_signed_math("state = mod(state + 1, 16); f = mod(floor(word / 2^20), 2^12); en = floor(mod(c, 7) / 2);") == []
+    assert wrapped_signed_math("x = floor(mod(-v, 2^8) / 2);") == []                  # unary minus is a sign, not a difference
+    assert wrapped_signed_math("% r = floor(mod(a*b, 2^24) / 8) in a comment is fine\nr = floor((a*b + 4096) / 2^13);") == []
+
+    written: list[str] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        written.append(filename)
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok", "output": "wrote 40 rows"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": bad, "project_dir": "x"})
+        assert "REJECTED" in out and "mod(mm*nsv, 2^24)" in out and "16752640" in out and written == []
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "r = floor((m * ns + 4096) / 2^13);", "project_dir": "x"})
+        assert "REJECTED" not in out and written == ["gen_test_vectors.m"]
+    asyncio.run(scenario())
+
+    from pathlib import Path
+    from services.config import REPO_ROOT
+    rules = Path(REPO_ROOT, "skills", "TEST_VECTOR", "matlab_golden_model_rules.md").read_text(encoding="utf-8")
+    assert "NEVER wrap a signed intermediate value with mod" in rules
 
 
 def test_scripts_that_pack_a_spec_field_at_the_wrong_bit_are_rejected():
@@ -453,7 +657,8 @@ def test_old_csvs_are_deleted_before_every_matlab_run_and_the_last_run_is_record
         assert state["last_run"] is None
         await gen.ainvoke({"filename": "gen_test_vectors", "code": "x", "project_dir": str(tmp_path)})
         await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": str(tmp_path)})
-        assert state["last_run"] == {"status": "error", "error": '{"status": "error", "error": "Undefined function at line 163"}'}
+        assert state["last_run"]["status"] == "error"
+        assert state["last_run"]["error"].startswith('{"status": "error", "error": "Undefined function at line 163"}')
         await gen.ainvoke({"filename": "gen_test_vectors", "code": "y", "project_dir": str(tmp_path)})
         await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": str(tmp_path)})
         assert state["last_run"] == {"status": "ok", "error": ""}
@@ -547,4 +752,393 @@ def test_scripts_that_never_check_a_field_fits_its_width_are_rejected():
         assert "REJECTED" in out and "fit their bit width" in out and "assert(all(I" in out
         out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": checked, "project_dir": "x"})
         assert "REJECTED" not in out
+    asyncio.run(scenario())
+
+
+def test_scripts_for_a_rated_stream_must_assert_their_beat_count():
+    """timing_recovery, 2026-11-06 run 2a912a0f: four scripts ran the Gardner
+    loop on the integer codes, strobed 1-8 times in 400+ samples and wrote the
+    CSVs; only the outer validator caught it (beat_rate_mismatch), one attempt
+    later. The guard now wants the script to check its own beat count."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import (
+        guard_matlab_tools, missing_beat_count_assert)
+
+    stream = [{"name": "s_axis_tvalid", "direction": "input", "width": "1"},
+              {"name": "m_axis_tvalid", "direction": "output", "width": "1"}]
+    rated = {"ports": stream, "behavior": ["Output strobe rate is approximately one per 4 input clocks."]}
+    unchecked = "for c = 0:399\n  if strobe, nOut = nOut + 1; end\nend\nfprintf('%d beats', nOut);\n"
+    msg = missing_beat_count_assert(rated, unchecked)
+    assert msg and "one output per 4" in msg and "nOut >= nIn/4/2" in msg and "abs(v) < 1/4" in msg
+
+    checked = unchecked + "assert(nOut >= nIn/4/2 && nOut <= nIn/4*2, '%d beats for %d', nOut, nIn);\n"
+    assert missing_beat_count_assert(rated, checked) is None
+    other_name = unchecked + "assert(numel(strobe_cycles) > 50, 'too few strobes');\n"      # any beat-count word
+    assert missing_beat_count_assert(rated, other_name) is None
+    assert missing_beat_count_assert(rated, unchecked + "% assert(nOut > 50)\n") is not None  # a comment is not a check
+    assert missing_beat_count_assert(rated, unchecked + "assert(all(I <= 2047), 'I');\n") is not None  # other asserts do not count
+    # no rate in the spec, or not a streaming design: the rule does not apply
+    assert missing_beat_count_assert({"ports": stream, "behavior": ["Output is saturated."]}, unchecked) is None
+    assert missing_beat_count_assert({"ports": [], "behavior": rated["behavior"]}, unchecked) is None
+    assert missing_beat_count_assert(None, unchecked) is None
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")], spec=rated)
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": unchecked, "project_dir": "x"})
+        assert "REJECTED" in out and "output beat count" in out and "assert(nOut" in out
+        # the finite-stimulus rule (next test) also applies to a streaming spec
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": checked + "assert(all(isfinite(x)), 'x');\n", "project_dir": "x"})
+        assert "REJECTED" not in out
+    asyncio.run(scenario())
+
+
+def test_scripts_for_a_stream_must_assert_a_finite_stimulus():
+    """timing_recovery 2026-11-06 16:06 (run bb27cb1d): a pulse tap divided by
+    k^2-1 = 0, normalising made the whole pulse NaN, saturation turned every
+    sample into -2048 and every input word into 8390656; the range asserts
+    passed and only the validator's constant_input caught it, one attempt later."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import (
+        guard_matlab_tools, missing_finite_assert)
+
+    stream = {"ports": [{"name": "s_axis_tvalid", "direction": "input", "width": "1"},
+                        {"name": "s_axis_tdata", "direction": "input", "width": "24"},
+                        {"name": "m_axis_tvalid", "direction": "output", "width": "1"}],
+              "behavior": ["Output strobe rate is approximately one per 4 input clocks."]}
+    unchecked = ("h = h / max(abs(h));\ncI = min(max(round(xI * 2048), -2048), 2047);\n"
+                 "assert(all(cI >= -2048 & cI <= 2047), 'I code');\n"
+                 "assert(nOut >= nIn/4/2 && nOut <= nIn/4*2, 'beats');\n")
+    msg = missing_finite_assert(stream, unchecked)
+    assert msg and "isfinite" in msg and "8390656" in msg and "before any saturate/pack" in msg
+
+    checked = "assert(all(isfinite(xI)) && all(isfinite(xQ)), 'stimulus has NaN');\n" + unchecked
+    assert missing_finite_assert(stream, checked) is None
+    assert missing_finite_assert(stream, "assert(isfinite(x(i)), 'x');\n" + unchecked) is None   # any isfinite assert
+    assert missing_finite_assert(stream, "% assert(all(isfinite(xI)))\n" + unchecked) is not None  # comment only
+    assert missing_finite_assert(stream, "ok = all(isfinite(xI));\n" + unchecked) is not None      # not an assert
+    counter = {"ports": [{"name": "count", "direction": "output", "width": "4"}]}
+    assert missing_finite_assert(counter, unchecked) is None                                  # not a stream
+    assert missing_finite_assert(None, unchecked) is None
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")], spec=stream)
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": unchecked, "project_dir": "x"})
+        assert "REJECTED" in out and "isfinite" in out
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": checked, "project_dir": "x"})
+        assert "REJECTED" not in out
+    asyncio.run(scenario())
+
+
+def test_a_failed_run_comes_back_with_the_line_that_crashed_and_why():
+    """Runs 115142 / 115908 on 2026-10-30: MATLAB said "line 43" and "line 42",
+    the LLM never saw those lines, guessed, and rewrote the script with a new bug."""
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import crash_note
+
+    code = "edgen = [ 64, 64, 64, 64, 0, 255, 127, 127 ];\nIb = [Ib; edge];\nQb = [Qb; edgeQ];\n"
+    err = ('{"status": "error", "error": "\\n  File C:\\\\x\\\\gen_test_vectors.m, line 2, in gen_test_vectors\\n'
+           'Dimensions of arrays being concatenated are not consistent.\\n"}')
+    note = crash_note(code, err)
+    assert note.startswith("WHERE IT CRASHED (gen_test_vectors.m):")
+    assert "-->   2 | Ib = [Ib; edge];" in note and "      1 | edgen" in note and "      3 | Qb" in note
+    assert "WHY:" in note and "row vector" in note and "a = [a, b];" in note
+    assert "FIX:" in note and "do not start a new script" in note
+
+    err = ('{"status": "error", "error": "line 2, in gen_test_vectors\\n'
+           'Index exceeds the number of array elements. Index must not exceed 36."}')
+    note = crash_note("x = 1;\nI = I_vals(bi);\n", err)
+    assert "-->   2 | I = I_vals(bi);" in note and "same length" in note and "nbeats" in note
+
+    # syntax errors say "Line: N Column: M"; a line number past the end of the script is not quoted
+    note = crash_note("a = 1;\nr = (p + 4096) >>> 13;", '{"error": "Line: 2 Column: 20 Invalid use of operator."}')
+    assert "-->   2 | r = (p + 4096) >>> 13;" in note and "floor(x / 2^k)" in note
+    note = crash_note("x = 1;", '{"error": "Undefined function at line 163"}')
+    assert "WHERE IT CRASHED" not in note and note.startswith("FIX:")
+
+    # the script's own assert fired: the values are wrong, not the check
+    note = crash_note("nbeats = 29;\nassert(nbeats == numel(Ivals), 'beat count mismatch');",
+                      '{"error": "line 2, in gen_test_vectors\\nbeat count mismatch"}')
+    assert "Your own assert" in note
+
+    # 2026-11-06: an RRC conv() result added to a shorter preallocated list
+    note = crash_note("x = zeros(1, 10);\nx = x + 1.5*a;", '{"error": "line 2\\nArrays have incompatible sizes for this operation."}')
+    assert "conv(a, b) returns numel(a)+numel(b)-1" in note and "size() of BOTH sides" in note
+    assert "y = y(1:N)" in note and "matlab_eval" in note
+
+    # timing_recovery 2026-11-06 16:48: inst(i+1) with i running to nIn = numel(inst); the generic
+    # list-length hint was the wrong guess, the loop and the shift are the real cause
+    code = "inst = 0.25 + (0:nsym-1) * sps;\nfor i = 1:nIn\n    xs(i) = x(floor(inst(i+1)) + 1);   % sample\nend\n"
+    err = '{"error": "line 3, in gen_test_vectors\\nIndex exceeds the number of array elements. Index must not exceed 100."}'
+    note = crash_note(code, err)
+    assert "-->   3 | " in note and "for i = 1:nIn` reads inst(i+1)" in note and "entry nIn+1 of inst" in note
+    assert "for i = 1:nIn-1" in note and "inst_next = inst(2:end)" in note and "nbeats" not in note
+    # the same message on a line without a shifted read keeps the list-length hint
+    note = crash_note("for i = 1:nIn\n    xs(i) = x(i);\nend\n", err.replace("line 3", "line 2"))
+    assert "nbeats" in note and "reads" not in note
+
+    # timing_recovery 2026-11-06 17:12 (iteration 3): a fixed 8-slot history read with the running
+    # sample count (m = nIn - 2): slot -1 on the first strobe; the loop-variable hint was the wrong guess
+    code = ("xbufI = zeros(1, 8);\nfor c = 0:N-1\n    nIn = nIn + 1;\n    xbufI = [xbufI(2:8), ci];\n"
+            "    m = nIn - 2;\n    xm1 = xbufI(m); xm = xbufI(m+1); xp1 = xbufI(m+2); xp2 = xbufI(m+3);\nend\n")
+    err = '{"error": "line 6, in gen_test_vectors\\nArray indices must be positive integers or logical values."}'
+    note = crash_note(code, err)
+    assert "-->   6 | " in note and "xbufI is a fixed history of the last 8 samples" in note
+    assert "reads it with xbufI(m)" in note and "x[m+2] = xbufI(8)" in note and "x[m-3] = xbufI(3)" in note
+    assert "Drop m from the index" in note and "loop\nvariable" not in note
+    # a history read with fixed slots, or with a for-loop variable, is not blamed
+    assert crash_note(code.replace("xbufI(m)", "xbufI(5)"), err).count("fixed history") == 1   # m+1.. still flagged
+    ok = "xbufI = zeros(1, 8);\nxbufI = [xbufI(2:8), ci];\nfor j = 1:8\n    s = s + xbufI(j);\nend\n"
+    assert "fixed history" not in crash_note(ok, err.replace("line 6", "line 4"))
+
+
+def test_scripts_that_index_a_sample_history_with_the_sample_count_are_rejected_before_they_run():
+    """timing_recovery 2026-11-06 17:12 (iteration 3): xbufI(m), xbufI(m-2) with
+    m = nIn - 2 crashed on the first strobe; the script was re-sent unchanged."""
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import history_index_by_counter
+
+    bad = ("xbufQ = zeros(1, 8);\nxbufQ = [xbufQ(2:8), cq];\nm = nIn - 2;\n"
+           "xm3 = xbufQ(m-2); xm2 = xbufQ(m-1);\n")
+    found = history_index_by_counter(bad)
+    assert len(found) == 2 and found[0].startswith("line 4 `xm3 = xbufQ(m-2); xm2 = xbufQ(m-1);`")
+    assert "xbufQ(m-2)" in found[0] and "xbufQ(m-1)" in found[1] and "x[m-2] = xbufQ(4)" in found[0]
+    # fixed slots, `end`, ranges, loop variables and lists that are not shifted are fine
+    assert history_index_by_counter("xbufQ = zeros(1, 8);\nxbufQ = [xbufQ(2:8), cq];\ny = xbufQ(6) + xbufQ(end) + sum(xbufQ(3:5));\n") == []
+    assert history_index_by_counter("xbufQ = zeros(1, 8);\nxbufQ = [xbufQ(2:8), cq];\nfor j = 1:8\n    s = s + xbufQ(j);\nend\n") == []
+    assert history_index_by_counter("xI = zeros(1, 400);\nm = nIn - 2;\ny = xI(m);\n") == []
+    assert history_index_by_counter("% xbufQ = zeros(1, 8); xbufQ = [xbufQ(2:8), cq]; y = xbufQ(m);\n") == []
+
+
+def test_scripts_whose_loop_reads_past_the_end_of_a_list_are_rejected_before_they_run():
+    """timing_recovery 2026-11-06 16:48 (run cb9924de): `xs(i) = x(floor(inst(i+1)) + 1)`
+    inside `for i = 1:nIn` with nIn = numel(inst) crashed, the LLM rewrote the block
+    and hit three more index crashes: 6 of the attempt's failed runs on one off-by-one."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools, loop_index_overruns
+
+    bad = "for i = 1:nIn\n    xs(i) = x(floor(inst(i+1)) + 1);\nend\n"
+    found = loop_index_overruns(bad)
+    assert len(found) == 1 and found[0].startswith("line 2 `xs(i) = x(floor(inst(i+1)) + 1);`")
+    assert "for i = 1:nIn` reads inst(i+1)" in found[0] and "for i = 1:nIn-1" in found[0]
+    assert loop_index_overruns("for k = 1:nsym\n    d(k) = sym(k+2) - sym(k);\nend\n")[0].endswith("before the loop.")
+    assert "entry 0 of x" in loop_index_overruns("for i = 1:n\n    y(i) = x(i) - x(i-1);\nend\n")[0]
+    # the AI's rewrite in the same run: a 0-based loop reading symI(k) directly (entry 0 on the first pass)
+    # (the read sits in a nested loop, under an `if` that guards idx, not k: still found)
+    rewrite = ("for k = 0:Nsym-1\n    inst = mu0 + k*Ttrue;\n    for j = 1:numel(h)\n        idx = round(inst) + (j - 1);\n"
+               "        if idx >= 1 && idx <= nIn\n            xI(idx) = xI(idx) + h(j)*symI(k);\n        end\n    end\nend\n")
+    found = loop_index_overruns(rewrite)
+    assert len(found) == 1 and "line 6" in found[0] and "starts at 0 and reads symI(k)" in found[0]
+    assert "for k = 1:Nsym-1" in found[0] and "read symI(k+1)" in found[0]
+    assert loop_index_overruns("for k = 0:Nsym-1\n    a(k) = symQ(k+1);\nend\n") == []                  # k+1 from 0 is fine
+    assert loop_index_overruns("for k = 0:n-1\n    y(k+1) = x(k+1) * 2;\nend\n") == []
+    assert loop_index_overruns("llr = @(m) m * 2;\nfor k = 0:n-1\n    y(k+1) = llr(k);\nend\n") == []  # a function, not a list
+
+    # room is made for the shift: a shorter range, a padded list, a later start, a guarded read
+    assert loop_index_overruns("for i = 1:nIn-1\n    d(i) = inst(i+1) - inst(i);\nend\n") == []
+    assert loop_index_overruns("for i = 1:numel(inst)-1\n    d(i) = inst(i+1);\nend\n") == []
+    assert loop_index_overruns("for i = 1:n-2\n    d(i) = inst(i+2);\nend\n") == []
+    assert loop_index_overruns("inst = zeros(1, nIn+1);\nfor i = 1:nIn\n    d(i) = inst(i+1);\nend\n") == []
+    assert loop_index_overruns("for i = 2:n\n    y(i) = x(i) - x(i-1);\nend\n") == []
+    assert loop_index_overruns("for i = i0:n\n    y(i) = x(i-1);\nend\n") == []                     # start unknown
+    assert loop_index_overruns("for i = 1:n\n    if i < n\n        y(i) = x(i+1);\n    end\nend\n") == []
+    # not a read past the end: growing a list, a function call, a different variable, a comment
+    assert loop_index_overruns("for i = 1:n\n    x(i+1) = x(i) + 1;\nend\n") == []
+    assert loop_index_overruns("for i = 1:n\n    y(i) = floor(i+1) + mod(i+1, 4);\nend\n") == []
+    assert loop_index_overruns("for i = 1:n\n    y(i) = x(j+1);\nend\n") == []
+    assert loop_index_overruns("for i = 1:n\n    y(i) = x(i);   % not x(i+1)\nend\n") == []
+    assert loop_index_overruns("for v = vals\n    y(end+1) = v;\nend\n") == []                       # loop over a list
+    assert loop_index_overruns("while k < n\n    y(k) = x(k+1);\n    k = k + 1;\nend\n") == []       # not a for loop
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
+    gen = {t.name: t for t in tools}["generate_matlab_script"]
+
+    async def scenario():
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": bad, "project_dir": "x"})
+        assert "REJECTED" in out and "reads past the end" in out and "inst(i+1)" in out
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": bad.replace("1:nIn", "1:nIn-1"), "project_dir": "x"})
+        assert "REJECTED" not in out
+    asyncio.run(scenario())
+
+
+def test_failed_matlab_eval_snippets_count_toward_the_run_cap():
+    """2026-11-06: the LLM ran seven matlab_eval snippets in a row, each failing
+    with the same 'incompatible sizes' error, and only the 30-step limit stopped it
+    because matlab_eval was the one tool outside the failure cap."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools
+    from agents.test_vector_agent.test_vector_generator_agent.state import RunAttemptsExceeded, new_run_state
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "error", "error": "line 3\\nArrays have incompatible sizes for this operation."}'
+
+    async def matlab_eval(code: str, project_dir: str = "") -> str:
+        if "disp(size" in code:
+            return '{"status": "ok", "output": " 1 5", "error": null}'
+        return '{"status": "error", "output": "", "error": "Arrays have incompatible sizes for this operation."}'
+
+    state = new_run_state()
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r"),
+                                StructuredTool.from_function(coroutine=matlab_eval, name="matlab_eval", description="e")],
+                               max_failures=3, state=state)
+    by_name = {t.name: t for t in tools}
+    gen, run, ev = by_name["generate_matlab_script"], by_name["run_matlab_script"], by_name["matlab_eval"]
+
+    async def scenario():
+        await gen.ainvoke({"filename": "gen_test_vectors", "code": "x = zeros(1,10);\ny = conv(h, s);\nx = x + y;", "project_dir": "p"})
+        assert '"error"' in await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "p"})     # failure 1
+        assert state["failures"] == 1
+        out = await ev.ainvoke({"code": "h = [1 2 3]; a = conv(h, [0 0 1]); disp(size(a));"})           # a snippet that works
+        assert state["failures"] == 1 and "MATLAB_EVAL FAILED" not in out
+        out = await ev.ainvoke({"code": "x = zeros(1, 10); a = [1 2 3 4 5]; y = x + a;"})                # failure 2
+        assert state["failures"] == 2 and "MATLAB_EVAL FAILED (2 of 3 failed runs used)" in out
+        assert "conv(a, b) returns numel(a)+numel(b)-1" in out and "do not shrink the problem" in out
+        assert state["last_run"]["status"] == "error"
+        with pytest.raises(RunAttemptsExceeded):                                                            # failure 3 = cap
+            await ev.ainvoke({"code": "x = zeros(1, 10); y = x + [1 2 3 4 5];"})
+    asyncio.run(scenario())
+    assert state["failures"] == 3
+
+
+def test_resending_the_same_crashed_script_twice_ends_the_attempt():
+    """2026-11-06 17:12 (timing_recovery): after 'REJECTED: same as one that already
+    crashed' the LLM re-sent the identical script seven more times (2,626 tokens each)
+    until the 30-step cap. The attempt now ends on the second unchanged re-send."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools
+    from agents.test_vector_agent.test_vector_generator_agent.state import RunAttemptsExceeded, new_run_state
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return '{"status": "error", "error": "line 1, in gen_test_vectors\\nArray indices must be positive integers or logical values."}'
+
+    state = new_run_state()
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")],
+                               state=state, max_failures=3)
+    gen, run = {t.name: t for t in tools}["generate_matlab_script"], {t.name: t for t in tools}["run_matlab_script"]
+
+    async def scenario():
+        await gen.ainvoke({"filename": "gen_test_vectors", "code": "xm1 = xbuf(m);", "project_dir": "p"})
+        assert '"error"' in await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "p"})
+        out = await gen.ainvoke({"filename": "gen_test_vectors", "code": "% retry\nxm1 = xbuf(m);", "project_dir": "p"})
+        assert "REJECTED" in out and "(1 of 2)" in out and state["identical_rejects"] == 1
+        # a real change resets the count
+        await gen.ainvoke({"filename": "gen_test_vectors", "code": "xm1 = xbuf(m+1);", "project_dir": "p"})
+        assert state["identical_rejects"] == 0
+        assert '"error"' in await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "p"})
+        out = await gen.ainvoke({"filename": "gen_test_vectors", "code": "xm1 = xbuf(m+1);  % same", "project_dir": "p"})
+        assert "REJECTED" in out and state["identical_rejects"] == 1
+        with pytest.raises(RunAttemptsExceeded) as exc:
+            await gen.ainvoke({"filename": "gen_test_vectors", "code": "xm1 = xbuf(m+1);", "project_dir": "p"})
+        assert exc.value.reason.startswith("Gave up: the script that crashed was re-sent unchanged 2 times")
+        assert "Array indices must be positive" in str(exc.value) and "MATLAB lists start at 1" in str(exc.value)
+    asyncio.run(scenario())
+    assert state["failures"] == 2
+
+
+def test_the_attempt_summary_carries_the_guards_reason():
+    from agents.test_vector_agent.test_vector_generator_agent.state import RunAttemptsExceeded
+
+    assert RunAttemptsExceeded("boom").reason == "Gave up after 3 failed MATLAB runs."
+    assert RunAttemptsExceeded("boom", reason="Gave up: stuck").reason == "Gave up: stuck"
+
+
+def test_guard_without_a_matlab_eval_tool_still_works():
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import guard_matlab_tools
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        return "ok"
+
+    async def run_matlab_script(script_name: str, project_dir: str) -> str:
+        return "ok"
+
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")])
+    assert sorted(t.name for t in tools) == ["generate_matlab_script", "run_matlab_script"]
+
+
+def test_a_script_identical_to_one_that_crashed_is_rejected_without_spending_a_run():
+    """Run 115142 on 2026-10-30: the 2nd and 3rd failed scripts were byte-identical,
+    so the 3rd run was wasted and the attempt hit its cap."""
+    import asyncio
+    from langchain_core.tools import StructuredTool
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import code_fingerprint, guard_matlab_tools
+    from agents.test_vector_agent.test_vector_generator_agent.state import new_run_state
+
+    assert code_fingerprint("Ib = [Ib; edge];  % append") == code_fingerprint("Ib=[Ib; edge];\n% other comment")
+    assert code_fingerprint("Ib = [Ib; edge];") != code_fingerprint("Ib = [Ib, edge];")
+    assert code_fingerprint("x = [1 -2];") != code_fingerprint("x = [1 - 2];")                         # two numbers vs one
+    assert code_fingerprint("names = {'cycle','clk'};") != code_fingerprint("names = {'cycle','rst'};")  # a fix inside quotes counts
+
+    written: list[str] = []
+    runs: list[str] = []
+
+    async def generate_matlab_script(filename: str, code: str, project_dir: str) -> str:
+        written.append(code)
+        return '{"status": "ok"}'
+
+    async def run_matlab_script(script_name: str, project_dir: str):
+        runs.append(script_name)
+        # the MCP adapter hands back content blocks, not a plain string
+        return [{"type": "text", "text": '{"status": "error", "output": "", "error": "line 1, in gen_test_vectors\\n'
+                                         'Dimensions of arrays being concatenated are not consistent."}'}]
+
+    state = new_run_state()
+    tools = guard_matlab_tools([StructuredTool.from_function(coroutine=generate_matlab_script, name="generate_matlab_script", description="w"),
+                                StructuredTool.from_function(coroutine=run_matlab_script, name="run_matlab_script", description="r")],
+                               state=state, max_failures=3)
+    gen, run = {t.name: t for t in tools}["generate_matlab_script"], {t.name: t for t in tools}["run_matlab_script"]
+
+    async def scenario():
+        await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "Ib = [Ib; edge];", "project_dir": "x"})
+        out = await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})
+        assert isinstance(out, list) and out[-1]["text"].startswith("WHERE IT CRASHED (gen_test_vectors.m):")
+        assert "-->   1 | Ib = [Ib; edge];" in out[-1]["text"] and "WHY:" in out[-1]["text"]
+        assert "WHERE IT CRASHED" in state["last_run"]["error"] and state["failures"] == 1
+        assert "[{'type'" not in state["last_run"]["error"]          # readable text, not the list's Python repr
+        # the same code with a comment added: not written, not run, not counted
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "% second try\nIb = [Ib; edge];", "project_dir": "x"})
+        assert "REJECTED" in out and "already crashed" in out and written == ["Ib = [Ib; edge];"]
+        assert "REJECTED" in await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})
+        assert runs == ["gen_test_vectors"] and state["failures"] == 1
+        # a real change is written and run
+        out = await gen.ainvoke({"filename": "gen_test_vectors.m", "code": "Ib = [Ib, edge];", "project_dir": "x"})
+        assert "REJECTED" not in str(out) and written[-1] == "Ib = [Ib, edge];"
+        await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})
+        assert runs == ["gen_test_vectors", "gen_test_vectors"] and state["failures"] == 2
     asyncio.run(scenario())

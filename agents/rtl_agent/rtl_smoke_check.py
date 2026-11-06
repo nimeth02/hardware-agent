@@ -14,7 +14,7 @@ import re
 import tempfile
 
 from agents.mcp_utils import mcp_run_xvhdl, mcp_write_files
-from agents.rtl_agent.rtl_widths import assignments, declared_widths, expr_width, source_line
+from agents.rtl_agent.rtl_widths import assignments, expr_width, scoped_widths, source_line
 from agents.simulation_agent.simulation_runner import design_std, simulate
 from agents.vhdl_version import resolve_vhdl_version
 
@@ -189,8 +189,9 @@ def stream_issues(output: str) -> list[dict]:
                                      f"rises before the register that drives '{data}' is written. Count the "
                                      f"registers from the input to '{data}' (an output register written inside the "
                                      f"process counts as one more stage): valid_pipe must have exactly that many "
-                                     f"bits, the output valid flag must come from its LAST bit, and the output "
-                                     f"register must be written under the same advance = '1' condition as that bit. "
+                                     f"bits, the output valid flag must come from its LAST bit (and the strobe of "
+                                     f"that row, when the spec outputs on a strobe), and the output register must be "
+                                     f"written under the same advance = '1' condition as that bit. "
                                      f"This is not an arithmetic problem; do not change the formulas."})
         if unstable:
             issues.append({"code": "smoke_stream_data_changed_while_stalled",
@@ -242,9 +243,9 @@ def _width_mismatch_hint(message: str, code: str) -> str:
     if not m or not code:
         return ""
     left, right = int(m.group(1)), int(m.group(2))
-    widths = declared_widths(code)
+    scopes = scoped_widths(code)
     hits = [(n, target) for n, target, _, expr in assignments(code)
-            if widths.get(target.lower()) == left and expr_width(expr, widths) == right]
+            if scopes.at(n).get(target.lower()) == left and expr_width(expr, scopes.at(n)) == right]
     if not hits:
         return ""
     where = "; ".join(f"line {n}: `{source_line(code, n)}`" for n, _ in hits[:3])

@@ -23,6 +23,9 @@ You will receive:
 The spec is your ONLY input: there is no reference model or source file on
 disk, so never search for one. run_matlab_script runs only the script you
 wrote with generate_matlab_script; it cannot list folders or run built-ins.
+matlab_eval is for one quick check at most (e.g. a function's exact output
+size); a snippet that errors counts as a failed MATLAB run, the same as a
+failed run_matlab_script, so never debug by running smaller snippets.
 
 Workflow (use the tools in this order):
 
@@ -48,6 +51,11 @@ Workflow (use the tools in this order):
    - the spec's `>>>`, `>>`, `<<`, `!=`, `+=` and `++` are NOT MATLAB:
      write floor(x / 2^k), mod(x * 2^k, 2^N), ~=, x = x + v instead
      (a script containing them is rejected before it runs);
+   - decide the number of beats once (nbeats) and derive every per-beat
+     list (beat cycles, I, Q, ns ...) from it as a ROW vector of exactly
+     nbeats entries, with assert(numel(list) == nbeats) after each one;
+     never hand-type parallel lists and count them yourself — lists of
+     different lengths or shapes were the cause of every failed run;
    - print the number of rows written.
    Recommended structure — preallocate two numeric matrices and convert
    them once, which avoids row/column orientation mistakes:
@@ -70,10 +78,13 @@ Workflow (use the tools in this order):
 
 3. Run it with run_matlab_script(script_name="gen_test_vectors",
    project_dir=project_dir).
-4. If the run reports an error, FIX THE SCRIPT with generate_matlab_script
-   and only then run again. Re-running an unchanged script is rejected.
-   You get at most 3 failed runs; do not finish while the last run is an
-   error.
+4. If the run reports an error, the reply shows WHERE IT CRASHED (the
+   source line) and WHY. Fix that line with generate_matlab_script — keep
+   every other line as it is, do not start a new script — and only then
+   run again. Re-running an unchanged script, or re-submitting a script
+   that already crashed (comments or spacing aside), is rejected and the
+   run is not spent. You get at most 3 failed runs; do not finish while
+   the last run is an error.
 
 When the run succeeds, reply with exactly one JSON object and nothing else:
 

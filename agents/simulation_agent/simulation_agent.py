@@ -23,7 +23,7 @@ from pathlib import Path
 from langgraph.graph import END, START, StateGraph
 
 from agents.simulation_agent.simulation_guard import guard
-from agents.simulation_agent.simulation_runner import double_sim_time
+from agents.simulation_agent.simulation_runner import double_sim_time, sim_time_for
 from agents.simulation_agent.state import (
     DEFAULT_SIM_TIME, MAX_ITERATIONS, PROJECTS_DIR, Action, SimulationAgentState, SimulationStatus, initial_state,
 )
@@ -82,7 +82,9 @@ class SimulationAgent:
             return {"status": SimulationStatus.FAILED.value, "error": f"compile failed: {e}"}
 
     def simulate_node(self, state: SimulationAgentState) -> dict:
-        sim_time = state["sim_time"] if state.get("sim") is None else double_sim_time(state["sim_time"])
+        # first run: at least as long as the test vectors need; reruns: double
+        sim_time = (sim_time_for(state["project"], state["sim_time"]) if state.get("sim") is None
+                    else double_sim_time(state["sim_time"]))
         try:
             sim = self.tools.simulator(state["project"], sim_time)
         except Exception as e:

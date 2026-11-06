@@ -98,15 +98,42 @@ HOW TO FIX (general rules)
 If an issue is "pipeline_stage_skip" or "stage_map_missing": rewrite the
 stage map first (every register a stage reads must sit in the line above;
 add copy registers such as `i_s2 <= i_s1;` where a value jumps a stage),
-then change the code to match the map.
+then change the code to match the map. If the skipped register was meant
+as an OLDER SAMPLE (x[m-1], "history", "placeholder"): `i_s1` is not an
+older sample, it is the same sample one stage earlier. Build a history
+chain in the row above (`x0_s2 <= i_s1; x1_s2 <= x0_s2; x2_s2 <= x1_s2;
+...`, shifted when that row's valid bit is '1') and read only those `_s2`
+names. Returning the previous code unchanged is not a fix.
 
 If an issue is "valid_data_length_mismatch" or "smoke_output_stuck_at_zero":
 the valid flag and the data do not take the same number of clocks. Count
 the registers one input bit passes through on its way to m_axis_tdata
 (including any output register written inside the process); valid_pipe
 must have exactly that many bits and m_axis_tvalid must come from its
-LAST bit. Do the count in the stage map (one row per register, an output
-register is its own row), then fix the code. Do NOT touch the arithmetic.
+LAST bit (gated by the strobe of that same row when the spec outputs on a
+strobe: `valid_pipe(9) and strobe_s10`). Do the count in the stage map
+(one row per register, an output register is its own row), then fix the
+code. Do NOT touch the arithmetic.
+
+If an issue is "loop_state_ring" or "loop_value_never_computed": the loop
+values were copied down the rows and back into row 1 (`eta_s1 <= eta_s11`),
+which runs 11 separate loops. Delete every `<name>_s<K>` copy of eta, acc,
+v and y_prev and the lines that copy one back. Write ONE process `p_loop`
+exactly as pipeline_stage_map.md (LOOP VALUES) shows: `eta_r`, `acc_r`,
+`v_r`, `yprev_i_r`, `yprev_q_r` with the reset; eta updated under
+`valid_pipe(0) = '1'` from its own old value; `strobe_s2` and `mu_s2`
+written there and carried down the rows to the output row; acc, v and
+y_prev updated from the row where their new value is ready, on that row's
+valid bit and strobe. Rows read the `_r` registers directly.
+
+If an issue is "state_read_before_valid", "state_read_after_valid" or
+"history_chain_not_reset": a loop register took a row's value before (or
+after) that row held the right sample, or the history chain starts
+undefined. Put the update under the bit of the row it reads
+(`if valid_pipe(K-1) = '1' and strobe_sK = '1' then ...`), exactly as the
+issue names it, and reset every register of the history chain
+(`if rst = '1' then x0_s2 <= (others => '0'); ...`). An undefined value
+that enters the loop never leaves it, and the simulator does not warn.
 
 If an issue is "abs_without_sign_check": replace the bare negation with
 `unsigned(abs(resize(x, N)))` (or an if/else where only the negative
@@ -134,6 +161,15 @@ If an issue says "cannot read from 'out' object X": keep X as `out`,
 declare `signal X_i` of the same type, replace every read of X inside
 the architecture with X_i, and add `X <= X_i;`. Fix ALL such issues in
 this rewrite, before anything else.
+
+If an issue is "unchanged_on_retry", "smoke_output_never_valid",
+"output_valid_stuck_at_zero", or a "placeholder" that quotes a comment:
+returning "previous_code" unchanged is refused, whatever your notes say.
+If the output valid flag is only ever assigned the constant '0', or a
+process body holds only comments ("I will generate the full code in the
+final answer", "placeholder for the rest of the code"), the design is
+UNFINISHED: write that logic now, in this answer, at the quoted line.
+Never leave a note in place of code.
 """
 
 
@@ -153,6 +189,15 @@ Fix that behaviour first — a clean lint was not enough last time.
 A "downstream" note may carry "fixed_rule": a reading of the mismatches
 made by code, not by a model. It overrides the note's own "summary" and
 "suggested_fix": do exactly the checks it lists before changing anything else.
+A "downstream" note may also carry the evidence itself: "failing_beats",
+one entry per failing output beat with "input_row" (the test_vectors_in.csv
+row the design received, every input port as written), "expected_row" (the
+test_vectors_out.csv row it was compared against) and "line" (the log line
+with the value the design produced); and "log_excerpt", the first error
+lines of the simulation (or compiler) log. Read these before the "summary":
+decode "input_row" with the spec's field layout, work out from the spec
+what the output for that input must be, and compare it with the value in
+"line". Fix the RTL so it produces the spec's value for that exact input.
 A "downstream" note with "second_opinion": true means another stage was
 blamed first and redone without effect, so the fault may be here after
 all: check what its "summary" asks for. An entry may also have

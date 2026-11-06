@@ -256,95 +256,225 @@ def _column_order_checks(inputs: list[dict], outputs: list[dict], text: str) -> 
     return issues
 
 
-_STREAM_PORTS = {"s_axis_tvalid", "s_axis_tready", "m_axis_tvalid", "m_axis_tready"}
+# Every stream design has these two flags; s_axis_tready and m_axis_tready
+# are optional. timing_recovery (2026-10-30) had no m_axis_tready port
+# ("downstream is always ready"), the set below used to require all four
+# wires, so none of the streaming checks ran and a cycle-by-cycle testbench
+# went through: "missing m_axis_tvalid" on every expected row, "unexpected
+# m_axis_tvalid" on every real beat, and the RTL's timing was blamed.
+_STREAM_PORTS = {"s_axis_tvalid", "m_axis_tvalid"}
+# The handshake flags the outputs file carries. They are never compared
+# cycle by cycle: WHEN the design raises m_axis_tvalid (its latency, its
+# strobe pattern) and what s_axis_tready shows during reset belong to the
+# RTL, and the golden model cannot know them. Every other output column
+# (m_axis_tdata, m_axis_tuser, ...) is a per-beat value: the payload.
+_OUTPUT_FLAGS = ("s_axis_tready", "m_axis_tvalid")
+_STRING_RE = re.compile(r'"[^"]*"')
+# A relational compare: `/=`, or a `=` that is not part of `:=`, `<=`, `>=`
+# or the association arrow `=>` (`(others => '0')` in a declaration default).
+_CMP_RE = re.compile(r"/=|(?<![:<>/])=(?![=>])")
 # `if v_m_axis_tvalid = 1`: the CSV's flag (an integer) opens a block ...
-_CSV_TVALID_GATE_RE = re.compile(r"\bif\s+\w*m_axis_tvalid\w*\s*=\s*1\b", re.IGNORECASE)
-# ... and inside it the DUT's bare m_axis_tdata wire is compared: cycle-by-cycle.
-_DUT_TDATA_CMP_RE = re.compile(r"(?<![\w])m_axis_tdata\s*/?=|/?=\s*m_axis_tdata\b", re.IGNORECASE)
+_CSV_TVALID_GATE_RE = re.compile(r"\bif\s+\w*m_axis_tvalid\w*\s*=\s*[01]\b", re.IGNORECASE)
 # `m_axis_tvalid = '1' and m_axis_tready = '1'`: the DUT's own handshake decides.
-# The rule file's sketch samples the wires AT the edge into dut_m_axis_tvalid /
+# The rule file's complete streaming testbench samples the wires AT the edge into dut_m_axis_tvalid /
 # dut_m_axis_tready copies and compares those, so a prefix is allowed (the
 # CSV's integer flag is compared with 1, not '1', so it never matches here).
-_HANDSHAKE_RE = re.compile(r"\b\w*m_axis_tvalid\s*=\s*'1'\s+and\s+\w*m_axis_tready\s*=\s*'1'"
-                           r"|\b\w*m_axis_tready\s*=\s*'1'\s+and\s+\w*m_axis_tvalid\s*=\s*'1'", re.IGNORECASE)
+# Each term may be parenthesised: `if (a = '1') and (b = '1') then`.
+_HANDSHAKE_RE = re.compile(r"\b\w*m_axis_tvalid\s*=\s*'1'\s*\)?\s+and\s+\(?\s*\w*m_axis_tready\s*=\s*'1'"
+                           r"|\b\w*m_axis_tready\s*=\s*'1'\s*\)?\s+and\s+\(?\s*\w*m_axis_tvalid\s*=\s*'1'", re.IGNORECASE)
+# Without an m_axis_tready port the downstream is always ready: every edge
+# with the DUT's m_axis_tvalid = '1' is a consumed beat, so the compare is
+# guarded by `if dut_m_axis_tvalid = '1' then` (or `... and k_exp < n_exp`, in
+# either operand order: `if k_exp < n_exp and dut_m_axis_tvalid = '1' then` is
+# the same guard). A flag compare such as
+# `if (m_axis_tvalid = '1') /= (v_m_axis_tvalid = 1)` is not a guard.
+_VALID_ONLY_RE = re.compile(r"\b(?:if|elsif)\s+(?:[^;]*?\band\s+)?\(?\s*\w*m_axis_tvalid\s*=\s*'1'\s*\)?\s+"
+                            r"(?:then\b|and\b|or\b)", re.IGNORECASE)
+# Any identifier that carries the name (m_axis_tready, dut_m_axis_tready,
+# v_m_axis_tready): on a design without the port, none of them may exist.
+_M_AXIS_TREADY_RE = re.compile(r"\b\w*m_axis_tready\w*\b", re.IGNORECASE)
 _IF_RE = re.compile(r"\bif\b", re.IGNORECASE)
 _END_IF_RE = re.compile(r"\bend\s+if\b", re.IGNORECASE)
 
 
-def _row_variable_compare(lines: list[str], ports: list[dict]) -> str | None:
-    """A compare of the DUT's m_axis_tdata against the variable the current
-    outputs ROW was read into (`if m_axis_tdata /= v_m_axis_tdata`), or
-    None. Even inside the DUT's handshake, that is a cycle-by-cycle compare:
-    the row's value belongs to the beat sent on that row, which the pipeline
-    answers several cycles later. The beat-order pattern compares against an
-    array element (`exp_beats(k_exp)`) instead, and only stores the row
-    variable (`exp_beats(n) := v_m_axis_tdata`)."""
-    text = "\n".join(lines)
-    row_vars = {m.group(2) for m in _READ_TARGET_RE.finditer(text)
-                if _port_of(m.group(2), ports) == "m_axis_tdata"}
-    if not row_vars:
+def _no_strings(line: str) -> str:
+    """The line with its string literals blanked, so a port name inside a
+    report message does not count as a reference to the wire."""
+    return _STRING_RE.sub('""', line)
+
+
+def _dut_ref_re(names: list[str]) -> re.Pattern:
+    """A reference to the DUT's own output wire (`m_axis_tdata`) or to its
+    at-the-edge copy (`dut_m_axis_tdata`); never to a CSV row variable
+    (`v_m_axis_tdata`), an expected-beat array, or a width attribute
+    (`m_axis_tuser'length`, `m_axis_tdata'range`: a size, not the wire's
+    value)."""
+    alts = "|".join(re.escape(n) for n in names)
+    return re.compile(rf"(?<![\w'])(?:dut_)?(?:{alts})\b(?!\s*')", re.IGNORECASE)
+
+
+def _payload_ports(outputs: list[dict]) -> list[str]:
+    """The output ports that carry a value per beat: every output except
+    the handshake flags."""
+    return [p["name"] for p in outputs if p["name"].lower() not in _OUTPUT_FLAGS]
+
+
+def streaming_shape(spec: dict) -> dict | None:
+    """For a streaming design (s_axis_tvalid AND m_axis_tvalid among the
+    spec's ports) the wires the testbench has to handle, else None:
+    {"has_m_axis_tready": bool, "has_s_axis_tready": bool, "payload": [...]}.
+    The streaming checks below and the testbench writer's up-front hint
+    (testbench_generator.streaming_hint) both use this one test, so the
+    writer is told about exactly the designs the checker will hold to the
+    beat-order rule."""
+    ports = [p for p in (spec.get("ports") or []) if isinstance(p, dict) and p.get("name")]
+    names = {str(p["name"]).lower() for p in ports}
+    if not _STREAM_PORTS <= names:
         return None
-    var = "|".join(re.escape(v) for v in row_vars)
-    cmp_re = re.compile(rf"(?<![\w'])m_axis_tdata\s*/?=\s*(?:{var})\b|\b(?:{var})\s*/?=\s*m_axis_tdata(?!\w)",
-                        re.IGNORECASE)
-    for line in lines:
-        if cmp_re.search(line):
-            return line.strip()
+    outputs = [p for p in ports if str(p.get("direction", "")).lower() == "output"]
+    return {"has_m_axis_tready": "m_axis_tready" in names,
+            "has_s_axis_tready": "s_axis_tready" in names,
+            "payload": _payload_ports(outputs) or ["m_axis_tdata"]}
+
+
+def _row_variable_compare(lines: list[str], ports: list[dict], payload: list[str]) -> str | None:
+    """A compare of a DUT payload output (the wire or its dut_ copy) against
+    the variable the current outputs ROW was read into
+    (`if m_axis_tdata /= v_m_axis_tdata`,
+    `if to_integer(unsigned(dut_m_axis_tuser)) /= to_integer(unsigned(v_m_axis_tuser))`),
+    or None. Even inside the DUT's handshake, that is a cycle-by-cycle
+    compare: the row's value belongs to the beat sent on that row, which the
+    pipeline answers several cycles later. The beat-order pattern compares
+    against an array element (`exp_beats(k_exp)`) instead, and only stores
+    the row variable (`exp_beats(n) := v_m_axis_tdata`)."""
+    text = "\n".join(lines)
+    by_port: dict[str, set[str]] = {}
+    for m in _READ_TARGET_RE.finditer(text):
+        if m.group(2).lower() in ("c", "ok"):            # read_wide's own character reads
+            continue
+        port = _port_of(m.group(2), ports)
+        if port in payload:
+            by_port.setdefault(port, set()).add(m.group(2))
+    for port, row_vars in by_port.items():
+        var_re = re.compile(r"\b(?:" + "|".join(re.escape(v) for v in sorted(row_vars)) + r")\b", re.IGNORECASE)
+        dut_re = _dut_ref_re([port])
+        for line in lines:
+            bare = _no_strings(line)
+            if _CMP_RE.search(bare) and var_re.search(bare) and dut_re.search(bare):
+                return line.strip()
     return None
 
 
-def _csv_gated_compare(lines: list[str]) -> str | None:
-    """The `if <csv tvalid> = 1` line whose block compares the DUT's
-    m_axis_tdata, or None. Collecting expected beats inside such a block
+def _csv_gated_compare(lines: list[str], payload: list[str]) -> str | None:
+    """The `if <csv tvalid> = 1` line whose block compares a DUT payload
+    output, or None. Collecting expected beats inside such a block
     (`exp_beats(n) := v_m_axis_tdata`) is the correct pattern and is not
     a compare."""
+    dut_re = _dut_ref_re(payload)
     for start, line in enumerate(lines):
-        if not _CSV_TVALID_GATE_RE.search(line):
+        if not _CSV_TVALID_GATE_RE.search(_no_strings(line)):
             continue
         depth = 0
         for inner in lines[start:]:
-            depth += len(_IF_RE.findall(inner)) - 2 * len(_END_IF_RE.findall(inner))  # 'end if' also matches \bif\b
-            if _DUT_TDATA_CMP_RE.search(inner):
+            bare = _no_strings(inner)
+            depth += len(_IF_RE.findall(bare)) - 2 * len(_END_IF_RE.findall(bare))  # 'end if' also matches \bif\b
+            if _CMP_RE.search(bare) and dut_re.search(bare):
                 return line.strip()
             if depth <= 0:
                 break
     return None
 
 
+def _flag_cycle_compare(lines: list[str], flags: list[str]) -> str | None:
+    """A line that compares a handshake flag (s_axis_tready, m_axis_tvalid)
+    cycle by cycle with the CSV, or None: the CSV's integer flag and the
+    DUT's std_logic flag in one condition
+    (`if (m_axis_tvalid = '1') /= (v_m_axis_tvalid = 1)`,
+    `if dut_m_axis_tvalid = '0' and v_m_axis_tvalid = 1`), or a report
+    that calls the flag missing / unexpected / expected. timing_recovery,
+    2026-10-30: the design chooses its own latency L, the golden model
+    guessed another one, and the testbench reported "missing m_axis_tvalid"
+    on every expected row and "unexpected m_axis_tvalid" on every real
+    beat; the analyst blamed the RTL's strobe timing."""
+    for flag in flags:
+        csv_re = re.compile(rf"\b\w*{flag}\w*\s*=\s*[01]\b", re.IGNORECASE)
+        dut_re = re.compile(rf"\b\w*{flag}\w*\s*=\s*'[01]'", re.IGNORECASE)
+        # the keyword must sit NEXT to the flag ("missing m_axis_tvalid",
+        # "m_axis_tvalid expected"): "unexpected output beat (m_axis_tvalid
+        # high ...)" or "m_axis_tvalid beats: expected N" are legitimate
+        # beat-order messages. The analyst's _FLAG_LINE reads the same forms.
+        msg_re = re.compile(rf'"[^"]*(?:\b(?:missing|unexpected)\s+{flag}\b'
+                            rf'|\b{flag}\s*:?\s+(?:expected|mismatch|differs|wrong)\b)[^"]*"', re.IGNORECASE)
+        for line in lines:
+            bare = _no_strings(line)
+            if (csv_re.search(bare) and dut_re.search(bare)) or msg_re.search(line):
+                return line.strip()
+    return None
+
+
 def _streaming_checks(spec: dict, code: str) -> list[dict]:
-    """Streaming designs (AXI-Stream handshake ports) answer a few cycles
-    after the input beat, and the vectors put the expected output on the
-    SAME row as the input beat (matlab_golden_model_rules, STREAMING
-    DESIGNS). A testbench that compares cycle by cycle therefore fails on
-    every beat ("expected 24_50_141 got 0_0_0" in the LLR runs). Require
-    the beat-order pattern from vhdl_2008_testbench_rules instead."""
-    names = {str(p.get("name", "")).lower() for p in (spec.get("ports") or []) if isinstance(p, dict)}
-    if not _STREAM_PORTS <= names:
+    """Streaming designs (s_axis_tvalid + m_axis_tvalid; the tready wires
+    are optional) answer a few cycles after the input beat, and the vectors
+    put the expected output on the SAME row as the input beat
+    (matlab_golden_model_rules, STREAMING DESIGNS). A testbench that
+    compares cycle by cycle therefore fails on every beat ("expected
+    24_50_141 got 0_0_0" in the LLR runs; "missing m_axis_tvalid" on every
+    expected row in timing_recovery). Require the beat-order pattern from
+    vhdl_2008_testbench_rules instead."""
+    shape = streaming_shape(spec)
+    if shape is None:
         return []
+    has_tready = shape["has_m_axis_tready"]
+    payload = shape["payload"]
     lines = [line.split("--", 1)[0] for line in code.splitlines()]       # drop comments
-    rule = ("STREAMING DESIGNS rule: collect the outputs rows with m_axis_tvalid = 1 as the expected beats, "
-            "and compare m_axis_tdata with the next expected beat on every rising edge where the DUT's "
-            "m_axis_tvalid = '1' and m_axis_tready = '1'; never on the cycle of the outputs row.")
+    ports = [p for p in (spec.get("ports") or []) if isinstance(p, dict) and p.get("name")]
+    names = {str(p["name"]).lower() for p in ports}
+    flags = [f for f in _OUTPUT_FLAGS if f in names]
+    consumed = ("m_axis_tvalid = '1' and m_axis_tready = '1'" if has_tready else
+                "m_axis_tvalid = '1' (the spec has no m_axis_tready port: the downstream is always ready, so "
+                "every such edge is a consumed beat)")
+    rule = (f"STREAMING DESIGNS rule: collect the outputs rows with m_axis_tvalid = 1 as the expected beats "
+            f"({', '.join(payload)} of each such row, one array per column), and compare them with the next "
+            f"expected beat on every rising edge where the DUT's {consumed}; never on the cycle of the outputs "
+            f"row, and never compare the s_axis_tready / m_axis_tvalid columns themselves cycle by cycle.")
     issues: list[dict] = []
-    gate = _csv_gated_compare(lines)
+    gate = _csv_gated_compare(lines, payload)
     if gate:
         issues.append({"code": "streaming_cycle_compare",
-                       "detail": f"'{gate}' compares m_axis_tdata on the cycle the CSV row says, but the "
+                       "detail": f"'{gate}' compares the output on the cycle the CSV row says, but the "
                                  f"pipeline answers several cycles later, so every beat mismatches. {rule}"})
-    ports = [p for p in (spec.get("ports") or []) if isinstance(p, dict) and p.get("name")]
-    row_cmp = _row_variable_compare(lines, ports)
+    row_cmp = _row_variable_compare(lines, ports, payload)
     if row_cmp:
         issues.append({"code": "streaming_row_compare",
-                       "detail": f"'{row_cmp}' compares the DUT's m_axis_tdata with the value read from the CURRENT "
+                       "detail": f"'{row_cmp}' compares a DUT output with the value read from the CURRENT "
                                  f"outputs row. That row holds the result of the beat sent on that same row, which "
                                  f"the pipeline delivers several cycles later, so the output is checked against the "
                                  f"wrong beat (seen as 'expected X got 0' and later 'got X' on another cycle). "
                                  f"Store the row's value in an array of expected beats and compare against "
                                  f"exp_beats(k_exp). {rule}"})
-    if not _HANDSHAKE_RE.search(chr(10).join(lines)):
+    if not has_tready:
+        stray = next((line.strip() for line in lines if _M_AXIS_TREADY_RE.search(_no_strings(line))), None)
+        if stray:
+            issues.append({"code": "no_m_axis_tready_port",
+                           "detail": f"'{stray}' uses m_axis_tready, but the spec has no such port (the downstream "
+                                     f"is always ready), so this does not compile. Remove every m_axis_tready "
+                                     f"signal, variable and column: a beat is consumed on every rising edge where "
+                                     f"the DUT's m_axis_tvalid = '1'. {rule}"})
+    if not (_HANDSHAKE_RE if has_tready else _VALID_ONLY_RE).search(chr(10).join(lines)):
         issues.append({"code": "streaming_no_handshake_compare",
-                       "detail": f"No compare guarded by the DUT's handshake (m_axis_tvalid = '1' and "
-                                 f"m_axis_tready = '1') was found. {rule}"})
+                       "detail": f"No compare guarded by the DUT's handshake ({consumed}) was found. {rule}"})
+    flag = _flag_cycle_compare(lines, flags)
+    if flag:
+        issues.append({"code": "streaming_flag_cycle_compare",
+                       "detail": f"'{flag}' compares a handshake flag with the CSV cycle by cycle. The cycle on "
+                                 f"which the design raises m_axis_tvalid (its latency, its strobe pattern) and "
+                                 f"what s_axis_tready shows during reset belong to the RTL and are not in the "
+                                 f"CSV: the CSV's m_axis_tvalid column only marks WHICH outputs rows hold an "
+                                 f"expected beat, in order (timing_recovery, 2026-10-30: 'missing m_axis_tvalid' "
+                                 f"on every expected row, 'unexpected m_axis_tvalid' on every real beat, and the "
+                                 f"RTL was blamed). Never report 'missing/unexpected m_axis_tvalid' or "
+                                 f"'<flag> expected X got Y' per cycle; read v_s_axis_tready and v_m_axis_tvalid "
+                                 f"only to find the expected beats. {rule}"})
     idle = _idle_row_hold_issue(lines)
     if idle:
         issues.append(idle)

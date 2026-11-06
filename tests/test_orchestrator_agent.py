@@ -53,8 +53,8 @@ def fakes(monkeypatch):
                         {"session_id": "s1", "status": "COMPLETE", "pending_question": None, "spec": SPEC})
     monkeypatch.setattr(orch, "run_rtl_generation", lambda spec, requirement_id, attempt, previous, last_rtl:
                         calls.append(("rtl", spec, requirement_id, attempt, previous)) or {"status": "COMPLETE", "rtl": RTL})
-    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history:
-                        calls.append(("tb", spec, rtl, requirement_id, attempt, history)) or {"status": "COMPLETE", "testbench": TB})
+    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history, previous:
+                        calls.append(("tb", spec, rtl, requirement_id, attempt, history, previous)) or {"status": "COMPLETE", "testbench": TB})
     monkeypatch.setattr(orch, "run_test_vector_generation", lambda spec, run_dir, requirement_id, attempt, history:
                         calls.append(("vectors", spec, run_dir, requirement_id, attempt, history)) or VECTORS)
     monkeypatch.setattr(orch.project_writer, "mcp_read_file",                  # CSVs exist; no earlier RTL/testbench on disk
@@ -88,9 +88,9 @@ def test_llm_drives_the_whole_flow_passing_results_between_the_tools(fakes):
     assert "WNS 8.6 ns" in out["summary"]                                   # the code writes the summary from the real numbers
     name = out["requirement_id"]
     project = str(orch.project_writer.REPO_ROOT / "projects" / name)        # the tools hand spec/rtl/... to each other
-    assert calls == [("spec", "4-bit counter"), ("rtl", SPEC, name, 1, []), ("tb", SPEC, RTL, name, 1, []),
+    assert calls == [("spec", "4-bit counter"), ("rtl", SPEC, name, 1, []), ("tb", SPEC, RTL, name, 1, [], None),
                      ("vectors", SPEC, None, name, 1, []),                   # RTL, testbench and test vector agents are
-                     f"sim:{project}:20us", "impl:xc7a35tcpg236-1"]           # told: run id, 1st call, no history
+                     f"sim:{project}:20us", "impl:xc7a35tcpg236-1"]           # told: run id, 1st call, no history, no earlier testbench
     assert sorted(written) == [f"projects/{name}/spec.json", f"projects/{name}/src/counter4.vhd",
                                f"projects/{name}/tb/counter4_tb.vhd", f"projects/{name}/test_vectors_in.csv",
                                f"projects/{name}/test_vectors_out.csv"]
@@ -179,15 +179,16 @@ def test_a_failed_simulation_blames_the_testbench_and_the_testbench_agent_is_tol
     monkeypatch.setattr(orch, "run_simulation", lambda project, sim_time:
                         {"status": "NEEDS_REVIEW", "verdict": "fail", "analysis": analysis, "error": "simulation fail"})
     told = []
-    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history:
-                        told.append((attempt, history)) or {"status": "COMPLETE", "testbench": TB})
+    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history, previous:
+                        told.append((attempt, history, previous)) or {"status": "COMPLETE", "testbench": TB})
     out = run_with([analyze(), call("generate_rtl"), call("generate_testbench"), call("write_project"),
                     call("simulate"), call("generate_testbench"), final("NEEDS_REVIEW", "stop")])
     tb_first = out["stages"]["generate_testbench"]["attempt_history"][0]
     assert tb_first["downstream"] == [{"stage": "simulate", "verdict": "fail", "failures": analysis["failures"],
                                        "summary": analysis["summary"], "suggested_fix": analysis["suggested_fix"]}]
     assert "downstream" not in out["stages"]["generate_rtl"]["attempt_history"][0]        # the RTL is not blamed
-    assert told == [(1, []), (2, [tb_first])]                                  # 2nd testbench call is handed the blame
+    # 2nd testbench call is handed the blame AND the testbench it delivered, to revise instead of rewrite
+    assert told == [(1, [], None), (2, [tb_first], TB)]
 
 
 def test_requirement_id_is_name_then_time_then_date():
@@ -339,7 +340,7 @@ def failing_sim(monkeypatch, likely_cause="rtl"):
 def test_after_two_rtl_retries_with_the_same_failure_the_testbench_and_vectors_get_a_second_opinion(fakes, monkeypatch):
     failing_sim(monkeypatch)
     tb_told, tv_told, messages = [], [], []
-    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history:
+    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history, previous:
                         tb_told.append((attempt, history)) or {"status": "COMPLETE", "testbench": TB})
     monkeypatch.setattr(orch, "run_test_vector_generation", lambda spec, run_dir, requirement_id, attempt, history:
                         tv_told.append((attempt, history)) or VECTORS)
