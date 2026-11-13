@@ -57,8 +57,9 @@ def fakes(monkeypatch):
                         calls.append(("tb", spec, rtl, requirement_id, attempt, history, previous)) or {"status": "COMPLETE", "testbench": TB})
     monkeypatch.setattr(orch, "run_test_vector_generation", lambda spec, run_dir, requirement_id, attempt, history:
                         calls.append(("vectors", spec, run_dir, requirement_id, attempt, history)) or VECTORS)
-    monkeypatch.setattr(orch.project_writer, "mcp_read_file",                  # CSVs exist; no earlier RTL/testbench on disk
-                        lambda d, f: None if f.endswith(".vhd") else f"{f}:cycle,...\n0,...\n")
+    monkeypatch.setattr(orch.project_writer, "mcp_read_file",                  # CSVs exist; no earlier RTL/testbench on disk,
+                        lambda d, f: None if f.endswith(".vhd") or f == "loop_trace.csv"   # no loop trace (not a closed loop)
+                        else f"{f}:cycle,...\n0,...\n")
     monkeypatch.setattr(orch.project_writer, "mcp_write_files", lambda root, files: written.update(files))
     monkeypatch.setattr(orch, "run_simulation", lambda project, sim_time: calls.append(f"sim:{project}:{sim_time}") or
                         {"status": "COMPLETE", "verdict": "pass", "analysis": {"verdict": "pass"}})
@@ -91,7 +92,8 @@ def test_llm_drives_the_whole_flow_passing_results_between_the_tools(fakes):
     assert calls == [("spec", "4-bit counter"), ("rtl", SPEC, name, 1, []), ("tb", SPEC, RTL, name, 1, [], None),
                      ("vectors", SPEC, None, name, 1, []),                   # RTL, testbench and test vector agents are
                      f"sim:{project}:20us", "impl:xc7a35tcpg236-1"]           # told: run id, 1st call, no history, no earlier testbench
-    assert sorted(written) == [f"projects/{name}/spec.json", f"projects/{name}/src/counter4.vhd",
+    assert sorted(written) == [f"projects/{name}/gen_test_vectors.m", f"projects/{name}/spec.json",
+                               f"projects/{name}/src/counter4.vhd",
                                f"projects/{name}/tb/counter4_tb.vhd", f"projects/{name}/test_vectors_in.csv",
                                f"projects/{name}/test_vectors_out.csv"]
     assert json.loads(written[f"projects/{name}/spec.json"]) == SPEC
@@ -130,6 +132,19 @@ def test_write_project_keeps_the_overwritten_rtl_and_testbench_under_history(fak
     assert list(history.values()) == ["old rtl"]                        # RTL changed: kept; testbench same: not kept
     assert list(history)[0].startswith(f"projects/r1/history/src_{RTL['entity_name']}_")
     assert written[f"projects/r1/src/{RTL['entity_name']}.vhd"] == RTL["code"]
+
+
+def test_write_project_copies_the_matlab_script_next_to_the_vectors(fakes, monkeypatch):
+    """2026-11-10: the owner wants the MATLAB script that produced the CSVs
+    inside the project folder, not only in runs/test_vectors/<run>/."""
+    in_run = {"test_vectors_in.csv": "in", "test_vectors_out.csv": "out", "gen_test_vectors.m": "x = 1;"}
+    written: dict[str, str] = {}
+    monkeypatch.setattr(orch.project_writer, "mcp_read_file", lambda root, rel: in_run.get(rel))
+    monkeypatch.setattr(orch.project_writer, "mcp_write_files", lambda root, files: written.update(files))
+    orch.project_writer.write_project("r1", SPEC, RTL, TB, {"status": "COMPLETE", "run_dir": "runs/x",
+                                      "result": {"input_csv": "test_vectors_in.csv", "output_csv": "test_vectors_out.csv"}})
+    assert written["projects/r1/gen_test_vectors.m"] == "x = 1;"
+    assert "projects/r1/loop_trace.csv" not in written                  # no trace in the run folder: nothing invented
 
 
 def test_each_helper_marks_its_status_attempts_and_error_in_the_state(fakes, monkeypatch):
@@ -465,3 +480,85 @@ def test_the_retry_limit_question_lists_every_attempt_and_suggests_the_other_sid
     assert "NEEDS_REVIEW" in suggestions[-1]
     _, spec_suggestions = retry_limit_question(Stage.ANALYZE_SPEC, [])
     assert spec_suggestions == ["Run analyze_spec once more", "Stop the run so I can review it (NEEDS_REVIEW)"]
+
+
+def test_simulate_is_refused_while_the_rtl_is_not_finished(fakes, monkeypatch):
+    """Run be4b20ac (2026-11-11): the RTL agent stopped with NEEDS_REVIEW and
+    smoke_output_stuck_at_zero open, and the manager AI simulated anyway. The
+    simulation must not run; the manager is told why and what to call."""
+    calls, _ = fakes
+    stuck = {"status": "NEEDS_REVIEW", "rtl": RTL, "error": "2 fix attempts left the lint issues unchanged.",
+             "lint": {"issues": [{"code": "smoke_output_stuck_at_zero", "detail": "0 on ALL 131 accepted beats"}]}}
+    results = iter([stuck, {"status": "COMPLETE", "rtl": RTL}])
+    monkeypatch.setattr(orch, "run_rtl_generation", lambda *a: next(results))
+    out = run_with([analyze(), call("generate_rtl"), call("generate_testbench"), call("write_project"),
+                    call("simulate"), call("generate_rtl"), call("simulate"), final("COMPLETE", "done")])
+    assert [c for c in calls if isinstance(c, str) and c.startswith("sim:")] == [calls[-1]]   # only the 2nd simulate ran
+    assert out["stages"]["simulate"]["attempts"] == 1                       # the refused call is not an attempt
+    blocked = orch.guard_rtl_not_finished(state_with(stages={"generate_rtl": {
+        "status": "NEEDS_REVIEW", "error": "stuck", "attempt_history": [{"issues": stuck["lint"]["issues"]}]}}),
+        orch.Stage.SIMULATE)
+    message = json.loads(blocked.update["messages"][0].content)
+    assert message["status"] == "BLOCKED" and message["open_rtl_findings"] == ["smoke_output_stuck_at_zero"]
+    assert "Call generate_rtl again" in message["reason"] and "stages" not in blocked.update
+    # finished RTL, or a tool called before any RTL was made: nothing is refused
+    assert orch.guard_rtl_not_finished(state_with(stages={"generate_rtl": {"status": "COMPLETE"}}), orch.Stage.SIMULATE) is None
+    assert orch.guard_rtl_not_finished(state_with(), orch.Stage.SIMULATE) is None
+
+
+def test_while_the_rtl_is_blamed_and_has_a_call_left_other_helpers_are_not_re_made(fakes, monkeypatch):
+    """Run d4fa0f77 (2026-11-11 13:01): every simulation blamed the RTL (and the
+    RTL was the only wrong part), yet after the 2nd failure the manager AI re-made
+    the test vectors 3 times and the testbench once; the RTL helper's 3rd call was
+    never used. Such a call is now answered BLOCKED, naming the helper to call."""
+    failing_sim(monkeypatch)
+    rtl_told, tv_told, tb_told = [], [], []
+    monkeypatch.setattr(orch, "run_rtl_generation", lambda spec, requirement_id, attempt, previous, last_rtl:
+                        rtl_told.append(attempt) or {"status": "COMPLETE", "rtl": RTL})
+    monkeypatch.setattr(orch, "run_test_vector_generation", lambda spec, run_dir, requirement_id, attempt, history:
+                        tv_told.append(attempt) or VECTORS)
+    monkeypatch.setattr(orch, "run_testbench_generation", lambda spec, rtl, requirement_id, attempt, history, previous:
+                        tb_told.append(attempt) or {"status": "COMPLETE", "testbench": TB})
+    out = run_with([analyze(), call("generate_rtl"), call("generate_testbench"), call("generate_test_vectors"),
+                    call("write_project"), call("simulate"),                  # fails, blames the RTL
+                    call("generate_test_vectors"), call("generate_testbench"),  # both refused
+                    call("generate_rtl"),                                     # the blamed helper runs
+                    call("generate_testbench"),                               # the RTL changed: allowed again
+                    final("NEEDS_REVIEW", "stop")])
+    assert rtl_told == [1, 2] and tv_told == [1] and tb_told == [1, 2]
+    assert out["stages"]["generate_test_vectors"]["attempts"] == 1            # a refused call is not an attempt
+    assert out["stages"]["generate_testbench"]["attempts"] == 2
+
+
+def test_the_blamed_helper_first_rule_steps_aside_when_it_should():
+    from agents.orchestrator_agent.guard import blamed_helper_first, open_blame
+    S = orch.Stage
+    note = {"stage": "simulate", "summary": "mu diverges at beat 64"}
+    blamed_rtl = {"attempts": 2, "attempt_history": [{"attempt": 1, "downstream": [note]}, {"attempt": 2, "downstream": [note]}]}
+    plain = {"attempts": 1, "attempt_history": [{"attempt": 1}]}
+    state = state_with(stages={"generate_rtl": blamed_rtl, "generate_testbench": plain, "generate_test_vectors": plain})
+    blocked = blamed_helper_first(state, S.GENERATE_TEST_VECTORS)
+    message = json.loads(blocked.update["messages"][0].content)
+    assert message["status"] == "BLOCKED" and message["blamed"] == "generate_rtl"
+    assert message["blamed_calls_used"] == 2 and message["blamed_calls_allowed"] == 3
+    assert "Call generate_rtl now" in message["reason"] and message["failure"] == "mu diverges at beat 64"
+    assert "stages" not in blocked.update                                     # nothing is written to the state
+    assert blamed_helper_first(state, S.GENERATE_RTL) is None                 # the blamed helper itself runs
+    # the RTL has used its 3 calls: the others may be re-made (second-opinion time)
+    used_up = {"attempts": 3, "attempt_history": [{"attempt": n, "downstream": [note]} for n in (1, 2, 3)]}
+    state = state_with(stages={"generate_rtl": used_up, "generate_testbench": plain})
+    assert blamed_helper_first(state, S.GENERATE_TESTBENCH) is None
+    # a helper that was itself told to re-check (second opinion) is not refused
+    told = {"attempts": 1, "attempt_history": [{"attempt": 1, "downstream": [{**note, "second_opinion": True}]}]}
+    state = state_with(stages={"generate_rtl": blamed_rtl, "generate_testbench": told})
+    assert blamed_helper_first(state, S.GENERATE_TESTBENCH) is None
+    assert open_blame(state.state, S.GENERATE_TESTBENCH) is None                    # a second opinion blames nobody
+    # the person answered at the retry limit for the blamed helper: their word decides, not this rule
+    answered = {"attempts": 3, "retry_limit": 5, "attempt_history": [{"attempt": 3, "downstream": [note], "human_note": "re-run the testbench"}]}
+    state = state_with(stages={"generate_rtl": answered, "generate_testbench": plain})
+    assert blamed_helper_first(state, S.GENERATE_TESTBENCH) is None
+    # the RTL was re-run since the blame, or nothing has failed yet: nothing is refused
+    redone = {"attempts": 2, "attempt_history": [{"attempt": 1, "downstream": [note]}, {"attempt": 2}]}
+    assert blamed_helper_first(state_with(stages={"generate_rtl": redone, "generate_testbench": plain}), S.GENERATE_TESTBENCH) is None
+    assert blamed_helper_first(state_with(), S.GENERATE_RTL) is None
+

@@ -45,6 +45,8 @@ projects/*
 *.pb
 *.wdb
 *.vcd
+# ...but keep the hand-made wave files the tests read (tests/test_simulation_agent.py)
+!tests/fixtures/*.vcd
 *.str
 xsim.dir/
 .Xil/

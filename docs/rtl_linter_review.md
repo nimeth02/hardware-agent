@@ -1,7 +1,7 @@
 # RTL Linter Review — request for FPGA-engineer feedback
 
 **Project:** Hardware Agent (AI-generated VHDL → lint → simulate → implement)
-**Component under review:** `agents/rtl_agent/rtl_linter.py` (+ `agents/lint_utils.py`, `agents/rtl_agent/rtl_smoke_check.py`)
+**Component under review:** `agents/rtl_agent/lint/rtl_linter.py` (+ `agents/lint_utils.py`, `agents/rtl_agent/lint/rtl_smoke_check.py`)
 **Date:** 2026-10-22
 **What we need from you:** for each check below, tell us whether it is
 **Correct** (catches a real problem, no false alarms), **Enhanced** (goes

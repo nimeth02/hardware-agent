@@ -1,4 +1,4 @@
-# agents/test_vector_agent/test_vector_validator.py — deterministic checks
+# agents/test_vector_agent/lint/test_vector_validator.py — deterministic checks
 # on the two CSVs the test-vector agent produced: both exist, each has the
 # expected header (cycle, then that direction's spec ports in spec order),
 # they have the same rows with the same cycle numbers, and every value is
@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 
 from agents.mcp_utils import mcp_read_file
+from agents.test_vector_agent.lint.output_range_check import saturated_output_issue
 
 INPUT_CSV = "test_vectors_in.csv"
 OUTPUT_CSV = "test_vectors_out.csv"
@@ -155,7 +156,8 @@ def _longest_run(flags: list[bool]) -> int:
 # "one per 4 input clocks", "1 output every 4 samples", "every 4th cycle",
 # "decimate by 4", "decimation factor of 4", "4:1 decimation".
 _RATE_RES = [
-    re.compile(r"\b(?:one|1)\s+(?:output\s+|symbol\s+|beat\s+|sample\s+)*(?:per|every)\s+(\d+)\s+(?:input\s+)?"
+    # up to 3 words between "one" and "per": "one recovered symbol per 4 input samples" (2026-11-11 17:15)
+    re.compile(r"\b(?:one|1)\s+(?:[A-Za-z]+\s+){0,3}(?:per|every)\s+(\d+)\s+(?:input\s+)?"
                r"(?:clocks?|cycles?|samples?|inputs?|beats?|ticks?)\b", re.I),
     re.compile(r"\bevery\s+(\d+)(?:st|nd|rd|th)?\s+(?:input\s+)?(?:clocks?|cycles?|samples?|inputs?|beats?)\b", re.I),
     re.compile(r"\bdecimat\w*\s+(?:by|factor(?:\s+of)?|ratio(?:\s+of)?)\s+(\d+)\b", re.I),
@@ -237,6 +239,17 @@ def _value_sanity_checks(spec: dict, in_header: list[str], in_rows: list[list[st
                   f"(use random symbols) or the loop blew up and repeats one value. Run the whole loop on real "
                   f"values (code / 2^fraction_bits), add assert(abs(v) < 1/N, ...) at every strobe, and check the "
                   f"printed CSV before finishing.")
+        elif out_share == len(out_values) and in_share < in_beats:
+            # every beat the same number, zero included, while the input varies: the test proves nothing
+            # (timing_recovery 2026-11-06 18:47: 99 expected beats, all 0; the warm-up exemption above let it through)
+            issue("constant_output",
+                  f"m_axis_tdata is {out_value or 0} on ALL {len(out_values)} expected output beats while s_axis_tdata "
+                  f"takes {len(set(in_values))} different values. A test whose every answer is the same number proves "
+                  f"nothing: an RTL that never computes anything passes it. In the 2026-11-06 18:47 run the pulse "
+                  f"filter was applied to the symbols BEFORE the x4 upsample, so 3 of every 4 input samples were "
+                  f"exactly 0 and every strobe, with mu = 0, read a zero sample. Upsample first, then filter "
+                  f"(conv(upsampled, h)), check that most input samples are non-zero, and look at the printed CSV: "
+                  f"the expected values must differ from beat to beat.")
 
     run = _longest_run(beat_flags)
     if run >= max(4, 2 * rate):
@@ -307,6 +320,9 @@ def validate_test_vectors(spec: dict, run_dir: str, result: dict) -> dict:
         _reset_row_checks(spec, in_header, in_rows, out_header, out_rows, issue)
         _backpressure_row_checks(in_header, in_rows, issue)
         _value_sanity_checks(spec, in_header, in_rows, out_header, out_rows, issue)
+        saturated = saturated_output_issue(spec, spec_output_rate(spec), in_header, in_rows, out_header, out_rows)
+        if saturated:                               # expected outputs pinned at full scale (output_range_check.py)
+            issue(saturated["code"], saturated["detail"])
 
     return {
         "csv": {"inputs": str(Path(run_dir) / in_name) if in_header else None,

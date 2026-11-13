@@ -382,15 +382,71 @@ def history_index_by_counter(code: str) -> list[str]:
     return [f"line {h['line']} `{h['text']}`: {_history_reason(h)}" for h in _history_reads_by_counter(code)]
 
 
-def _why(error: str, crash_line: str, overrun: dict | None = None, history: dict | None = None) -> str:
+# An assert that can never pass: it compares a list's length with a number
+# defined FROM that same length. timing_recovery 2026-11-06 18:46 (run
+# ce5d6a48): `Nc = numel(Ic) + sps - 1; assert(numel(Ic) == Nc && numel(Qc)
+# == Nc, 'pulse length mismatch')` — numel(Ic) == numel(Ic) + 3 is false
+# whatever Ic holds. The generic assert hint said "fix the values, not the
+# assert", the opposite of what was needed; the attempt was lost.
+_LEN_EQ_RE = re.compile(r"(?:numel|length)\s*\(\s*([A-Za-z_]\w*)\s*\)\s*==\s*([A-Za-z_]\w*)(?![\w(])"
+                        r"|(?<![\w.])([A-Za-z_]\w*)\s*==\s*(?:numel|length)\s*\(\s*([A-Za-z_]\w*)\s*\)")
+
+
+def _assert_contradiction(code: str, crash_line: str) -> dict | None:
+    """For an assert line comparing numel(X) == N: the definition `N = ...`
+    that itself uses numel(X)/length(X) plus or minus something, if any."""
+    if not re.match(r"\s*assert\s*\(", crash_line):
+        return None
+    lines = _code_only(code).splitlines()
+    for m in _LEN_EQ_RE.finditer(_code_only(crash_line)):
+        x, n = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+        for d, line in enumerate(lines, 1):
+            dm = re.match(rf"\s*{re.escape(n)}\s*=(?!=)\s*(.+?)\s*;?\s*$", line)
+            if not dm:
+                continue
+            expr = dm.group(1)
+            if re.search(rf"(?:numel|length)\s*\(\s*{re.escape(x)}\s*\)", expr) and \
+                    not re.fullmatch(rf"(?:numel|length)\s*\(\s*{re.escape(x)}\s*\)", expr):
+                return {"x": x, "n": n, "def_line": d, "expr": expr}
+    return None
+
+
+def _contradiction_reason(c: dict) -> str:
+    x, n, expr, d = c["x"], c["n"], c["expr"], c["def_line"]
+    return (f"This check can never pass: {n} is defined on line {d} as `{n} = {expr}`, so `numel({x}) == {n}` compares "
+            f"the length of {x} with that same length changed by an offset. The CHECK is wrong, not the values of {x}. "
+            f"Decide which length you mean: if {n} is the length AFTER a later step (upsampling by sps gives nsym*sps "
+            f"values, conv(a, b) gives numel(a)+numel(b)-1), compute {n} from the inputs (nsym, sps, numel(h)) and "
+            f"assert the RESULT of that step against it, on the line after that step; if you meant the length of {x} "
+            f"as it is now, define {n} from what {x} was built from, not from numel({x}). Change the {n} line or the "
+            f"assert, not {x}.")
+
+
+def contradicting_asserts(code: str) -> list[str]:
+    """Plain description of every assert in the script that compares a list's
+    length with a number defined from that same length, for the pre-run
+    rejection."""
+    found: list[str] = []
+    for k, (line, raw) in enumerate(zip(_code_only(code).splitlines(), code.splitlines()), 1):
+        c = _assert_contradiction(code, line)
+        if c:
+            found.append(f"line {k} `{raw.strip()}`: {_contradiction_reason(c)}")
+    return found
+
+
+def _why(error: str, crash_line: str, overrun: dict | None = None, history: dict | None = None,
+         contradiction: dict | None = None) -> str:
     """Plain reason for the MATLAB message, or "" when it is not one seen before.
     `overrun` is the loop read past the end found on the crashed line, if any,
-    and `history` a fixed history buffer read with a running sample count: each
-    names the real cause instead of the generic list-length hint."""
+    `history` a fixed history buffer read with a running sample count, and
+    `contradiction` an assert that compares a length with itself plus an
+    offset: each names the real cause instead of the generic hint."""
     if history and _INDEX_ERROR_RE.search(error):
         return _history_reason(history)
     if overrun and _INDEX_ERROR_RE.search(error):
         return _overrun_reason(overrun)
+    if contradiction:
+        return _contradiction_reason(contradiction)
     for pattern, hint in _ERROR_HINTS:
         m = re.search(pattern, error, re.IGNORECASE)
         if m:
@@ -420,7 +476,8 @@ def crash_note(code: str, error: str, script: str = SCRIPT_NAME) -> str:
                 parts.append(f"{'-->' if k == n else '   '}{k:4d} | {lines[k - 1]}")
     overrun = next((o for o in _loop_overruns(code) if numbers and o["line"] == numbers[0]), None)
     history = next((h for h in _history_reads_by_counter(code) if numbers and h["line"] == numbers[0]), None)
-    why = _why(error, lines[numbers[0] - 1] if numbers else "", overrun, history)
+    crash_line = lines[numbers[0] - 1] if numbers else ""
+    why = _why(error, crash_line, overrun, history, _assert_contradiction(code, crash_line))
     if why:
         parts.append("WHY: " + why)
     parts.append("FIX: change only this line (and whatever it depends on) with generate_matlab_script; keep every other "
@@ -631,7 +688,7 @@ def missing_beat_count_assert(spec: dict | None, code: str) -> str | None:
     """Why the script is rejected when the spec states an output rate but no
     `assert(...)` line in the script mentions the output beat count; None
     when the check does not apply or the assert is there."""
-    from agents.test_vector_agent.test_vector_validator import spec_output_rate   # no import cycle: validator imports no guard
+    from agents.test_vector_agent.lint.test_vector_validator import spec_output_rate   # no import cycle: validator imports no guard
     rate = spec_output_rate(spec)
     if rate is None or not _is_streaming(spec):
         return None
@@ -669,6 +726,64 @@ def missing_finite_assert(spec: dict | None, code: str) -> str | None:
             "stimulus is built and before any saturate/pack line add: assert(all(isfinite(xI)) && "
             "all(isfinite(xQ)), 'stimulus has NaN/Inf: check every division and normalisation'); (use your own "
             "stimulus names; one assert per input signal is fine)")
+
+
+# Noise in the stimulus of a closed loop. The golden model applies the loop
+# filter's value on the next sample, a pipelined RTL several samples later;
+# on a clean stimulus the two settle onto the same path (within 2 steps after
+# 64 beats, 40 seeds, 2026-11-09), on a noisy one they never do: a CORRECT
+# design then differs by hundreds of steps on some beats and the compare
+# fails whatever the RTL does (scripts of 2026-11-06 / 11-09 with randn and a
+# +500 ppm rate error: up to 1361 steps and a mu 128 of 256 away).
+_LOOP_SPEC_WORDS = re.compile(r"\bloop\s+filter\b|\bNCO\b|\bintegrator\b|\bfeedback\b|\bTED\b|\bPLL\b|\bAGC\b",
+                              re.IGNORECASE)
+_NOISE_CALL = re.compile(r"(?<![\w.])(randn|awgn)\s*\(", re.IGNORECASE)
+
+
+def _spec_text(spec: dict | None) -> str:
+    spec = spec or {}
+    return "\n".join([str(spec.get("description") or "")] + [str(b) for b in spec.get("behavior") or []])
+
+
+def noisy_closed_loop_stimulus(spec: dict | None, code: str) -> str | None:
+    """Why the script is rejected when the spec describes a closed loop (a
+    loop filter, an NCO, an integrator fed back) and the script adds noise to
+    its stimulus; None when it does not or the spec has no loop."""
+    if not _is_streaming(spec) or not _LOOP_SPEC_WORDS.search(_spec_text(spec)):
+        return None
+    lines = [(n, line.strip()) for n, line in enumerate(_code_only(code).splitlines(), 1) if _NOISE_CALL.search(line)]
+    if not lines:
+        return None
+    n, text = lines[0]
+    return (f"line {n} `{text}` adds noise to the stimulus of a closed-loop design. The golden model's loop reacts on "
+            f"the next sample and the RTL's a few samples later; on a noisy stimulus the two never settle onto the "
+            f"same path, so a CORRECT design fails the beat-by-beat compare. This simulation checks that the RTL "
+            f"computes the spec's formulas, not its noise performance (the spec's Es/N0 and ppm figures belong to "
+            f"the graded test). Use the clean stimulus of the CLOSED-LOOP STIMULUS rule: random +/-1 symbols drawn "
+            f"separately for I and Q, each spread over the 4 samples with p = [0.25 0.75 0.75 0.25], scaled by 2048, "
+            f"at least 200 symbols; no randn / awgn, no sample-rate error, no resampling, no fractional start offset")
+
+
+LOOP_TRACE_CSV = "loop_trace.csv"
+
+
+def missing_loop_trace(spec: dict | None, code: str) -> str | None:
+    """Why the script is rejected when the spec describes a closed loop and
+    the script never writes loop_trace.csv (CLOSED-LOOP TRACE rule); None
+    when it does or the spec has no loop. The trace is what lets the RTL
+    writer see the model's mu / e / v / acc per beat next to the chip's
+    registers when the dry run fails (simulation_agent.inside_values)."""
+    if not _is_streaming(spec) or not _LOOP_SPEC_WORDS.search(_spec_text(spec)):
+        return None
+    if re.search(rf"\b{re.escape(LOOP_TRACE_CSV)}\b", code or "", re.IGNORECASE):
+        return None
+    return (f"the spec describes a closed loop but the script never writes {LOOP_TRACE_CSV}. When the dry run fails, "
+            f"the RTL writer is shown the model's loop values from that file next to the chip's registers for the "
+            f"same beats; without it it only sees the output pins and guesses. Add the CLOSED-LOOP TRACE rule's lines: "
+            f"trace_names = {{'beat','cycle','mu8','e','v','acc','y_sym_i','y_sym_q','y_mid_i','y_mid_q'}}; collect "
+            f"one row per output beat inside the strobe branch (beat = nOut before it is incremented, cycle, "
+            f"floor(mu*256), e, v, acc, the two output codes, the two y_mid codes) and write it after the loop with "
+            f"writetable(array2table(trace, 'VariableNames', trace_names), '{LOOP_TRACE_CSV}')")
 
 
 def keep_failed_script(project_dir: str, stem: str, failure_no: int) -> None:
@@ -752,6 +867,12 @@ def guard_matlab_tools(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILUR
         no_finite = missing_finite_assert(spec, str(kwargs.get("code") or ""))
         if no_finite:
             return "REJECTED: " + no_finite + ". Rewrite and call generate_matlab_script again."
+        noisy = noisy_closed_loop_stimulus(spec, str(kwargs.get("code") or ""))
+        if noisy:
+            return "REJECTED: " + noisy + ". Rewrite and call generate_matlab_script again."
+        no_trace = missing_loop_trace(spec, str(kwargs.get("code") or ""))
+        if no_trace:
+            return "REJECTED: " + no_trace + ". Rewrite and call generate_matlab_script again."
         overruns = loop_index_overruns(str(kwargs.get("code") or ""))
         if overruns:
             return ("REJECTED: a loop reads past the end of a list, so MATLAB would stop with 'Index exceeds the "
@@ -762,6 +883,11 @@ def guard_matlab_tools(tools: list[BaseTool], max_failures: int = MAX_RUN_FAILUR
             return ("REJECTED: a fixed sample history is indexed with the running sample count, so MATLAB would stop "
                     "with 'Array indices must be positive' on the first strobe (timing_recovery 2026-11-06 17:12: "
                     "xbufI(m) with m = nIn - 2): " + "; ".join(by_counter) + ". Rewrite and call generate_matlab_script again.")
+        contradictions = contradicting_asserts(str(kwargs.get("code") or ""))
+        if contradictions:
+            return ("REJECTED: an assert compares a list's length with a number defined from that same length, so it "
+                    "fails whatever the list holds (timing_recovery 2026-11-06 18:46: Nc = numel(Ic) + sps - 1; "
+                    "assert(numel(Ic) == Nc)): " + "; ".join(contradictions) + ". Rewrite and call generate_matlab_script again.")
         # Same code as a script that already crashed (comments or spacing
         # aside) fails the same way: say so instead of spending a run on it.
         code = str(kwargs.get("code") or "")

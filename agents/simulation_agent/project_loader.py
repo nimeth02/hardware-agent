@@ -65,7 +65,7 @@ class SimulationProjectLoader:
                     raise RuntimeError(f"spec.json is not valid JSON: {e}") from e
 
             test_vectors = [n for n in root_files if n.lower().endswith(".csv")]
-            test_vectors_in_csv = test_vectors_out_csv = None
+            test_vectors_in_csv = test_vectors_out_csv = loop_trace_csv = None
             for csv_name in test_vectors:
                 content = await read(csv_name)
                 # both kept for the analyst: the stimulus row and the expected
@@ -76,6 +76,8 @@ class SimulationProjectLoader:
                     test_vectors_in_csv = content
                 elif csv_name.lower() == "test_vectors_out.csv":
                     test_vectors_out_csv = content
+                elif csv_name.lower() == "loop_trace.csv":
+                    loop_trace_csv = content           # the golden model's loop values per beat (inside_values)
                 # xsim runs with work_proj/ as cwd: put the CSVs where a
                 # relative open() in the testbench will find them.
                 out = text(await tools["write_file"].ainvoke(
@@ -93,5 +95,6 @@ class SimulationProjectLoader:
             "test_vectors": test_vectors,
             "test_vectors_in_csv": test_vectors_in_csv,
             "test_vectors_out_csv": test_vectors_out_csv,
+            "loop_trace_csv": loop_trace_csv,
             "testbench_code": testbench_code,
         }

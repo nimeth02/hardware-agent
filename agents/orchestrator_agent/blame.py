@@ -89,6 +89,11 @@ def downstream_note(by: Stage, analysis: dict) -> dict:
         note["failing_beats"] = beats[:MAX_EVIDENCE_ROWS]
     if analysis.get("log_excerpt"):
         note["log_excerpt"] = str(analysis["log_excerpt"])[:MAX_EVIDENCE_CHARS]
+    if isinstance(analysis.get("inside_values"), dict):
+        # the chip's loop registers next to the golden model's values on the beats
+        # around the first failure (simulation_agent.inside_values): the RTL worker
+        # sees WHERE the two part ways instead of guessing from the output pins
+        note["inside_values"] = analysis["inside_values"]
     return note
 
 

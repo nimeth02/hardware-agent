@@ -717,8 +717,10 @@ def test_the_analyst_runs_its_own_python_check_and_the_arithmetic_wins():
     assert "CHECK beat=2 got_matches_spec=yes expected_matches_spec=no" in check["stdout"]
     assert "CHECK beat=3 got_matches_spec=yes expected_matches_spec=no" in check["stdout"]
     assert calls[1]["python_check_allowed"] is False and "MUST be 'test_vectors'" in calls[1]["fixed_rule_hint"]
-    # the LLM still said "rtl": the check it wrote itself overrides it, and everything travels with the analysis
-    assert analysis["likely_cause"] == "test_vectors" and analysis["overridden_cause"] == "rtl"
+    # the LLM still said "rtl": since 2026-11-10 the check it wrote no longer overrides its verdict (run
+    # 35b45c09: a check that could not see the sample history forced the blame onto correct vectors);
+    # the check and its FIXED RULE reading still travel with the analysis for the next worker to read
+    assert analysis["likely_cause"] == "rtl" and "overridden_cause" not in analysis
     assert analysis["python_check"]["status"] == "ok" and "FIXED RULE" in analysis["fixed_rule"]
     assert analysis["summary"] == "the RTL is wrong"
     from agents.orchestrator_agent.blame import downstream_note
@@ -964,3 +966,201 @@ def test_decimating_designs_take_the_stimulus_from_the_expected_rows_cycle():
     assert one_to_one[0]["input_cycle"] == "4" and "input_row_note" not in one_to_one[0]
     from prompts.simulation_agent_prompt import SIMULATION_AGENT_SYSTEM_PROMPT
     assert "input_row_note" in SIMULATION_AGENT_SYSTEM_PROMPT
+
+
+TR_SPEC = {"entity_name": "timing_recovery", "reset": {"name": "aresetn", "active": "low"},
+           "behavior": ["Per input sample: W = 1/N + v; eta_next = eta - W; strobe = (eta_next < 0)",
+                        "On strobe: y_sym = farrow(x[m-1], x[m], x[m+1], x[m+2], mu)",
+                        "On strobe: acc = acc + K2 * e", "On strobe: y_prev = y_sym"]}
+# reset on rows 0-3, then one input sample per row; one expected beat per 4 samples
+TR_IN_CSV = "cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata\n" + "".join(
+    f"{c},1,{int(c >= 4)},{int(c >= 4)},{(2097664, 6292992, 6292992, 2097664)[c % 4] if c >= 4 else 0}\n" for c in range(44))
+TR_OUT_CSV = "cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata,m_axis_tuser\n" + "".join(
+    f"{c},{int(c >= 4)},{int(c >= 4 and c % 4 == 3)},{6292992 + c if c >= 4 and c % 4 == 3 else 0},"
+    f"{250 - c if c >= 4 and c % 4 == 3 else 0}\n" for c in range(44))
+TR_DATA_LOG = "\n".join(
+    f"Error: beat {k} (input cycle {14 + 4 * k}): m_axis_tdata expected I={1536 + 7 * k} Q={1536 + 7 * k} "
+    f"got I={512 if k < 6 else -512} Q={512 if k < 6 else -512} (tolerance 2)" for k in range(1, 9)) + "\nSIMULATION FAILED"
+TR_MU_LOG = "\n".join(
+    f"Error: beat {k} (input cycle {14 + 4 * k}): m_axis_tdata expected I={1536 + 7 * k} Q={1536 + 7 * k} "
+    f"got I={512 if k % 2 else -512} Q={512 if k % 2 else -512} (tolerance 2)\n"
+    f"Error: beat {k} (input cycle {14 + 4 * k}): m_axis_tuser expected {250 - 3 * k} got 0 (tolerance 8)"
+    for k in range(1, 9)) + "\nSIMULATION FAILED"
+
+
+def test_a_design_that_depends_on_earlier_samples_is_not_judged_by_a_one_row_python_check():
+    """timing_recovery 2026-11-09 14:18 (run 35b45c09, attempts 2 and 3): the
+    python_check only sees the failing rows; the analyst wrote "I cannot
+    recompute the exact state ... But I am forced to return python_check",
+    printed expected_matches_spec=no on every beat, and the code forced the
+    blame onto test vectors that were correct."""
+    import json
+    from agents.simulation_agent.simulation_analyst import HISTORY_NOTE, depends_on_history, failing_beats
+
+    assert depends_on_history(TR_SPEC)
+    assert depends_on_history({"behavior": ["On strobe: y_prev = y_sym"]})
+    assert depends_on_history({"behavior": ["Integrator acc initial value 0"]})
+    assert depends_on_history({"description": "PI loop filter and NCO"})
+    # a memoryless design (one beat in, one beat out, each answer from its own row) keeps the calculator
+    llr = {"entity_name": "llr_demap16", "behavior": ["m_lsb = |I| - 2*d", "llr = m * ns, saturated to 8 bits"]}
+    assert not depends_on_history(llr) and not depends_on_history(None) and not depends_on_history({})
+    # fewer output beats than input beats: failing_beats already marks the rows
+    beats = failing_beats(TR_DATA_LOG, TR_IN_CSV, TR_OUT_CSV, TR_SPEC)
+    assert beats and beats[0].get("input_row_note") and depends_on_history(llr, beats)
+
+    project = {**PROJECT, "spec": TR_SPEC, "test_vectors_in_csv": TR_IN_CSV, "test_vectors_out_csv": TR_OUT_CSV}
+    sim = {**SIM_FAIL, "sim_output": TR_DATA_LOG}
+    calls = []
+
+    class Llm:
+        def __init__(self, replies):
+            self.replies = list(replies)
+
+        def invoke(self, messages, config=None):
+            calls.append(json.loads(messages[1].content))
+            return type("R", (), {"content": self.replies.pop(0)})()
+
+    final = json.dumps({"verdict": "fail", "likely_cause": "rtl", "failures": ["beat 1 ..."],
+                        "summary": "the design passes the input sample through", "suggested_fix": "fix the interpolator"})
+    analysis = SimulationAnalyst(Llm([final])).analyze(project, COMPILE_OK, sim)
+    assert len(calls) == 1 and calls[0]["python_check_allowed"] is False
+    assert calls[0]["note"] == HISTORY_NOTE and "NOT evidence that the test vectors are wrong" in calls[0]["note"]
+    assert "fixed_rule_hint" not in calls[0] and calls[0]["failing_beats"]
+    assert analysis["likely_cause"] == "rtl" and "overridden_cause" not in analysis and "python_check" not in analysis
+
+    # the LLM sends a check anyway: it is NOT run and cannot force the blame onto the test vectors
+    calls.clear()
+    wrong_check = "for b in FAILING_BEATS:\n    print(f\"CHECK beat={b['beat']} got_matches_spec=yes expected_matches_spec=no\")\n"
+    analysis = SimulationAnalyst(Llm([json.dumps({"verdict": "fail", "python_check": wrong_check}), final])).analyze(
+        project, COMPILE_OK, sim)
+    assert len(calls) == 2 and "python_check" not in calls[1] and "No further python_check" in calls[1]["note"]
+    assert analysis["likely_cause"] == "rtl" and "overridden_cause" not in analysis and "python_check" not in analysis
+
+    # the memoryless demapper is unchanged: its check is still asked for
+    calls.clear()
+    llr_project = {**PROJECT, "spec": {"entity_name": "llr_demap16", "reset": {"name": "aresetn", "active": "low"}},
+                   "test_vectors_in_csv": LLR_IN_CSV, "test_vectors_out_csv": LLR_OUT_CSV}
+    SimulationAnalyst(Llm([final])).analyze(llr_project, COMPILE_OK, {**SIM_FAIL, "sim_output": LLR_LOG})
+    assert calls[0]["python_check_allowed"] is True and "note" not in calls[0]
+
+
+def test_an_output_stuck_at_one_value_while_the_expected_one_moves_is_the_rtl():
+    """timing_recovery 2026-11-09 14:18 (attempt 4): "m_axis_tuser expected 249 /
+    246 / 229 ... got 0" on every line; the loop never moved."""
+    import json
+    from agents.simulation_agent.simulation_analyst import fixed_rule_hint, stuck_output_hint
+
+    hint = stuck_output_hint(TR_MU_LOG)
+    assert hint and hint.startswith("FIXED RULE") and "all 8 lines for m_axis_tuser" in hint
+    assert "the same value (0)" in hint and "8 different values" in hint and "likely_cause is 'rtl'" in hint
+    assert "aI*bI + aQ*bQ" in hint and "same expression as the symbol" in hint
+    assert fixed_rule_hint(TR_MU_LOG, TR_IN_CSV, TR_OUT_CSV, TR_SPEC) == hint
+    # not stuck: the got value changes, too few lines, or the expected value hardly changes
+    assert stuck_output_hint(TR_DATA_LOG) is None                                    # got is +512 on 5 lines, -512 on 3
+    assert stuck_output_hint("\n".join(TR_MU_LOG.splitlines()[:6])) is None                      # 3 lines of m_axis_tuser
+    assert stuck_output_hint("\n".join(f"beat {k}: m_axis_tuser expected {9 + k % 2} got 0" for k in range(8))) is None
+    assert stuck_output_hint("missing output beats: expected 20 got 18\nmismatches: 5") is None
+    assert stuck_output_hint(None) is None and stuck_output_hint("") is None
+
+    # the rule reaches the analyst as fixed_rule_hint, the calculator is off, and it travels with the analysis
+    calls = []
+
+    class Llm:
+        def invoke(self, messages, config=None):
+            calls.append(json.loads(messages[1].content))
+            return type("R", (), {"content": json.dumps({"verdict": "fail", "likely_cause": "rtl", "failures": [],
+                                                           "summary": "s", "suggested_fix": "f"})})()
+
+    project = {**PROJECT, "spec": TR_SPEC, "test_vectors_in_csv": TR_IN_CSV, "test_vectors_out_csv": TR_OUT_CSV}
+    analysis = SimulationAnalyst(Llm()).analyze(project, COMPILE_OK, {**SIM_FAIL, "sim_output": TR_MU_LOG})
+    assert calls[0]["fixed_rule_hint"] == hint and calls[0]["python_check_allowed"] is False and "note" not in calls[0]
+    assert analysis["fixed_rule"] == hint and analysis["likely_cause"] == "rtl"
+
+
+def test_inside_values_put_the_chips_loop_registers_next_to_the_models_for_the_failing_beats():
+    """2026-11-09 18:59 (run a3133ede): the RTL worker only heard "beat 64 expected
+    I=-1792 got I=651". The simulator had recorded every register of the design
+    (work_proj/waves.vcd); read next to the golden model's loop_trace.csv it shows
+    at beat 0 already that y_mid is -1536 while y_sym is 0."""
+    from pathlib import Path
+    from agents.simulation_agent.inside_values import beats_to_show, chip_inside_values, inside_values, model_inside_values
+
+    vcd = (Path(__file__).parent / "fixtures" / "timing_recovery_waves.vcd").read_text(encoding="utf-8")
+    failing = [{"beat": 64, "line": "..."}, {"beat": 65}, {"beat": 66}]
+    assert beats_to_show(failing) == [0, 1, 2, 62, 63, 64, 65, 66]
+    assert beats_to_show([]) == [0, 1, 2] and beats_to_show([{"beat": 1}]) == [0, 1, 2]
+
+    chip = chip_inside_values(vcd, beats_to_show(failing))
+    # the LAST pipeline row of each family is shown, named after the design's own signals
+    assert chip["signals"]["mu"] == "mu_s10 (18 bits)" and chip["signals"]["e"] == "e_s10 (26 bits)"
+    assert chip["signals"]["v"] == "v_r (32 bits)" and chip["signals"]["y_mid_i"] == "ymid_i_s7 (12 bits)"
+    rows = {r["beat"]: r for r in chip["rows"]}
+    assert sorted(rows) == [0, 1, 2, 62, 63, 64, 65, 66] and chip["beats_seen"] >= 67
+    # beat 0: the state just before the edge that delivered it; y_mid already wrong (should be 0 like y_sym)
+    assert rows[0]["y_sym_i"] == 0 and rows[0]["y_mid_i"] == -1536 and rows[0]["m_axis_tuser"] == 0
+    assert rows[0]["strobe"] == 1 and rows[0]["eta"] == 805306368            # 1-bit read as 0/1; eta_r = 0.75 * 2**30
+    assert rows[64]["m_axis_tuser"] == 136 and rows[64]["y_sym_i"] == -373 and rows[64]["v"] == 1026492
+    assert rows[64]["m_axis_tdata"] == 15250059                               # the output word, unsigned like the CSV
+    # xsim drops the leading zeros of a vector value: the 12-bit ysym_q_s10 is written `b1010001011`
+    # (10 characters) for +651, the Q field of that output word (0xE8B28B -> I = -373, Q = 651).
+    # Read at the written length it came out as 651 - 1024 = -373 (2026-11-10 review).
+    assert rows[64]["y_sym_q"] == 651 and rows[64]["y_prev_q"] == 651
+    from agents.simulation_agent.inside_values import _to_int
+    assert _to_int("1010001011", True, 12) == 651 and _to_int("111111111111", True, 12) == -1
+    assert _to_int("1", True, 32) == 1 and _to_int("0", True, 32) == 0 and _to_int("1x", True, 2) == "U"
+    assert chip_inside_values("not a vcd", [0]) is None and chip_inside_values(None, [0]) is None
+
+    trace = ("beat,cycle,mu8,e,v,acc,y_sym_i,y_sym_q,y_mid_i,y_mid_q\n0,4,0,0,0,0,0,0,0,0\n1,8,0,0.5625,0.00441,1.7e-05,1536,1536,512,512\n"
+             "2,11,249,0.1,0.0012,2e-05,1560,1560,700,700\n64,267,123,-0.01,0.00012,3e-05,-1792,1792,10,-10\n")
+    model = model_inside_values(trace, [0, 1, 64])
+    assert [r["beat"] for r in model] == ["0", "1", "64"] and model[1]["e"] == "0.5625"
+    assert model_inside_values(None, [0]) == [] and model_inside_values("", [0]) == []
+
+    both = inside_values(vcd, trace, failing)
+    assert both["beats"] == [0, 1, 2, 62, 63, 64, 65, 66] and "chip" in both and "model" in both
+    assert "FIRST beat where a chip value parts from the model" in both["how_to_read"]
+    assert both["first_difference"].startswith("beat 64: the chip's mu (m_axis_tuser = 136) is 13/256")  # 136 vs 123
+    assert inside_values(None, None, failing) is None
+    assert "model" not in inside_values(vcd, None, failing) and "chip" not in inside_values(None, trace, failing)
+
+    # it travels: analysis -> downstream note -> the RTL worker's prompt names it
+    from agents.orchestrator_agent.blame import downstream_note
+    from agents.orchestrator_agent.state import Stage
+    note = downstream_note(Stage.SIMULATE, {"verdict": "fail", "likely_cause": "rtl", "inside_values": both})
+    assert note["inside_values"]["first_difference"] == both["first_difference"]
+    from prompts.rtl_agent_prompt import RTL_RETRY_ADDENDUM
+    assert "inside_values" in RTL_RETRY_ADDENDUM and "register where the chip parts from the model" in RTL_RETRY_ADDENDUM
+
+
+def test_the_analyst_attaches_inside_values_when_the_project_has_a_wave_file(tmp_path):
+    import json, shutil
+    from pathlib import Path
+
+    work = tmp_path / "work_proj"
+    work.mkdir()
+    shutil.copy(Path(__file__).parent / "fixtures" / "timing_recovery_waves.vcd", work / "waves.vcd")
+    trace = "beat,cycle,mu8,e,v,acc,y_sym_i,y_sym_q,y_mid_i,y_mid_q\n0,4,0,0,0,0,0,0,0,0\n64,267,123,0,0,0,-1792,1792,0,0\n"
+    # 300 rows: one input sample per row after reset, one expected beat per 4 samples (beat 64 is on row 263)
+    in_csv = "cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata\n" + "".join(
+        f"{c},1,{int(c >= 4)},{int(c >= 4)},{2097664 if c >= 4 else 0}\n" for c in range(300))
+    out_csv = "cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata,m_axis_tuser\n" + "".join(
+        f"{c},{int(c >= 4)},{int(c >= 4 and c % 4 == 3)},{6292992 if c >= 4 and c % 4 == 3 else 0},0\n" for c in range(300))
+    project = {**PROJECT, "dir": str(tmp_path), "spec": TR_SPEC, "test_vectors_in_csv": in_csv,
+               "test_vectors_out_csv": out_csv, "loop_trace_csv": trace}
+    calls = []
+
+    class Llm:
+        def invoke(self, messages, config=None):
+            calls.append(json.loads(messages[1].content))
+            return type("R", (), {"content": json.dumps({"verdict": "fail", "likely_cause": "rtl", "failures": [],
+                                                           "summary": "s", "suggested_fix": "f"})})()
+
+    log = "\n".join(f"Error: beat {k} (input cycle {11 + 4 * k}): m_axis_tdata expected I=-1792 Q=1792 got I=651 Q=-373 "
+                    f"(tolerance 4)" for k in (64, 65, 66)) + "\nSIMULATION FAILED"
+    analysis = SimulationAnalyst(Llm()).analyze(project, COMPILE_OK, {**SIM_FAIL, "sim_output": log})
+    inside = analysis["inside_values"]
+    assert calls[0]["inside_values"] == inside and inside["beats"][:3] == [0, 1, 2] and 64 in inside["beats"]
+    assert inside["chip"]["signals"]["v"] == "v_r (32 bits)" and inside["model"][0]["beat"] == "0"
+    # no wave file, no trace: nothing attached, nothing breaks
+    plain = {**project, "dir": str(tmp_path / "nowhere"), "loop_trace_csv": None}
+    assert "inside_values" not in SimulationAnalyst(Llm()).analyze(plain, COMPILE_OK, {**SIM_FAIL, "sim_output": log})

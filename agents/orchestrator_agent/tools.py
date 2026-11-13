@@ -14,6 +14,8 @@ from langgraph.types import Command
 
 from agents.implementation_agent.implementation_agent import run_implementation
 from agents.orchestrator_agent import human_input, project_writer
+from agents.orchestrator_agent.guard import blamed_helper_first as guard_blamed_helper_first
+from agents.orchestrator_agent.guard import rtl_not_finished as guard_rtl_not_finished
 from agents.orchestrator_agent.state import Stage
 from agents.orchestrator_agent.steps import attempt_history_of, attempt_of, run_stage
 from agents.rtl_agent.rtl_agent import run_rtl_generation
@@ -51,7 +53,11 @@ def make_tools() -> list:
         """The spec -> lint-clean VHDL RTL. The RTL agent is told which run this is,
         whether it is its 1st, 2nd, ... call for it, how its earlier calls went, and
         is handed the RTL it delivered last time so a retry revises it instead of
-        starting over."""
+        starting over. Not run while the last failure blames another helper that
+        still has a call left (guard.blamed_helper_first)."""
+        blocked = guard_blamed_helper_first(runtime, Stage.GENERATE_RTL)
+        if blocked:
+            return blocked
         s = runtime.state
         return run_stage(runtime, Stage.GENERATE_RTL, run_rtl_generation, s["spec"], s["requirement_id"],
                          attempt_of(s, Stage.GENERATE_RTL), attempt_history_of(s, Stage.GENERATE_RTL), s.get("rtl"),
@@ -63,7 +69,11 @@ def make_tools() -> list:
         test_vectors_out.csv during simulation. The testbench agent is told which run
         this is, whether it is its 1st, 2nd, ... call for it, how its earlier calls went,
         and is handed the testbench it delivered last time so a retry revises it
-        instead of starting over."""
+        instead of starting over. Not run while the last failure blames another
+        helper that still has a call left (guard.blamed_helper_first)."""
+        blocked = guard_blamed_helper_first(runtime, Stage.GENERATE_TESTBENCH)
+        if blocked:
+            return blocked
         s = runtime.state
         return run_stage(runtime, Stage.GENERATE_TESTBENCH, run_testbench_generation, s["spec"], s["rtl"],
                          s["requirement_id"], attempt_of(s, Stage.GENERATE_TESTBENCH),
@@ -74,7 +84,12 @@ def make_tools() -> list:
         """The spec -> golden test vectors via MATLAB (an independent model of the spec):
         test_vectors_in.csv (stimulus) + test_vectors_out.csv (expected). The test vector
         agent is told which run this is, whether it is its 1st, 2nd, ... call for it, and
-        how its earlier calls went. run_dir (2nd input) is None: the agent names it."""
+        how its earlier calls went. run_dir (2nd input) is None: the agent names it.
+        Not run while the last failure blames another helper that still has a call
+        left (guard.blamed_helper_first)."""
+        blocked = guard_blamed_helper_first(runtime, Stage.GENERATE_TEST_VECTORS)
+        if blocked:
+            return blocked
         s = runtime.state
         return run_stage(runtime, Stage.GENERATE_TEST_VECTORS, run_test_vector_generation, s["spec"], None,
                          s["requirement_id"], attempt_of(s, Stage.GENERATE_TEST_VECTORS),
@@ -90,7 +105,11 @@ def make_tools() -> list:
 
     @tool
     def simulate(runtime: ToolRuntime, sim_time: str = "10us") -> Command:
-        """xvhdl + xsim on the project folder -> pass/fail/error verdict with analysis."""
+        """xvhdl + xsim on the project folder -> pass/fail/error verdict with analysis.
+        Not run while the RTL is unfinished (guard.rtl_not_finished)."""
+        blocked = guard_rtl_not_finished(runtime, Stage.SIMULATE)
+        if blocked:
+            return blocked
         return run_stage(runtime, Stage.SIMULATE, run_simulation, runtime.state["project_dir"], sim_time)
 
     @tool

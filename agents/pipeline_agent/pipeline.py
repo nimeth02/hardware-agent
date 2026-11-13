@@ -25,7 +25,7 @@ from langgraph.types import Command, interrupt
 
 from agents.json_utils import extract_json
 from agents.rtl_agent.rtl_agent import call_rtl_agent, parse_rtl_response
-from agents.rtl_agent.rtl_linter import lint_rtl
+from agents.rtl_agent.lint.rtl_linter import lint_rtl
 from agents.spec_analyser_agent.spec_analyzer_agent import call_spec_analyzer
 from agents.spec_analyser_agent.spec_evaluator import evaluate_spec
 from agents.spec_analyser_agent.spec_suggester import generate_suggestions

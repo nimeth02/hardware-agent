@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from agents.rtl_agent.rtl_generator import RTLGenerator
-from agents.rtl_agent.rtl_linter import _forbidden_constructs
+from agents.rtl_agent.lint.rtl_linter import _forbidden_constructs
 from agents.spec_analyser_agent.spec_evaluator import evaluate_spec
 from agents.spec_analyser_agent.spec_generator import parse_spec_response
 from agents.vhdl_version import (

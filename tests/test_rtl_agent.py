@@ -85,9 +85,10 @@ def fake_linter(results):
     return lint
 
 
-def make_agent(rtls, lints, decider=None, loader=None, max_iterations=6):
+def make_agent(rtls, lints, decider=None, loader=None, max_iterations=6, examples=None):
     tools = RTLAgentTools(generator=FakeGenerator(rtls), decider=decider or FakeDecider(),
-                          skill_loader=loader or FakeSkillLoader(), linter=fake_linter(lints))
+                          skill_loader=loader or FakeSkillLoader(), linter=fake_linter(lints),
+                          examples=examples or (lambda spec: {}))
     return RTLAgent(tools=tools, max_iterations=max_iterations)
 
 
@@ -249,7 +250,7 @@ def test_generator_failure_fails_the_run():
         def generate(self, *a, **k):
             raise RuntimeError("llm down")
     tools = RTLAgentTools(generator=Exploding([GOOD_RTL]), decider=FakeDecider(),
-                          skill_loader=FakeSkillLoader(), linter=fake_linter([CLEAN]))
+                          skill_loader=FakeSkillLoader(), linter=fake_linter([CLEAN]), examples=lambda spec: {})
     out = RTLAgent(tools=tools).run(SPEC)
     assert out["status"] == RTLStatus.FAILED.value and "llm down" in out["error"]
 
@@ -281,7 +282,7 @@ def test_a_reply_that_is_not_json_or_was_cut_off_has_no_code_and_says_why():
     compiled as if it were RTL, and reported as markdown fences / no entity."""
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
     from langchain_core.messages import AIMessage
-    from agents.rtl_agent.rtl_linter import _static_checks
+    from agents.rtl_agent.lint.rtl_linter import _static_checks
     rtl = RTLGenerator(llm=FakeListChatModel(responses=["here is some vhdl, not json"])).generate(SPEC)
     assert rtl["code"] == "" and "not valid JSON" in rtl["notes"][0]
     cut = AIMessage(content='```json\n{"entity_name": "counter4", "code": "entity counter4 is',
@@ -294,7 +295,7 @@ def test_a_reply_that_is_not_json_or_was_cut_off_has_no_code_and_says_why():
 
 
 def test_comparing_with_an_others_aggregate_is_caught_before_xelab_would_refuse_it():
-    from agents.rtl_agent.rtl_linter import _forbidden_constructs
+    from agents.rtl_agent.lint.rtl_linter import _forbidden_constructs
     bad = "if count_next = (others => '0') then\nif v /= (others => '1') then"
     found = _forbidden_constructs(bad, "93")
     assert [i["code"] for i in found] == ["forbidden_construct"] * 2
@@ -307,7 +308,7 @@ def test_vhdl_2008_shift_operators_are_caught_before_xvhdl_in_93_mode():
     """timing_recovery, 2026-11-02 fix round 3: `to_signed(1, 16) sra 7` and
     `v2_i sra 1` cost a whole compile round ("found '0' definitions of operator
     sra"); the rulebook already said to use shift_right."""
-    from agents.rtl_agent.rtl_linter import _forbidden_constructs
+    from agents.rtl_agent.lint.rtl_linter import _forbidden_constructs
     bad = ("constant K1 : signed(15 downto 0) := to_signed(1, 16) sra 7;\n"
            "v2_i := v2_i SLL 1;\n"
            "acc := acc ror 2;  -- `x sra 1` inside a comment is fine")
@@ -333,7 +334,7 @@ def test_linter_catches_a_stage_that_reads_two_stages_back():
     """llr_demap16, 2026-10-29 12:18: stage 3 read i_s1/q_s1 directly while ns
     went through stage 2, so every beat was multiplied by the gap row's ns = 0
     and all 50 output beats were 0; three retries returned the same file."""
-    from agents.rtl_agent.rtl_linter import _pipeline_stage_skip_issues
+    from agents.rtl_agent.lint.rtl_linter import _pipeline_stage_skip_issues
     skipping = """
       process(aclk) begin if rising_edge(aclk) then
         i_s1 <= signed(s_axis_tdata(31 downto 20));  ns_s1 <= unsigned(s_axis_tdata(7 downto 0));
@@ -378,7 +379,7 @@ def test_a_retry_that_returns_the_same_rtl_is_refused_without_a_simulation():
 
 
 def test_linter_flags_multiplier_width_and_double_writers():
-    from agents.rtl_agent.rtl_linter import _multiple_driver_issues, _multiplier_width_issues
+    from agents.rtl_agent.lint.rtl_linter import _multiple_driver_issues, _multiplier_width_issues
 
     narrow = ("signal d : signed(28 downto 0);\nsignal n : unsigned(7 downto 0);\n"
               "signal p : signed(36 downto 0);\n"
@@ -396,7 +397,7 @@ def test_linter_flags_multiplier_width_and_double_writers():
 
 
 def test_linter_catches_a_process_declaration_without_the_variable_keyword():
-    from agents.rtl_agent.rtl_linter import _process_declaration_issues
+    from agents.rtl_agent.lint.rtl_linter import _process_declaration_issues
     bad = ("signal sat_i : signed(11 downto 0);\n"                       # architecture signal: fine
            "farrow: process(clk)\n"
            "  temp_i : signed(47 downto 0);\n"                           # line 3: missing `variable`
@@ -413,7 +414,7 @@ def test_linter_catches_a_process_declaration_without_the_variable_keyword():
 
 
 def test_linter_catches_unbalanced_parentheses_per_statement():
-    from agents.rtl_agent.rtl_linter import _unbalanced_parentheses_issues
+    from agents.rtl_agent.lint.rtl_linter import _unbalanced_parentheses_issues
     bad = ("v0_i <= resize(signed('0' & x_0_i), 16);\n"                  # balanced: fine
            "v1_i <= resize((-signed('0' & x_p2_i) + shift_left(signed('0' & x_p1_i), 1)\n"
            "         - signed('0' & x_m1_i), COEF_WIDTH);\n"             # one ')' short
@@ -437,7 +438,7 @@ def test_linter_names_the_if_whose_end_if_is_missing_before_the_compiler_blames_
     """timing_recovery 15:11 (2026-11-02): one `end if;` missing after an if/elsif
     in p_nco; xvhdl said 'syntax error near process' / 'mismatch on label p_nco',
     the model hunted for a label problem and returned the same file nine times."""
-    from agents.rtl_agent.rtl_linter import _block_balance_issues
+    from agents.rtl_agent.lint.rtl_linter import _block_balance_issues
     nco = ("p_nco : process(aclk)\n"
            "  variable mu_v : signed(16 downto 0);\n"
            "begin\n"
@@ -477,7 +478,7 @@ def test_valid_chain_registers_with_odd_names_are_not_mistaken_for_the_output_fl
     """timing_recovery 15:11 (2026-11-02): `valid_s3_f <= valid_s2;` was read as the
     output flag taken from stage 2, so an eight-deep valid chain was reported
     as two and the model could not act on the finding."""
-    from agents.rtl_agent.rtl_linter import _valid_data_length_issues
+    from agents.rtl_agent.lint.rtl_linter import _valid_data_length_issues
     clocked = "process(clk) begin if rising_edge(clk) then\n{}\nend if; end process;\n"   # one statement per line, as in real code
     chain = ("valid_s1 <= in_valid;\na_s1 <= d;\nvalid_s2 <= valid_s1;\na_s2 <= a_s1;\n"
              "valid_s3_f <= valid_s2;\na_s3 <= a_s2;\nvalid_s4 <= valid_s3_f;\na_s4 <= a_s3;")
@@ -516,7 +517,7 @@ def test_linter_wants_the_stage_map_note_for_a_pipelined_design():
     """skills/RTL/pipeline_stage_map.md: the model writes the stage map
     before the code so a two-stages-back read is caught in the table, not
     in a simulation. A pipeline returned without the map goes back once."""
-    from agents.rtl_agent.rtl_linter import _stage_map_issues
+    from agents.rtl_agent.lint.rtl_linter import _stage_map_issues
     pipeline = "i_s1 <= signed(d); i_s2 <= i_s1; i_s3 <= i_s2;"
     assert [i["code"] for i in _stage_map_issues({"code": pipeline, "notes": ["latency 3"]})] == ["stage_map_missing"]
     assert not _stage_map_issues({"code": pipeline, "notes": ["Stage map:", "s1: i_s1 <- inputs", "s2: i_s2 <- s1"]})
@@ -556,7 +557,7 @@ def test_linter_counts_the_output_register_as_a_stage_the_valid_chain_must_cover
     data registers, but valid_pipe(5 downto 0) = six bits, so m_axis_tvalid
     rose one clock before the output register was written and every beat was
     read as 0 ("expected 8253440 got 0")."""
-    from agents.rtl_agent.rtl_linter import _valid_data_length_issues
+    from agents.rtl_agent.lint.rtl_linter import _valid_data_length_issues
     issues = _valid_data_length_issues(SIX_STAGES)
     assert [i["code"] for i in issues] == ["valid_data_length_mismatch"]
     d = issues[0]["detail"]
@@ -635,7 +636,7 @@ def test_linter_counts_the_data_path_to_the_output_not_the_loop_rows_after_it():
     _s1. The checker said "11 stages", the model obeyed (11 valid bits), the
     finding went quiet and m_axis_tvalid rose 3 clocks late. Now the count
     stops at the stage the output reads, and the finding names the lines."""
-    from agents.rtl_agent.rtl_linter import _valid_data_length_issues
+    from agents.rtl_agent.lint.rtl_linter import _valid_data_length_issues
     issues = _valid_data_length_issues(LOOP_AFTER_OUTPUT)
     assert [i["code"] for i in issues] == ["valid_data_length_mismatch"]
     d = issues[0]["detail"]
@@ -731,7 +732,7 @@ def test_linter_reports_a_loop_value_that_only_goes_round_the_ring_and_is_never_
     eleven rows and back to row 1 but never written from anything else, so
     they kept their reset value; the notes claimed "strobe is generated when
     eta_next < 0" and the dry run showed 0 on every beat."""
-    from agents.rtl_agent.rtl_linter import _loop_value_never_computed_issues
+    from agents.rtl_agent.lint.rtl_linter import _loop_value_never_computed_issues
     issues = _loop_value_never_computed_issues(SPEC_STROBE, LOOP_RING)
     assert [i["code"] for i in issues] == ["loop_value_never_computed"] * 2
     by_name = {re.search(r"`(\w+)` only goes round", i["detail"]).group(1): i["detail"] for i in issues}
@@ -832,7 +833,7 @@ def test_a_loop_value_computed_down_the_rows_and_copied_back_is_reported_as_one_
     back into row 1, so the design ran 11 (16) loops side by side, one beat
     came per 16 clocks instead of per 4, and no checker said a word because
     the never-computed check skips a ring that is computed."""
-    from agents.rtl_agent.rtl_linter import _loop_state_ring_issues, _loop_value_never_computed_issues
+    from agents.rtl_agent.lint.rtl_linter import _loop_state_ring_issues, _loop_value_never_computed_issues
     issues = _loop_state_ring_issues(RING_COMPUTED)
     assert [i["code"] for i in issues] == ["loop_state_ring"]
     d = issues[0]["detail"]
@@ -878,7 +879,7 @@ def test_the_ring_check_follows_the_value_through_any_name_and_stays_quiet_on_pl
     record field; a delay line numbered the wrong way round inside one
     process, a two-line `if` compare and a `/* */` comment set off wrong
     alarms. The value is now followed through the signals themselves."""
-    from agents.rtl_agent.rtl_linter import (
+    from agents.rtl_agent.lint.rtl_linter import (
         _loop_state_ring_issues as ring, _loop_value_never_computed_issues as never, _pipeline_stage_skip_issues,
     )
     codes = lambda code: [i["code"] for i in ring(code)]
@@ -981,7 +982,7 @@ def test_a_loop_register_loaded_before_its_row_is_valid_is_reported_with_the_bit
     'U', 13 of 16 loop copies went 'X' and never recovered, one beat came
     per 16 clocks. 14:51 waited for the right bit but its history chain was
     not reset: the other half of the same fault."""
-    from agents.rtl_agent.rtl_linter import _history_chain_reset_issues, _state_read_before_valid_issues
+    from agents.rtl_agent.lint.rtl_linter import _history_chain_reset_issues, _state_read_before_valid_issues
     no_gate = _state_read_before_valid_issues(_loop_design(""))
     assert [i["code"] for i in no_gate] == ["state_read_before_valid"]
     d = no_gate[0]["detail"]
@@ -1162,7 +1163,7 @@ def test_the_loop_process_the_rules_teach_passes_every_loop_and_stage_check():
     strobe_s2 / mu_s2. The full timing_recovery design built that way
     compiled, passed the smoke dry run and locked at +100 and -1000 ppm.
     This keeps the checker from ever rejecting the pattern the rules teach."""
-    from agents.rtl_agent import rtl_linter as lint
+    from agents.rtl_agent.lint import rtl_linter as lint
     code = _design_around_the_rules_p_loop()
     assert "eta_r <= eta_next;" in code and "strobe_s2 <= '1';" in code        # the rules' p_loop is in it
     checks = [lint._process_declaration_issues(code), lint._declaration_after_begin_issues(code),
@@ -1172,15 +1173,87 @@ def test_the_loop_process_the_rules_teach_passes_every_loop_and_stage_check():
               lint._valid_data_length_issues(code), lint._constant_output_valid_issues(SPEC_STROBE, code),
               lint._loop_value_never_computed_issues(SPEC_STROBE, code), lint._loop_state_ring_issues(code),
               lint._state_read_before_valid_issues(code), lint._history_chain_reset_issues(code),
-              lint._output_valid_without_strobe_issues(SPEC_STROBE, code)]
+              lint._output_valid_without_strobe_issues(SPEC_STROBE, code),
+              lint._self_blocking_advance_issues(SPEC_STROBE, code)]
     assert [i for found in checks for i in found] == []
+
+
+SPEC_NO_TREADY = {
+    "entity_name": "timing_recovery",
+    "ports": [{"name": "aclk", "direction": "input", "width": "1"}, {"name": "aresetn", "direction": "input", "width": "1"},
+              {"name": "s_axis_tvalid", "direction": "input", "width": "1"}, {"name": "s_axis_tready", "direction": "output", "width": "1"},
+              {"name": "s_axis_tdata", "direction": "input", "width": "24"}, {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
+              {"name": "m_axis_tdata", "direction": "output", "width": "24"}, {"name": "m_axis_tuser", "direction": "output", "width": "8"}],
+    "behavior": ["No m_axis_tready port exists; downstream is always ready."],
+}
+
+_ADVANCE_DESIGN = """architecture rtl of timing_recovery is
+  signal advance : std_logic;
+  signal valid_pipe : std_logic_vector(9 downto 0) := (others => '0');
+begin
+  rst <= not aresetn;
+  {advance_line}
+  s_axis_tready <= '1';
+  p_valid : process(aclk) begin if rising_edge(aclk) then if rst = '1' then valid_pipe <= (others => '0');
+    elsif advance = '1' then valid_pipe(0) <= s_axis_tvalid; valid_pipe(9) <= valid_pipe(8); end if; end if; end process;
+  m_axis_tvalid_i <= valid_pipe(9) and strobe_s10;
+end architecture rtl;
+"""
+
+
+def test_linter_rejects_a_pipeline_enable_that_waits_for_its_own_valid_bit():
+    """timing_recovery 18:52 (2026-11-06): the spec has no m_axis_tready port,
+    the rewrite turned attempt 1's `advance <= s_axis_tvalid;` into the
+    recipe's handshake line minus the missing ready term, `advance <= not
+    valid_pipe(9);`. Once the pipe was full (cycle 14) advance stayed '0':
+    every register froze, m_axis_tvalid stuck at '1' with one constant value,
+    801 mismatches, the same picture for three attempts. The checker now
+    names the line and the one-line fix before any simulation."""
+    from agents.rtl_agent.lint.rtl_linter import _self_blocking_advance_issues
+    design = _ADVANCE_DESIGN.format
+
+    [issue] = _self_blocking_advance_issues(SPEC_NO_TREADY, design(advance_line="advance <= not valid_pipe(9);"))
+    assert issue["code"] == "self_blocking_advance"
+    assert issue["detail"].startswith("line 6: the pipeline enable `advance` is computed from the pipeline's own valid flag valid_pipe(9)")
+    # the fix is a pipeline that moves on every clock (equalizer 2026-11-12: `advance <= s_axis_tvalid;` never emptied)
+    assert "`advance <= '1';`" in issue["detail"] and "`valid_pipe(0) <= s_axis_tvalid;`" in issue["detail"]
+    assert "`advance <= s_axis_tvalid;`" not in issue["detail"] and "801 mismatches" in issue["detail"]
+    assert issue["detail"].endswith(">> advance <= not valid_pipe(9);")
+
+    # the output flag instead of the bare bit, or a when/else form: the same freeze
+    [issue] = _self_blocking_advance_issues(SPEC_NO_TREADY, design(advance_line="advance <= not m_axis_tvalid_i;"))
+    assert "own valid flag m_axis_tvalid_i" in issue["detail"]
+    [issue] = _self_blocking_advance_issues(SPEC_NO_TREADY, design(advance_line="advance <= '1' when valid_pipe(9) = '0' else '0';"))
+    assert issue["code"] == "self_blocking_advance"
+
+    # attempt 1's line, and a free-running '1', never wait for the pipe itself
+    assert _self_blocking_advance_issues(SPEC_NO_TREADY, design(advance_line="advance <= s_axis_tvalid;")) == []
+    assert _self_blocking_advance_issues(SPEC_NO_TREADY, design(advance_line="advance <= '1';")) == []
+
+    # with a downstream ready port the recipe's handshake line passes; the bare bit gets the ready term as the fix
+    with_ready = {**SPEC_NO_TREADY, "ports": SPEC_NO_TREADY["ports"] + [{"name": "m_axis_tready", "direction": "input", "width": "1"}]}
+    assert _self_blocking_advance_issues(with_ready, design(advance_line="advance <= m_axis_tready or (not valid_pipe(9));")) == []
+    [issue] = _self_blocking_advance_issues(with_ready, design(advance_line="advance <= not valid_pipe(9);"))
+    assert "`advance <= m_axis_tready or not valid_pipe(9);`" in issue["detail"]
+
+    # an enable under another name is found through the `if <name> = '1'` guards of the processes
+    renamed = design(advance_line="advance <= not valid_pipe(9);").replace("advance", "pipe_en")
+    [issue] = _self_blocking_advance_issues(SPEC_NO_TREADY, renamed)
+    assert "`pipe_en`" in issue["detail"] and "`pipe_en <= '1';`" in issue["detail"]
+
+    # the real file of the 18:52 rewrite is caught through lint_rtl's static list, the attempt-1 file is not
+    from agents.rtl_agent.lint import rtl_linter as lint
+    real = ("architecture rtl of timing_recovery is\nbegin\n  rst <= not aresetn;\n  advance <= not valid_pipe(9);\n"
+            "  s_axis_tready <= '1';\n  m_axis_tvalid_i <= valid_pipe(9) and strobe_s10;\nend architecture rtl;\n")
+    assert [i["code"] for i in lint._self_blocking_advance_issues(SPEC_NO_TREADY, real)] == ["self_blocking_advance"]
+    assert lint._self_blocking_advance_issues(SPEC_NO_TREADY, real.replace("not valid_pipe(9)", "s_axis_tvalid")) == []
 
 
 def test_linter_requires_the_output_valid_to_carry_the_strobe_when_the_spec_says_output_on_strobe():
     """timing_recovery 18:32 (2026-11-02): m_axis_tvalid_i <= valid_pipe(10)
     raised a beat on every input sample; the testbench expected 198 strobe
     beats, saw ~785, and reported 998 mismatches with every beat "got 0"."""
-    from agents.rtl_agent.rtl_linter import _output_valid_without_strobe_issues, _valid_data_length_issues
+    from agents.rtl_agent.lint.rtl_linter import _output_valid_without_strobe_issues, _valid_data_length_issues
     issues = _output_valid_without_strobe_issues(SPEC_STROBE, LOOP_RING)
     assert [i["code"] for i in issues] == ["output_valid_without_strobe"]
     d = issues[0]["detail"]
@@ -1225,7 +1298,7 @@ def test_linter_sees_width_mistakes_inside_if_branches_and_functions():
     inside calc_mmsb's if-branch makes a 32-bit value for a 16-bit variable.
     The multiplier check only looked after ';', the dry run named only the
     process, and three attempts returned the same file."""
-    from agents.rtl_agent.rtl_linter import (
+    from agents.rtl_agent.lint.rtl_linter import (
         _assignment_width_issues, _multiplier_width_issues, _power_of_two_multiply_issues, _width_issues,
     )
     mult = _multiplier_width_issues(CALC_MMSB)
@@ -1246,7 +1319,7 @@ def test_linter_sees_width_mistakes_inside_if_branches_and_functions():
 
 
 def test_dry_run_crash_names_the_assignment_behind_an_array_size_mismatch():
-    from agents.rtl_agent import rtl_smoke_check as smoke
+    from agents.rtl_agent.lint import rtl_smoke_check as smoke
     out = ("ERROR: Array sizes do not match, left array has 16 elements, right array has 32 elements\n"
            "Time: 55 ns  Iteration: 1  Process: /smoke_tb/dut/line__107  File: x.vhd")
     code = "x\n" * 106 + "process(aclk)\n" + CALC_MMSB
@@ -1286,9 +1359,9 @@ def test_width_checks_read_widths_given_as_constants_and_generics():
     """timing_recovery 11:10 (2026-11-03): `signed(V_BITS-1 downto 0)` everywhere,
     so the static width check never fired and the dry run crashed six rounds
     in a row with only "16 vs 24 in p_s12"; the model returned the same file."""
-    from agents.rtl_agent.rtl_linter import _assignment_width_issues
-    from agents.rtl_agent.rtl_smoke_check import _width_mismatch_hint
-    from agents.rtl_agent.rtl_widths import declared_widths, expr_width, int_value, scoped_widths
+    from agents.rtl_agent.lint.rtl_linter import _assignment_width_issues
+    from agents.rtl_agent.lint.rtl_smoke_check import _width_mismatch_hint
+    from agents.rtl_agent.lint.rtl_widths import declared_widths, expr_width, int_value, scoped_widths
     w = scoped_widths(CONSTANT_WIDTHS).at(1)
     assert (w["e_s11"], w["acc_s11"], w["v_s12"], w["p"], w["q"]) == (24, 24, 16, 48, 25)
     assert "unknown" not in w and w.constants["v_bits"] == 16 and w.types["v_s12"] == "signed(V_BITS-1 downto 0)"
@@ -1353,7 +1426,7 @@ def test_a_number_that_does_not_fit_its_width_is_reported_with_the_register_to_w
     (0) and only warned, the phase never wrapped back, the strobe count was
     wrong for four attempts and the testbench was blamed. `if mu_raw > 65535`
     in the same file could never be true."""
-    from agents.rtl_agent.rtl_linter import _literal_width_issues
+    from agents.rtl_agent.lint.rtl_linter import _literal_width_issues
     issues = _literal_width_issues(LITERAL_WIDTHS)
     assert [i["code"] for i in issues] == ["literal_width"] * 5
     by_line = {int(re.match(r"line (\d+):", i["detail"]).group(1)): i["detail"] for i in issues}
@@ -1390,7 +1463,7 @@ def test_width_fix_follows_the_value_to_the_register_it_is_stored_in():
     resize to 17, but v_next then went into the 16-bit v_s12 and the next
     round crashed on that line. Now the advice names the final register's
     width, and a plain name that is too wide gets the one-line fix."""
-    from agents.rtl_agent.rtl_linter import _assignment_width_issues
+    from agents.rtl_agent.lint.rtl_linter import _assignment_width_issues
     code = (CONSTANT_WIDTHS
             .replace("p_s12 : process(aclk) begin",
                      "p_s12 : process(aclk)\n    variable v_sum : signed(24 downto 0);\n"
@@ -1416,7 +1489,7 @@ def test_width_fix_follows_the_value_to_the_register_it_is_stored_in():
 
 
 def test_width_arithmetic_of_simple_expressions():
-    from agents.rtl_agent.rtl_widths import expr_width
+    from agents.rtl_agent.lint.rtl_widths import expr_width
     w = {"a": 12, "b": 8, "p": 20}
     assert expr_width("a * b", w) == 20 and expr_width("a * 4", w) == 24 and expr_width("4 * a", w) == 24
     assert expr_width("a + b", w) == 12 and expr_width("a - 1", w) == 12 and expr_width("-a", w) == 12
@@ -1432,7 +1505,7 @@ def test_linter_rejects_an_absolute_value_written_as_a_bare_negation():
     """llr_demap16, 2026-10-29 13:23: `abs_i_s2 <= unsigned(-resize(i_s1, 13));`
     with no sign test (copied from the recipe's own example) negated positive
     inputs too; every m_lsb was wrong ("expected lo=1560 got lo=2080")."""
-    from agents.rtl_agent.rtl_linter import _abs_without_sign_check_issues
+    from agents.rtl_agent.lint.rtl_linter import _abs_without_sign_check_issues
     bare = "valid_pipe(0) <= s_axis_tvalid;\nabs_i_s2 <= unsigned(-resize(i_s1, 13));\nabs_q_s2 <= unsigned(-q_s1);"
     issues = _abs_without_sign_check_issues(bare)
     assert [i["code"] for i in issues] == ["abs_without_sign_check"] * 2
@@ -1453,7 +1526,7 @@ def test_a_label_after_end_process_is_not_a_missing_variable_declaration():
     a declaration without `variable` in all seven rounds (the word "process"
     in `end process` opened a fake declarative region), and the model deleted
     an `end if;` trying to obey."""
-    from agents.rtl_agent.rtl_linter import _process_declaration_issues
+    from agents.rtl_agent.lint.rtl_linter import _process_declaration_issues
     code = ("p_main : process(aclk)\n  variable w : signed(15 downto 0);\nbegin\n  w := eta;\nend process p_main;\n"
             "p_strobe : process(aclk)\nbegin\n  strobe <= '1';\nend process p_strobe;\n"
             "u_sub : entity work.sub port map (a => b);\n"
@@ -1469,7 +1542,7 @@ def test_multiplier_width_fix_is_one_exact_declaration_and_one_exact_line():
     p1 was told "make p1 44 bits"; the next round, the resize() gone as the
     same message asked, "make p1 23 bits". One message now, at the natural
     widths."""
-    from agents.rtl_agent.rtl_linter import _multiplier_width_issues
+    from agents.rtl_agent.lint.rtl_linter import _multiplier_width_issues
     code = ("signal v2 : signed(13 downto 0);\nsignal mu_q8 : unsigned(7 downto 0);\nsignal p1 : signed(21 downto 0);\n"
             "p1 <= resize(v2, 22) * resize(signed('0' & mu_q8), 22);\n")
     [issue] = _multiplier_width_issues(code)
@@ -1503,7 +1576,7 @@ def test_multiplier_width_requires_the_product_declared_from_width_names():
     next run. For `p <= a * b` with two declared names the fix now names the
     widths (`signed(A_W+B_W-1 downto 0)`), and a typed-in product width is
     reported even when the number is right, so later rounds cannot go stale."""
-    from agents.rtl_agent.rtl_linter import _multiplier_width_issues, _width_issues
+    from agents.rtl_agent.lint.rtl_linter import _multiplier_width_issues, _width_issues
     first, second = _multiplier_width_issues(TYPED_PRODUCT)
     assert first["detail"].startswith("line 11: `p2i_s5 <= v2i_s4 * mu_s4;` puts a 32-bit product into the 30-bit 'p2i_s5'")
     assert ("declare `constant V2I_W : integer := 14;` and change `signal v2i_s4 : signed(13 downto 0)` to "
@@ -1549,9 +1622,9 @@ def test_width_checks_use_the_variable_declared_in_the_same_process():
     p_s3's product lines were flagged for nine fix rounds with a fix the file
     already contained. Each process is now checked against its own
     declaration, and the message quotes `:=` for a variable, not `<=`."""
-    from agents.rtl_agent.rtl_linter import _width_issues
-    from agents.rtl_agent.rtl_smoke_check import _width_mismatch_hint
-    from agents.rtl_agent.rtl_widths import scoped_widths
+    from agents.rtl_agent.lint.rtl_linter import _width_issues
+    from agents.rtl_agent.lint.rtl_smoke_check import _width_mismatch_hint
+    from agents.rtl_agent.lint.rtl_widths import scoped_widths
     assert _width_issues(TWO_PROCESSES_SAME_VARIABLE) == []
     scopes = scoped_widths(TWO_PROCESSES_SAME_VARIABLE)
     assert scopes.at(10)["prod_v"] == 22 and scopes.at(18)["prod_v"] == 31 and "prod_v" not in scopes.at(1)
@@ -1562,7 +1635,7 @@ def test_width_checks_use_the_variable_declared_in_the_same_process():
     assert mult["code"] == "multiplier_width" and mult["detail"].startswith(
         "line 10: `prod_v := v2_s2 * signed('0' & mu_s2);` puts a 22-bit product into the 30-bit 'prod_v'")
     assert "declare `variable prod_v : signed(21 downto 0);` and write `prod_v := v2_s2 * signed('0' & mu_s2);`" in mult["detail"]
-    assert [i["code"] for i in rest] == ["assignment_width"] and "line 11" in rest[0]["detail"]   # p1_s3 <= prod_v (30 into 22)
+    assert rest == []       # line 11, p1_s3 <= prod_v, fits once prod_v is the 22 bits that message asks for
     # the dry-run hint finds the line by the same scoped widths
     hint = _width_mismatch_hint("Array sizes do not match, left array has 30 elements, right array has 22 elements", bad)
     assert "line 10:" in hint and "line 18" not in hint
@@ -1572,7 +1645,7 @@ def test_assignment_width_fix_is_the_exact_line_when_the_right_side_is_narrower(
     """`y_sym_i <= std_logic_vector(y_sat);` (12 bits into 24) was told to
     "compute at the natural width, then resize as a separate step", the
     advice for a WIDER right side, and survived two rounds."""
-    from agents.rtl_agent.rtl_linter import _assignment_width_issues
+    from agents.rtl_agent.lint.rtl_linter import _assignment_width_issues
     code = ("signal y_sat : signed(11 downto 0);\nsignal y_sym_i : std_logic_vector(23 downto 0);\n"
             "signal mu_q8 : unsigned(7 downto 0);\nsignal eta : signed(15 downto 0);\nsignal w : unsigned(23 downto 0);\n"
             "y_sym_i <= std_logic_vector(y_sat);\n"
@@ -1589,7 +1662,7 @@ def test_assignment_width_fix_is_the_exact_line_when_the_right_side_is_narrower(
 def test_multiple_drivers_names_the_processes_the_lines_and_the_stray_reset_line():
     """p_main reset `strobe` while p_strobe computed it; "process #1, process
     #2" was all the model got, for six rounds."""
-    from agents.rtl_agent.rtl_linter import _multiple_driver_issues
+    from agents.rtl_agent.lint.rtl_linter import _multiple_driver_issues
     code = ("p_main : process(aclk)\nbegin\n  if rising_edge(aclk) then\n    if aresetn = '0' then\n"
             "      cnt <= 0;\n      strobe <= '0';\n    end if;\n  end if;\nend process p_main;\n"
             "p_strobe : process(aclk)\nbegin\n  if rising_edge(aclk) then\n    if eta < 0 then\n"
@@ -1603,7 +1676,7 @@ def test_multiple_drivers_names_the_processes_the_lines_and_the_stray_reset_line
 def test_linter_catches_a_declaration_after_the_process_begin():
     """The retry put a `variable` line after `begin` and a `signal` line inside
     the process: 'syntax error near variable' plus 13 follow-on errors, twice."""
-    from agents.rtl_agent.rtl_linter import _declaration_after_begin_issues
+    from agents.rtl_agent.lint.rtl_linter import _declaration_after_begin_issues
     code = ("p_main : process(aclk)\n  variable w : signed(15 downto 0);\nbegin\n"
             "  variable eta_next : signed(15 downto 0);\n  if rising_edge(aclk) then\n"
             "    signal x_m1 : signed(11 downto 0);\n    w := eta;\n  end if;\nend process p_main;\n")
@@ -1625,7 +1698,7 @@ def test_linter_reads_leaked_planning_comments_as_placeholders():
     the full code in the final answer", "-- Placeholder for the rest of the
     code"); TODO/FIXME/`...` never matched, so the file reached the dry run
     eight times and got the same canned valid_pipe hint every time."""
-    from agents.rtl_agent.rtl_linter import _static_checks
+    from agents.rtl_agent.lint.rtl_linter import _static_checks
     spec = {"entity_name": "timing_recovery", "ports": []}
     base = ("entity timing_recovery is port (aclk : in std_logic); end entity;\n"
             "architecture rtl of timing_recovery is\nbegin\n"
@@ -1652,7 +1725,7 @@ def test_linter_catches_an_output_valid_tied_to_zero_before_the_dry_run():
     the whole output logic; the 400-cycle dry run then reported
     smoke_output_never_valid with a hint about valid_pipe/advance, names the
     file did not contain, and the model changed nothing."""
-    from agents.rtl_agent.rtl_linter import _constant_output_valid_issues
+    from agents.rtl_agent.lint.rtl_linter import _constant_output_valid_issues
     spec = {"ports": [{"name": "s_axis_tvalid", "direction": "input", "width": "1"},
                       {"name": "m_axis_tvalid", "direction": "output", "width": "1"},
                       {"name": "m_axis_tdata", "direction": "output", "width": "24"}]}
@@ -1721,7 +1794,7 @@ def test_generator_does_not_re_ask_when_the_fix_changed_something():
 
 
 def test_generator_re_asks_only_once_and_leaves_a_second_copy_to_the_linter():
-    from agents.rtl_agent.rtl_linter import unchanged_on_retry_issue
+    from agents.rtl_agent.lint.rtl_linter import unchanged_on_retry_issue
     first, second = RecordingLLM(OLD), RecordingLLM(OLD)
     gen = RTLGenerator(llm=first, retry_llm=second)
     rtl = gen.generate(SPEC, SKILLS, previous_rtl=json.loads(OLD), lint_issues=ISSUES)
@@ -1748,7 +1821,7 @@ def test_linter_names_every_stage_register_that_is_used_but_never_declared_or_wr
     carry lines read stage-1 registers that were never declared or written
     (loop values fed back from the last stage). xvhdl listed all seven, the
     follow-on filter showed one, and two fix rounds returned the same file."""
-    from agents.rtl_agent.rtl_linter import _stage_register_declaration_issues
+    from agents.rtl_agent.lint.rtl_linter import _stage_register_declaration_issues
     code = """architecture rtl of t is
   signal i_s1, q_s1 : signed(11 downto 0);
   signal mu_s2, mu_s3 : signed(16 downto 0);
@@ -1804,7 +1877,7 @@ end architecture;"""
 
 
 def test_compiler_undeclared_lines_are_dropped_once_the_linter_explained_the_name():
-    from agents.rtl_agent.rtl_linter import _without_duplicate_undeclared
+    from agents.rtl_agent.lint.rtl_linter import _without_duplicate_undeclared
     static = [{"code": "undeclared_stage_register", "detail": "line 15: `mu_s1` is used but never declared ..."}]
     compiled = [{"code": "compile_error",
                  "detail": "ERROR: [VRFC 10-2989] 'mu_s1' is not declared [t.vhd:15]  >> line 15: mu_s2 <= mu_s1;"},
@@ -1834,3 +1907,524 @@ def test_each_different_missing_name_is_a_root_compiler_error():
               "ERROR: [VRFC 10-2989] 'bar' is not declared [t.vhd:61]")
     kept = [i["detail"] for i in compiler_errors(broken, src, 1)]
     assert len(kept) == 2 and "'signal'" in kept[0] and kept[1].startswith("2 follow-on error(s) hidden")
+
+
+FARROW_TAIL = """
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+entity t is port (aclk : in std_logic); end entity t;
+architecture rtl of t is
+  constant D_W  : integer := 12;
+  constant MU_F : integer := 16;
+  constant MU_W : integer := MU_F + 2;
+  signal s2i_s5, s1i_s5 : signed(D_W+MU_W+1 downto 0);
+  signal mu_s5 : signed(MU_W-1 downto 0);
+  signal p2i_s6, p1i_s6 : signed(D_W+2*MU_W+1 downto 0);
+  signal m2i_s6, m1i_s6 : signed(D_W+2*MU_W+1 downto 0);
+  signal v0i_s5, v0i_s6, w0i_s6 : signed(D_W-1 downto 0);
+  signal ysym_i_s7, ymid_i_s7 : signed(D_W-1 downto 0);
+  signal stage1, stage2 : signed(D_W-1 downto 0);
+begin
+  p_s6 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      p2i_s6 <= s2i_s5 * mu_s5;
+      p1i_s6 <= s1i_s5 * mu_s5;
+      v0i_s6 <= v0i_s5;
+    end if;
+  end process p_s6;
+  p_s7 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      ysym_i_s7 <= sat12(resize(p2i_s6, D_W+2*MU_W+2) + resize(p1i_s6, D_W+2*MU_W+2) + resize(v0i_s6, D_W+2*MU_W+2));
+      ymid_i_s7 <= sat12(resize(p2i_s6, D_W+2*MU_W+2) + resize(p1i_s6, D_W+2*MU_W+2) + resize(v0i_s6, D_W+2*MU_W+2));
+    end if;
+  end process p_s7;
+end architecture rtl;
+"""
+
+
+def test_two_registers_given_the_same_computed_expression_are_reported():
+    """timing_recovery 2026-11-09 14:18 (run 35b45c09): ymid_i_s7 was a copy of
+    ysym_i_s7's expression, the Gardner error was 0 on every strobe and mu never
+    moved ("m_axis_tuser expected 249 got 0"). The same copy is in the RTL of
+    five earlier runs."""
+    from agents.rtl_agent.lint.rtl_linter import _duplicate_expression_issues
+
+    found = _duplicate_expression_issues(FARROW_TAIL)
+    assert [i["code"] for i in found] == ["duplicate_expression"]
+    detail = found[0]["detail"]
+    assert "`ymid_i_s7` is given exactly the same expression as `ysym_i_s7`" in detail
+    assert "OLDER samples x[m-3]..x[m]" in detail and ">> ymid_i_s7 <= sat12(" in detail
+    # its own expression (its own product registers) is fine
+    own = FARROW_TAIL.replace("ymid_i_s7 <= sat12(resize(p2i_s6, D_W+2*MU_W+2) + resize(p1i_s6, D_W+2*MU_W+2)",
+                              "ymid_i_s7 <= sat12(resize(m2i_s6, D_W+2*MU_W+2) + resize(m1i_s6, D_W+2*MU_W+2)")
+    assert _duplicate_expression_issues(own) == []
+    # not reported: plain copies of one signal, reset aggregates, and a register written in two places
+    quiet = FARROW_TAIL.replace(
+        "      v0i_s6 <= v0i_s5;",
+        "      v0i_s6 <= v0i_s5;\n      w0i_s6 <= v0i_s5;\n"
+        "      stage1 <= (others => '0');\n      stage2 <= (others => '0');\n"
+        "      m2i_s6 <= s2i_s5 * mu_s5;\n      if mu_s5 < 0 then\n        m2i_s6 <= s1i_s5 * mu_s5;\n      end if;")
+    assert [i["detail"].split("`")[1] for i in _duplicate_expression_issues(quiet)] == ["ymid_i_s7"]
+
+
+def test_a_product_added_to_a_plain_value_without_scaling_back_is_reported():
+    """timing_recovery 2026-11-09 14:18 (run 35b45c09): `p2i_s6 <= s2i_s5 * mu_s5`
+    (mu: 1.0 = 2**16) was added to the 12-bit v0i_s6 with no shift, so the output
+    saturated whenever mu was not 0."""
+    from agents.rtl_agent.lint.rtl_linter import _unscaled_product_sum_issues
+
+    found = _unscaled_product_sum_issues(FARROW_TAIL)
+    assert {i["code"] for i in found} == {"product_added_unscaled"} and len(found) == 2    # p2i_s6 and p1i_s6, once each
+    detail = found[0]["detail"]
+    assert "`p2i_s6` is a product (line" in detail and "`p2i_s6 <= s2i_s5 * mu_s5`, 50 bits" in detail
+    assert "plain 12-bit `v0i_s6`" in detail and "shift_right(p2i_s6, F)" in detail and "fraction bits of `mu_s5`" in detail
+    # scaled back before the add, or the plain value shifted up: fine
+    scaled = FARROW_TAIL.replace("resize(p2i_s6, D_W+2*MU_W+2) + resize(p1i_s6, D_W+2*MU_W+2) + resize(v0i_s6, D_W+2*MU_W+2)",
+                                 "shift_right(p2i_s6, 2*MU_F) + shift_right(p1i_s6, MU_F) + resize(v0i_s6, D_W+2*MU_W+2)")
+    assert _unscaled_product_sum_issues(scaled) == []
+    up = FARROW_TAIL.replace("+ resize(v0i_s6, D_W+2*MU_W+2)", "+ shift_left(resize(v0i_s6, D_W+2*MU_W+2), 2*MU_F)")
+    assert _unscaled_product_sum_issues(up) == []
+    # a sum of products with products, and an integer multiply (`x * 3`), are fine
+    only_products = FARROW_TAIL.replace(" + resize(v0i_s6, D_W+2*MU_W+2)", "")
+    assert _unscaled_product_sum_issues(only_products) == []
+    by_three = FARROW_TAIL.replace("p2i_s6 <= s2i_s5 * mu_s5;", "p2i_s6 <= resize(s2i_s5 * 3, D_W+2*MU_W+2);").replace(
+        "p1i_s6 <= s1i_s5 * mu_s5;", "p1i_s6 <= resize(s1i_s5 * 3, D_W+2*MU_W+2);")
+    assert _unscaled_product_sum_issues(by_three) == []
+    # the same mistake as a variable (`:=`) inside a function: the reviewed timing_recovery RTL of 2026-11-10,
+    # `p1 := v2 * mu; p2 := (resize(p1, P2_W) + resize(v1, P2_W)) * mu;`, went through a `<=`-only check
+    found = _unscaled_product_sum_issues(FARROW_FUNCTION)
+    assert [i["code"] for i in found] == ["product_added_unscaled"]
+    p1_line = next(n for n, t in enumerate(FARROW_FUNCTION.splitlines(), 1) if "p1 := v2 * mu;" in t)
+    assert f"`p1` is a product (line {p1_line}: `p1 := v2 * mu`, 32 bits) and is added to the plain 15-bit `v1`" in found[0]["detail"]
+    assert found[0]["detail"].endswith(">> p2 := (resize(p1, P2_W) + resize(v1, P2_W)) * mu;")
+    fixed = FARROW_FUNCTION.replace("(resize(p1, P2_W) + resize(v1, P2_W)) * mu", "(shift_right(p1, MU_F) + resize(v1, P2_W)) * mu")
+    assert _unscaled_product_sum_issues(fixed) == []
+
+
+FARROW_FUNCTION = """
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+entity t is port (aclk : in std_logic); end entity t;
+architecture rtl of t is
+  constant I_W  : integer := 12;
+  constant MU_F : integer := 16;
+  constant MU_W : integer := MU_F + 2;
+  constant V2_W : integer := 14;
+  constant V1_W : integer := 15;
+  constant P1_W : integer := V2_W + MU_W;
+  constant P2_W : integer := P1_W + MU_W;
+  signal x0_s2, x1_s2, x2_s2, x3_s2 : signed(I_W-1 downto 0);
+  signal mu_s2 : signed(MU_W-1 downto 0);
+  signal y_s3 : signed(P2_W+MU_W-1 downto 0);
+  function farrow(xm1, xm, xp1, xp2 : signed(I_W-1 downto 0);
+                  mu : signed(MU_W-1 downto 0)) return signed is
+    variable v2 : signed(V2_W-1 downto 0);
+    variable v1 : signed(V1_W-1 downto 0);
+    variable p1 : signed(P1_W-1 downto 0);
+    variable p2 : signed(P2_W+MU_W-1 downto 0);
+  begin
+    v2 := resize(xp2, V2_W) - resize(xp1, V2_W) - resize(xm, V2_W) + resize(xm1, V2_W);
+    v1 := shift_left(resize(xp1, V1_W), 1) + resize(xp1, V1_W) - resize(xp2, V1_W) - resize(xm, V1_W) - resize(xm1, V1_W);
+    p1 := v2 * mu;
+    p2 := (resize(p1, P2_W) + resize(v1, P2_W)) * mu;
+    return p2;
+  end function;
+begin
+  p_s3 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      y_s3 <= farrow(x3_s2, x2_s2, x1_s2, x0_s2, mu_s2);
+    end if;
+  end process p_s3;
+end architecture rtl;
+"""
+
+
+SPEC_WINDOW = {"behavior": ["The base point is m = n - 2.",
+                            "y_sym = farrow(x[m-1], x[m], x[m+1], x[m+2], mu)",
+                            "y_mid = farrow(x[m-3], x[m-2], x[m-1], x[m], mu)"]}
+
+
+def test_a_history_chain_shorter_than_the_spec_window_names_the_registers_to_add():
+    """timing_recovery 2026-11-10 (reviewed RTL): x0..x3 per channel, four taps,
+    while y_mid reads x[m-3] = x[n-5]: six samples. The midpoint window read a
+    sample the chain never stored, and pipeline_stage_map.md showed four taps too."""
+    from agents.rtl_agent.lint.rtl_linter import _history_depth_issues, _spec_history_window
+
+    assert _spec_history_window(SPEC_WINDOW) == (-5, 0, "x[m-3]..x[m+2] with m = n - 2, that is x[n-5]..x[n]")
+    assert _spec_history_window({"behavior": ["y = x[n-1] + x[n]"]}) == (-1, 0, "x[n-1]..x[n]")
+    chain = lambda taps, ch: "\n".join([f"x0_{ch}_s2 <= {ch}_s1;"] + [f"x{k}_{ch}_s2 <= x{k - 1}_{ch}_s2;" for k in range(1, taps)])
+    four = _rows("i_s1 <= signed(din); q_s1 <= signed(din);", chain(4, "i") + "\n" + chain(4, "q"), "y_s3 <= x3_i_s2 + x0_q_s2;")
+    found = _history_depth_issues(SPEC_WINDOW, four)
+    assert [i["code"] for i in found] == ["history_too_short"]
+    d = found[0]["detail"]
+    line = next(n for n, t in enumerate(four.splitlines(), 1) if "x1_i_s2 <= x0_i_s2;" in t)
+    assert d.startswith(f"line {line}: the history chain in row 2 (`x0_i_s2`..`x3_i_s2`, `x0_q_s2`..`x3_q_s2`) holds 4 samples, "
+                        f"but the spec reads x[m-3]..x[m+2] with m = n - 2, that is x[n-5]..x[n]: 6 input samples side by side.")
+    assert "Add 2 more register(s) to EACH chain" in d and "`x4_i_s2 <= x3_i_s2;` `x5_i_s2 <= x4_i_s2;`" in d
+    assert d.endswith(">> x1_i_s2 <= x0_i_s2;")
+    # six taps: fine; a spec that names no x[...] sample, or uses m without saying what m is: nothing to compare with
+    assert _history_depth_issues(SPEC_WINDOW, _rows("i_s1 <= signed(din);", chain(6, "i"), "y_s3 <= x5_i_s2;")) == []
+    assert _history_depth_issues({"behavior": ["y = x * 2"]}, four) == []
+    assert _history_depth_issues({"behavior": ["y = x[m-3] + x[m]"]}, four) == []
+    # a same-row copy whose names are not one stem plus a number (the previous symbol) is not a history chain
+    assert _history_depth_issues(SPEC_WINDOW, _rows("i_s1 <= signed(din);", "ysym_s2 <= i_s1;\nyprev_s2 <= ysym_s2;")) == []
+
+
+def test_a_function_of_one_signal_copied_to_two_registers_is_reported_but_reused_variables_are_not():
+    """2026-11-09 18:59 (run a3133ede): `ysym_i_s7 <= sat12(t2i_s6); ymid_i_s7 <=
+    sat12(t2i_s6);` slipped past the first duplicate_expression check, which only
+    looked at expressions reading two or more signals."""
+    from agents.rtl_agent.lint.rtl_linter import _duplicate_expression_issues
+
+    one_signal = FARROW_TAIL.replace(
+        "ysym_i_s7 <= sat12(resize(p2i_s6, D_W+2*MU_W+2) + resize(p1i_s6, D_W+2*MU_W+2) + resize(v0i_s6, D_W+2*MU_W+2));",
+        "ysym_i_s7 <= sat12(p2i_s6);").replace(
+        "ymid_i_s7 <= sat12(resize(p2i_s6, D_W+2*MU_W+2) + resize(p1i_s6, D_W+2*MU_W+2) + resize(v0i_s6, D_W+2*MU_W+2));",
+        "ymid_i_s7 <= sat12(p2i_s6);")
+    found = _duplicate_expression_issues(one_signal)
+    assert len(found) == 1 and "`ymid_i_s7` is given exactly the same expression as `ysym_i_s7`" in found[0]["detail"]
+    # one signal moved or re-typed into two registers is a fan-out, not a missing computation
+    copies = one_signal.replace("ysym_i_s7 <= sat12(p2i_s6);", "ysym_i_s7 <= resize(p2i_s6, D_W);").replace(
+        "ymid_i_s7 <= sat12(p2i_s6);", "ymid_i_s7 <= resize(p2i_s6, D_W);")
+    assert _duplicate_expression_issues(copies) == []
+    slices = one_signal.replace("sat12(p2i_s6)", "p2i_s6(D_W-1 downto 0)")
+    assert _duplicate_expression_issues(slices) == []
+    # a process variable reassigned between the two lines (older demapper RTL): same text, different value
+    reused = """
+architecture rtl of t is
+  signal a, b, c, d : signed(11 downto 0);
+  signal d0, d1 : signed(11 downto 0);
+begin
+  process(aclk)
+    variable diff : signed(11 downto 0);
+  begin
+    if rising_edge(aclk) then
+      diff := a - b;
+      d0 <= abs(diff);
+      diff := c - d;
+      d1 <= abs(diff);
+    end if;
+  end process;
+end architecture rtl;
+"""
+    assert _duplicate_expression_issues(reused) == []
+
+
+# timing_recovery 14:43 (2026-11-10) in small: `mu : signed` has no width, so
+# `v2 * mu` (13 + 18 = 31 bits into the 30-bit p1) was invisible to every static
+# check and four fix rounds got only "Array sizes do not match ... in process p_s7"
+FARROW_UNSIZED_MU = """\
+entity t is
+  port (aclk : in std_logic);
+end;
+architecture rtl of t is
+  constant I_W  : integer := 12;
+  constant MU_W : integer := 18;
+  signal x1_s6, x2_s6, x3_s6, x4_s6 : signed(I_W-1 downto 0);
+  signal mu_s6 : signed(MU_W-1 downto 0);
+  signal y_s7 : signed(I_W-1 downto 0);
+  signal s5r_s : signed(48 downto 0);
+  function sat12(x : signed) return signed is
+  begin
+    if x > 2047 then return to_signed(2047, I_W);
+    else return resize(x, I_W);
+    end if;
+  end function;
+  function farrow(xm1 : signed; xm : signed; xp1 : signed; xp2 : signed; mu : signed) return signed is
+    variable v2 : signed(12 downto 0);
+    variable p1 : signed(29 downto 0);
+  begin
+    v2 := resize(xp2, 13) - resize(xm1, 13);
+    p1 := v2 * mu;
+    return sat12(p1);
+  end function;
+begin
+  p_s7 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      y_s7 <= farrow(x1_s6, x2_s6, x3_s6, x4_s6, mu_s6);
+    end if;
+  end process p_s7;
+  p_x : process(aclk) begin if rising_edge(aclk) then s5r_s <= resize(sat12(s5r_s), 49); end if; end process;
+end architecture;
+"""
+
+
+def test_function_inputs_without_a_width_take_the_width_the_calls_pass():
+    """The width tool reads `mu : signed` from the one call (mu_s6, MU_W = 18
+    bits), so the multiplier check names line 22 with the exact fix in round
+    1, before any dry run. An input the calls size differently (sat12's x:
+    30 and 49 bits) stays unknown and is never reported."""
+    from agents.rtl_agent.lint.rtl_linter import _multiplier_width_issues, _unconstrained_parameter_issues, lint_rtl
+    from agents.rtl_agent.lint.rtl_widths import scoped_widths
+    scopes = scoped_widths(FARROW_UNSIZED_MU)
+    assert scopes.functions["farrow"] == (17, 24) and scopes.functions["sat12"] == (11, 16)
+    assert scopes.at(22).get("mu") == 18 and scopes.at(22).get("xp2") == 12
+    assert scopes.at(22).types["mu"] == "signed(MU_W-1 downto 0)"
+    assert scopes.at(14).get("x") is None                                   # 30 bits from farrow, 49 from p_x
+    mult = _multiplier_width_issues(FARROW_UNSIZED_MU)
+    assert [i["code"] for i in mult] == ["multiplier_width"]
+    assert "line 22: `p1 := v2 * mu;` puts a 31-bit product into the 30-bit 'p1' (v2 is 13 bits, mu is 18 bits" \
+        in mult[0]["detail"]
+    assert "declare `variable p1 : signed(V2_W+MU_W-1 downto 0);` (13 + 18 = 31 bits)" in mult[0]["detail"]
+    # the header itself is reported, with the width the call passes written as its name
+    param = _unconstrained_parameter_issues(FARROW_UNSIZED_MU)
+    assert [i["code"] for i in param] == ["unconstrained_function_parameter"]
+    assert param[0]["detail"].startswith("line 17: function `farrow` takes `mu : signed` with no width, and line 22 "
+                                         "multiplies by it (`p1 := v2 * mu;`)")
+    assert "Every call passes `mu_s6` (18 bits): write `mu : signed(MU_W-1 downto 0)` in the function header" \
+        in param[0]["detail"]
+    # sat12's unsized x is only compared and resized: the recipe's helper shape, not an issue
+    assert "sat12" not in " ".join(i["detail"] for i in param)
+    codes = [i["code"] for i in lint_rtl({"entity_name": "t", "ports": []}, {"code": FARROW_UNSIZED_MU})["issues"]]
+    assert "multiplier_width" in codes and "unconstrained_function_parameter" in codes
+
+    # a header that gives the width declares it for the body, and is not reported
+    sized = FARROW_UNSIZED_MU.replace("mu : signed)", "mu : signed(MU_W-1 downto 0))")
+    assert scoped_widths(sized).at(22).get("mu") == 18
+    assert _unconstrained_parameter_issues(sized) == []
+    # calls that disagree leave the input unknown; the issue then asks for the width, naming the calls
+    two = FARROW_UNSIZED_MU.replace("  signal mu_s6 : signed(MU_W-1 downto 0);",
+                                    "  signal mu_s6 : signed(MU_W-1 downto 0);\n  signal mu_s5 : signed(19 downto 0);\n"
+                                    "  signal y_s6 : signed(I_W-1 downto 0);")
+    two = two.replace("  end process p_s7;", "  end process p_s7;\n  p_s6 : process(aclk) begin if rising_edge(aclk) "
+                                             "then y_s6 <= farrow(x1_s6, x2_s6, x3_s6, x4_s6, mu_s5); end if; end process;")
+    assert scoped_widths(two).at(24).get("mu") is None
+    assert _multiplier_width_issues(two) == []
+    detail = _unconstrained_parameter_issues(two)[0]["detail"]
+    assert "Give it the width of the value the call passes (line 31 passes `mu_s6`; line 34 passes `mu_s5`)" in detail
+
+
+def test_xelab_runs_after_xvhdl_and_explains_a_wrong_width_start_value(monkeypatch):
+    """timing_recovery 2026-11-11, attempt 3: `to_signed(1, V2_W-1)` as the
+    start value of a 16-bit constant passes xvhdl (grammar only) and stopped
+    the real simulation in xelab, where it was explained as a missing comma.
+    The compile step now runs xelab on the RTL alone, every round."""
+    from agents.rtl_agent.lint import rtl_linter
+
+    code = ("entity t is end;\narchitecture rtl of t is\n"
+            "  constant V2_HALF : signed(15 downto 0) := to_signed(1, 15);\nbegin\nend;")
+    calls = []
+    monkeypatch.setattr(rtl_linter, "mcp_write_files", lambda *a, **k: None)
+    monkeypatch.setattr(rtl_linter, "mcp_run_xvhdl", lambda *a, **k: [{"status": "ok", "stdout": ""}])
+
+    def xelab(project_dir, top, file, std):
+        calls.append((top, file, std))
+        return {"status": "error", "errors_found": 2, "stdout":
+                "ERROR: [VRFC 10-664] expression has 15 elements ; expected 16 [C:/tmp x/tmpab12/t.vhd:3]\n"
+                "ERROR: [XSIM 43-3321] Static elaboration of top level VHDL design unit t in library work failed.\n"}
+    monkeypatch.setattr(rtl_linter, "mcp_run_xelab", xelab)
+    compiler, issues = rtl_linter._compile(code, "t", "2008")
+    assert compiler == "xvhdl" and calls == [("t", "t.vhd", "2008")]
+    assert [i["code"] for i in issues] == ["elaboration_error"]          # the closing summary line is not a cause
+    detail = issues[0]["detail"]
+    assert "[t.vhd:3]" in detail and ">> line 3: constant V2_HALF" in detail
+    assert "a 15-bit value is given to a 16-bit name" in detail and "not a missing comma" in detail
+
+    # xelab is not run on RTL that xvhdl rejects, and a clean build adds nothing
+    calls.clear()
+    monkeypatch.setattr(rtl_linter, "mcp_run_xvhdl", lambda *a, **k: [{"status": "error", "stdout": "ERROR: bad [t.vhd:1]"}])
+    assert [i["code"] for i in rtl_linter._compile(code, "t", "2008")[1]] == ["compile_error"] and not calls
+    monkeypatch.setattr(rtl_linter, "mcp_run_xvhdl", lambda *a, **k: [{"status": "ok", "stdout": ""}])
+    monkeypatch.setattr(rtl_linter, "mcp_run_xelab", lambda *a, **k: {"status": "ok", "stdout": "", "errors_found": 0})
+    assert rtl_linter._compile(code, "t", "2008") == ("xvhdl", [])
+
+
+def test_xelab_that_cannot_run_leaves_the_xvhdl_result(monkeypatch):
+    from agents.rtl_agent.lint import rtl_linter
+
+    monkeypatch.setattr(rtl_linter, "mcp_write_files", lambda *a, **k: None)
+    monkeypatch.setattr(rtl_linter, "mcp_run_xvhdl", lambda *a, **k: [{"status": "ok", "stdout": ""}])
+    monkeypatch.setattr(rtl_linter, "mcp_run_xelab", lambda *a, **k: {
+        "status": "error", "stderr": "xelab timed out after 180s.", "error_class": "environment"})
+    assert rtl_linter._compile("entity t is end;", "t", "93") == ("xvhdl", [])
+
+    def boom(*a, **k):
+        raise KeyError("run_xelab")                 # a Vivado server started before the helper existed
+    monkeypatch.setattr(rtl_linter, "mcp_run_xelab", boom)
+    assert rtl_linter._compile("entity t is end;", "t", "93") == ("xvhdl", [])
+
+
+FARROW_WIDTHS = (
+    "constant I_W : integer := 12;\nconstant D_W : integer := 13;\nconstant E_W : integer := 26;\n"
+    "constant V2_W : integer := 16;\n"
+    "constant V2_ONE : signed(V2_W-1 downto 0) := to_signed(1, V2_W);\n"
+    "signal ymid_i_s8 : signed(I_W-1 downto 0);\nsignal d_i_s8 : signed(D_W-1 downto 0);\n"
+    "signal e_s9 : signed(E_W-1 downto 0);\n"
+    "function farrow(xm : signed(I_W-1 downto 0)) return signed is\n"
+    "  variable v2m1 : signed(V2_W-1 downto 0);\n  variable v2m1_2 : signed(V2_W-1 downto 0);\n"
+    "  variable c0 : signed(V2_W-1 downto 0);\n  variable p0 : signed(I_W+V2_W-1 downto 0);\nbegin\n"
+    "  v2m1_2 := v2m1 * v2m1;\n"                                   # line 15
+    "  c0 := V2_ONE + V2_ONE * v2m1_2;\n"                           # line 16
+    "  p0 := resize(xm, I_W+V2_W-1) * c0;\n"                        # line 17
+    "  return p0;\nend function;\n"
+    "p_s9 : process(aclk)\n  variable e_v : signed(E_W-1 downto 0);\nbegin\n"
+    "  e_v := resize(ymid_i_s8, E_W) * resize(d_i_s8, E_W);\n"      # line 23
+    "  e_s9 <= e_v;\nend process;\n")                               # line 24
+
+
+def test_multiplier_width_takes_off_a_resize_whose_width_is_a_name():
+    """timing_recovery 2026-11-11 12:15: `p0 := resize(xm, I_W+V2_W-1) * c0;`
+    into a p0 that was already 12 + 16 = 28 bits. The wrapper was only taken
+    off for a typed number, so three rounds were told "declare p0 as
+    signed(42 downto 0) ... no resize() around any factor" next to the line
+    with the resize() kept, and the line never changed."""
+    from agents.rtl_agent.lint.rtl_linter import _width_issues
+    details = {int(re.match(r"line (\d+)", i["detail"]).group(1)): i["detail"] for i in _width_issues(FARROW_WIDTHS)}
+    assert "'p0' is already 28 bits: write `p0 := xm * c0;` (12 + 16 = 28 bits" in details[17]
+    assert "42 downto 0" not in details[17]
+    # the target is the wrong size too: declared from the factors' width names, never a typed number
+    assert ("declare `variable e_v : signed(I_W+D_W-1 downto 0);` and write `e_v := ymid_i_s8 * d_i_s8;` "
+            "(12 + 13 = 25 bits") in details[23]
+    assert "downto 0);` and write `e_v := resize(" not in details[23]
+
+
+def test_other_lines_are_counted_with_the_width_a_product_is_told_to_take():
+    """Same run, round 4 -> 5: `v2m1_2` (16 bits) was told to become 32, and
+    `c0 := V2_ONE + V2_QUARTER * v2m1_2` was told, on the same round, "a
+    variable of exactly 32 bits". Both done, the product was 48 bits and the
+    new helper was the next round's mistake."""
+    from agents.rtl_agent.lint.rtl_linter import _width_issues
+    issues = _width_issues(FARROW_WIDTHS)
+    assert all(set(i) == {"code", "detail"} for i in issues)        # the hand-over between the checks stays inside
+    details = {int(re.match(r"line (\d+)", i["detail"]).group(1)): i["detail"] for i in issues}
+    assert "declare `variable v2m1_2 : signed(V2_W+V2_W-1 downto 0);`" in details[15]
+    assert details[16].startswith("line 16: 'c0' is 16 bits but the right-hand side is 48 bits (counted with "
+                                  "`v2m1_2` at 32 bits, as the message for line 15 asks)")
+    assert "a signal or variable of exactly 48 bits" in details[16]
+    # the register a resized product is copied into hears about it on the same round
+    assert "counted with `e_v` at 25 bits, as the message for line 23 asks" in details[24]
+    assert "`e_s9 <= resize(e_v, 26);`" in details[24]
+    # a same-named variable of another process keeps its own width
+    other = FARROW_WIDTHS + ("p_x : process(aclk)\n  variable e_v : signed(E_W-1 downto 0);\nbegin\n"
+                             "  e_s9 <= e_v;\nend process;\n")
+    assert sorted(n for n in (int(re.match(r"line (\d+)", i["detail"]).group(1)) for i in _width_issues(other))) == \
+        [15, 16, 17, 23, 24]
+
+
+# -- values packed in one port: {I[11:0], Q[11:0]} ------------------------------
+PACKED_SPEC = {
+    "entity_name": "iq",
+    "ports": [{"name": "s_axis_tdata", "direction": "input", "width": "24", "type": "std_logic_vector"},
+              {"name": "m_axis_tdata", "direction": "output", "width": "24", "type": "std_logic_vector"}],
+    "behavior": ["Input s_axis_tdata is 24 bits: {I[11:0], Q[11:0]}, signed Q1.11.",
+                 "Output m_axis_tdata is 24 bits: {I[11:0], Q[11:0]}, signed Q1.11, saturated."],
+}
+PACKED_RTL = """
+architecture rtl of iq is
+  signal i_s1, q_s1 : signed(11 downto 0);
+begin
+  p_s1 : process(aclk)
+  begin
+    if rising_edge(aclk) then
+      i_s1 <= signed(s_axis_tdata(23 downto 12));
+      q_s1 <= signed(s_axis_tdata(11 downto 0));
+    end if;
+  end process p_s1;
+  m_axis_tdata <= std_logic_vector(sat12(i_s1) & sat12(q_s1));
+end architecture rtl;
+"""
+
+
+def test_values_read_from_the_other_values_bits_are_reported():
+    """timing_recovery 2026-11-11 13:09: `i_s1 <= signed(s_axis_tdata(11 downto 0))`
+    with the spec's {I[11:0], Q[11:0]} (I in the top bits)."""
+    from agents.rtl_agent.lint.rtl_linter import _packed_field_order_issues, _packed_ports
+
+    assert _packed_ports(PACKED_SPEC)["s_axis_tdata"][1] == [("i", 23, 12), ("q", 11, 0)]
+    assert _packed_field_order_issues(PACKED_SPEC, PACKED_RTL) == []
+    swapped = PACKED_RTL.replace("i_s1 <= signed(s_axis_tdata(23 downto 12));", "i_s1 <= signed(s_axis_tdata(11 downto 0));") \
+                        .replace("q_s1 <= signed(s_axis_tdata(11 downto 0));", "q_s1 <= signed(s_axis_tdata(23 downto 12));", 1)
+    found = _packed_field_order_issues(PACKED_SPEC, swapped)
+    assert [i["code"] for i in found] == ["packed_field_order"] * 2
+    assert "`i_s1` takes bits 11 downto 0 of `s_axis_tdata`, and those bits are Q, not I" in found[0]["detail"]
+    assert "Use `s_axis_tdata(23 downto 12)` for I" in found[0]["detail"]
+    # names without a word of their own count when the twin exists: xi_s1 / xq_s1
+    twins = swapped.replace("i_s1", "xi_s1").replace("q_s1", "xq_s1")
+    assert len(_packed_field_order_issues(PACKED_SPEC, twins)) == 2
+    # a whole-word read and a name that says nothing are left alone
+    assert _packed_field_order_issues(PACKED_SPEC, swapped.replace("i_s1", "a_s1").replace("q_s1", "b_s1")) == []
+    assert _packed_field_order_issues({**PACKED_SPEC, "behavior": ["Input is I then Q."]}, swapped) == []
+
+
+def test_an_output_joined_in_the_other_order_is_reported():
+    from agents.rtl_agent.lint.rtl_linter import _packed_field_order_issues
+
+    joined = PACKED_RTL.replace("sat12(i_s1) & sat12(q_s1)", "sat12(q_s1) & sat12(i_s1)")
+    found = _packed_field_order_issues(PACKED_SPEC, joined)
+    assert len(found) == 1 and "`m_axis_tdata` is joined as {Q, I}" in found[0]["detail"]
+    sliced = PACKED_RTL.replace("m_axis_tdata <= std_logic_vector(sat12(i_s1) & sat12(q_s1));",
+                                "m_axis_tdata(23 downto 12) <= std_logic_vector(q_s1);\n"
+                                "  m_axis_tdata(11 downto 0) <= std_logic_vector(q_s1);")
+    found = _packed_field_order_issues(PACKED_SPEC, sliced)
+    assert len(found) == 1 and "bits 23 downto 12 of `m_axis_tdata`, and those bits are I, not Q" in found[0]["detail"]
+
+
+# ── worked examples (skills/RTL_EXAMPLES, chosen by rtl_examples.py) ─────
+
+TIMING_SPEC = {**SPEC, "entity_name": "timing_recovery",
+               "description": "Symbol timing recovery using Gardner TED and a parabolic Farrow interpolator."}
+
+
+def test_a_worked_example_is_shown_only_for_the_kind_of_design_it_is_for():
+    """timing_recovery 2026-11-11 13:01: p_loop, given in full by the rules, came
+    back right; the Farrow rows, given as one summary line, came back wrong in a
+    different way on each attempt. The complete design is now shown, but only to
+    a spec of that kind: a counter is never handed it."""
+    from agents.rtl_agent.rtl_examples import EXAMPLE_LABEL, keywords_of, select_example
+    files = {"timing.md": "applies_when: Farrow, gardner, timing recovery\n\n# title\ncode",
+             "fir.md": "applies_when: fir filter\nfir code", "plain.md": "no header line"}
+    assert keywords_of(files["timing.md"]) == ["farrow", "gardner", "timing recovery"]
+    assert keywords_of(files["plain.md"]) == []
+    assert select_example(files, TIMING_SPEC) == {EXAMPLE_LABEL + "timing.md": "# title\ncode"}   # header line not shown
+    assert select_example(files, SPEC) == {}                                # a counter: no example
+    assert select_example({}, TIMING_SPEC) == {}
+    both = {"description": "FIR filter in front of a Gardner timing recovery with a Farrow interpolator"}
+    assert list(select_example(files, both)) == [EXAMPLE_LABEL + "timing.md"]   # one at most: the best fit
+
+
+def test_the_worked_example_reaches_the_generator_after_the_rules():
+    example = {"WORKED EXAMPLE timing.md": "entity timing_recovery ..."}
+    agent = make_agent([GOOD_RTL], [CLEAN], examples=lambda spec: example if "Farrow" in str(spec) else {})
+    out = agent.run(TIMING_SPEC)
+    assert list(agent.tools.generator.calls[0]["skills"]) == ["vhdl_93_design_rules.md", "WORKED EXAMPLE timing.md"]
+    assert out["skills_used"] == ["vhdl_93_design_rules.md", "WORKED EXAMPLE timing.md"]
+    agent = make_agent([GOOD_RTL], [CLEAN], examples=lambda spec: example if "Farrow" in str(spec) else {})
+    assert agent.run(SPEC)["skills_used"] == ["vhdl_93_design_rules.md"]
+
+
+def test_a_missing_example_folder_is_a_warning_and_the_rules_are_still_used():
+    def broken(spec):
+        raise RuntimeError("cannot list skills/RTL_EXAMPLES")
+    agent = make_agent([GOOD_RTL], [CLEAN], examples=broken)
+    out = agent.run(TIMING_SPEC)
+    assert out["status"] == RTLStatus.COMPLETE.value and out["skills_used"] == ["vhdl_93_design_rules.md"]
+    assert any("worked example not loaded" in w for w in out["warnings"])
+
+
+def test_the_shipped_timing_recovery_example_fits_the_task_spec_and_follows_the_static_rules():
+    """The file on disk: it is picked for the Task 2 spec text, its stage map
+    is there, and the five mistakes it exists to prevent are not in its code."""
+    from pathlib import Path
+    from agents.rtl_agent.rtl_examples import EXAMPLES_DIR, select_example
+    root = Path(__file__).resolve().parents[1]
+    files = {p.name: p.read_text(encoding="utf-8") for p in (root / EXAMPLES_DIR).glob("*.md")}
+    picked = select_example(files, TIMING_SPEC)
+    assert list(picked) == ["WORKED EXAMPLE timing_recovery_farrow_gardner.md"]
+    text = next(iter(picked.values()))
+    assert not text.lower().startswith("applies_when") and "stage map:" in text
+    code = re.search(r"```vhdl\n(.*?)```", text, re.S).group(1)
+    assert "i_s1 <= signed(s_axis_tdata(23 downto 12));" in code            # I is the high half
+    assert "p1_i_s4  <= v2_i_s3 * mu_s3;" in code and "p2_i_s6  <= h_i_s5 * mu_s5;" in code   # two multiplies by mu
+    assert "ymid_i_s7 <= resize(shift_right(p2m_i_s6, MU_F + 1), Y_W)" in code                # y_mid has its own path
+    assert "v2m_i_s3 <= resize(x2_i_s2, V_W) - resize(x3_i_s2, V_W) - resize(x4_i_s2, V_W) + resize(x5_i_s2, V_W);" in code
+    from agents.rtl_agent.lint.rtl_linter import _static_checks, _stage_map_issues, _pipeline_stage_skip_issues
+    spec = {"entity_name": "timing_recovery", "ports": [{"name": n} for n in ("aclk", "aresetn", "s_axis_tdata", "m_axis_tuser")]}
+    rtl = {"code": code, "notes": [text[text.index("stage map:"):text.index("What each row does")]]}
+    assert _static_checks(spec, rtl) == [] and _stage_map_issues(rtl) == [] and _pipeline_stage_skip_issues(code) == []
+

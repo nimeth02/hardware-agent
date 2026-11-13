@@ -422,7 +422,7 @@ flowchart LR
 Every arrow passes through `decide`, where the planner proposes and the guard corrects.
 
 - **Guard rules.** Load once; compile once; no simulation after a compile error (analyse instead); simulate before analysing; rerun only when the run ended without a PASSED/FAILED marker and at most `MAX_SIM_RERUNS` = 2 times; analyse before finalising.
-- **Analyst.** First the deterministic verdict rules (pass marker, log cut at the size limit, mismatch flood). Otherwise the LLM analyst, which may run one Python check that decodes and recomputes the failing rows. Code rules override the LLM's `likely_cause` when they contradict it.
+- **Analyst.** First the deterministic verdict rules (pass marker, log cut at the size limit, mismatch flood). Otherwise the LLM analyst, which may run one Python check that decodes and recomputes the failing rows (only for designs whose answer follows from one row; a design that reads earlier samples or keeps loop state gets no check). Fixed rules read off the log travel to the analyst as `fixed_rule_hint` text it must follow; the only code rule that still replaces its `likely_cause` is the one that proves the test vectors wrong from the CSV files themselves (constant input, strobe never fires).
 - **Status.** COMPLETE on a pass verdict; NEEDS_REVIEW on fail or error; FAILED on a tool or LLM exception.
 - **Returns** `{"status", "project_dir", "project": {name, src_files, tb_file, top_entity, test_vectors}, "compile", "sim", "analysis", "verdict", "iteration", "decision_reason", "warnings", "error"}`; the orchestrator keeps it whole as `simulation` and feeds `analysis` to blame.
 

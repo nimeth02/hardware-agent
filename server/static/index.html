@@ -218,6 +218,35 @@
   </section>
 
   <section id="tab-observability" class="tab">
+    <nav class="obs-switch">
+      <button type="button" class="tab-btn active" data-obs-view="runs">Run trace</button>
+      <button type="button" class="tab-btn" data-obs-view="calls">All LLM calls</button>
+    </nav>
+
+    <div id="obs-view-runs" class="obs-view active">
+      <div class="obs-split">
+        <aside class="obs-left">
+          <div class="obs-left-head">
+            <span class="obs-title">Trace</span>
+            <span class="obs-head-tools">
+              <button type="button" class="obs-mini" id="obs-expand-all" title="Open every group in the tree">Expand all</button>
+              <button type="button" class="obs-mini" id="obs-collapse-all" title="Close every group in the tree">Collapse all</button>
+              <button type="button" class="obs-mini" id="obs-refresh-btn" title="Reload the run list and the selected run">Refresh</button>
+            </span>
+          </div>
+          <div class="obs-pickers">
+            <select id="obs-agent-filter" title="Show runs of one AI worker only"><option value="">All agents</option></select>
+            <select id="obs-run-select" title="Pick the run to look at"></select>
+          </div>
+          <input id="obs-filter" class="obs-filter" type="search" placeholder="Filter steps…" autocomplete="off">
+          <div id="obs-tree-status" class="status obs-tree-status"></div>
+          <div id="obs-tree" class="obs-tree"></div>
+        </aside>
+        <section id="obs-detail" class="obs-right"></section>
+      </div>
+    </div>
+
+    <div id="obs-view-calls" class="obs-view">
     <div class="panel">
       <div class="row">
         <label>LLM call traces</label>
@@ -243,7 +272,8 @@
         <label>Trace detail</label>
         <button id="close-detail-btn">Close</button>
       </div>
-      <div id="trace-detail-body"></div>
+      <div id="trace-detail-body" class="obs-right obs-right-inline"></div>
+    </div>
     </div>
   </section>
 </main>

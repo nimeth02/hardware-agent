@@ -304,15 +304,49 @@ from the model: a bit-exact compare of such a design can NEVER pass, no
 matter how the RTL is written (timing_recovery, 2026-11-05: beat 1
 expected I=-46 Q=-47, got I=-47 Q=-46; 207 then 181 mismatches over three
 attempts; the RTL was blamed every time). For these designs:
+- SETTLE WINDOW: the first beats are COUNTED but NOT COMPARED. The model
+  applies the loop filter's new value on the very next sample; a pipelined
+  RTL applies it 4 to 24 samples later, so while the loop locks the two
+  take slightly different paths and then meet again. Measured on
+  2026-11-09 (40 random stimuli, loop delays 4..24 samples): after 64
+  beats a correct design is within 2 steps on I/Q and 7 of 256 on mu, on
+  every beat; in the first 16 beats it is up to 100 steps and 80 of 256
+  away. So declare `constant SETTLE_BEATS : integer := 64;` and compare a
+  beat only when its index is past the window:
+      if k_exp >= n_exp then
+        ... "unexpected output beat" ...
+      elsif k_exp >= SETTLE_BEATS then
+        ... the field compares below ...
+      end if;
+      k_exp := k_exp + 1;
+  When the vectors hold fewer than 3 * SETTLE_BEATS beats, use a third of
+  the expected beats as the window instead (`n_exp / 3`).
 - Compare each FIELD of a payload word separately, with a tolerance, not
   the packed word: one step of the I field moves the packed word by 4096.
   Decode the fields at the spec's [hi:lo] positions as signed values, then
       if abs(got_i - exp_i) > TOL_SYM or abs(got_q - exp_q) > TOL_SYM then
-  with `constant TOL_SYM : integer := 2;` (2 steps of the output's
+  with `constant TOL_SYM : integer := 4;` (4 steps of the output's
   fixed-point unit; use the spec's tolerance when it gives one). The
-  fractional offset (m_axis_tuser / mu) gets its own constant, e.g.
-  `constant TOL_MU : integer := 8;` out of 256, because mu is a loop state
-  and drifts more than the symbol.
+  fractional offset (m_axis_tuser / mu) gets its own constant,
+  `constant TOL_MU : integer := 16;` out of 256, because mu is a loop
+  state and drifts more than the symbol.
+- BOTH SIDES OF A FIELD COME FROM THE SAME PLACE. got_x and exp_x must be
+  decoded from the same output column and the same bit range, only the
+  array differs:
+      got_q := to_integer(signed(dut_m_axis_tdata(11 downto 0)));
+      exp_q := to_integer(signed(exp_tdata(k_exp)(11 downto 0)));
+  `exp_q := to_integer(signed(exp_tuser(k_exp)(7 downto 0)));` reads the
+  expected Q from the mu column and fails every beat on a correct RTL
+  (timing_recovery, 2026-11-11; linter: field_source_mismatch).
+- Compare mu ROUND THE WRAP. mu is a fraction of one sample: 249 and 0 are
+  7 apart, not 249 (the strobe then falls one sample earlier or later and
+  the symbol is the same instant). A plain abs() reported "m_axis_tuser
+  expected 249 got 0 (tolerance 8)" for a correct design:
+      d_mu := abs(got_mu - exp_mu);
+      if d_mu > 128 then d_mu := 256 - d_mu; end if;
+      if d_mu > TOL_MU then ... report ... end if;
+  (128 and 256 are half and the whole of the mu field's range: for an
+  N-bit mu use 2**(N-1) and 2**N.)
 - Report with the same words as before ("beat k (input cycle N):
   m_axis_tdata expected ... got ...") so the analyst's reader still finds
   them; add " (tolerance TOL)" at the end of the message.
@@ -321,6 +355,12 @@ attempts; the RTL was blamed every time). For these designs:
   beat" only when the count differs by more than 2 % of the expected beats
   (at least 2 beats).
 - Everything else (beat order, arrays, next_edge, the drain) is unchanged.
+- Checked in the simulator on 2026-11-09 with the timing_recovery vectors
+  (200 beats): a reference design of the spec whose loop reacts 8 samples
+  late FAILED the old compare (TOL_SYM 2, TOL_MU 8, no window, no wrap:
+  23 mismatches, the first "beat 2 ... expected I=1560 got I=1536") and
+  PASSED this one with 0 mismatches; an RTL that passed the input sample
+  straight through still failed it (266 mismatches from beat 64 on).
 
 COMPLETE STREAMING TESTBENCH. Copy this file and change only the entity
 name, the ports, their widths and the CSV columns to match the spec. It is
@@ -675,6 +715,9 @@ CHECK YOURSELF BEFORE ANSWERING (these are the mistakes that repeat)
     (m_axis_tdata, m_axis_tuser, ...) has its own expected array;
     m_axis_tready appears only if the spec has that port.
 [ ] Spec describes a closed loop (TED / NCO / loop filter / PLL / AGC /
-    error term fed back): payload fields are decoded and compared with
-    TOL_SYM / TOL_MU, never `/=` on the packed word; the beat count may
-    differ by 2 %.
+    error term fed back): the first SETTLE_BEATS (64) beats are counted
+    but not compared; after them payload fields are decoded and compared
+    with TOL_SYM / TOL_MU, never `/=` on the packed word; each got_x and
+    exp_x pair reads the same column and bit range; mu is compared
+    round the wrap (249 and 0 are 7 apart); the beat count may differ by
+    2 %.

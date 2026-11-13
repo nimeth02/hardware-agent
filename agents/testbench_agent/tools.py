@@ -15,7 +15,7 @@ from typing import Callable
 
 from agents.testbench_agent.testbench_decider import TestbenchDecider
 from agents.testbench_agent.testbench_generator import TestbenchGenerator
-from agents.testbench_agent.testbench_linter import lint_testbench
+from agents.testbench_agent.lint.testbench_linter import lint_testbench
 from agents.testbench_agent.testbench_skill_loader import TestbenchSkillLoader
 
 Linter = Callable[[dict, dict, dict], dict]

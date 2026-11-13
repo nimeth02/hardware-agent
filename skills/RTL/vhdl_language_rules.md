@@ -365,7 +365,10 @@ Subprograms (LRM 2):
   different parameter types. A call with a bare literal can then be
   ambiguous (`f("0101")`: slv or unsigned?). Qualify it (5).
 - An unconstrained parameter takes the size of the actual: use
-  `x'length`, `x'range`, `x'left` inside, never a fixed number.
+  `x'length`, `x'range`, `x'left` inside, never a fixed number. A parameter
+  the function multiplies must NOT be unconstrained: give it the width name
+  of the value the calls pass (`mu : signed(MU_W-1 downto 0)`), so the
+  product width (`V2_W+MU_W`) can be read from the function itself.
 
 ===============================================================
 9. CONCURRENT STATEMENTS (LRM 9)

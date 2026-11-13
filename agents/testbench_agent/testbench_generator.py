@@ -9,8 +9,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.json_utils import extract_json
 from agents.testbench_agent.orchestrator_feedback import feedback_inputs, feedback_rules, has_feedback, revise_rules
+from agents.testbench_agent.lint.closed_loop_compare import closed_loop_hint
 from agents.testbench_agent.state import AGENT_NAME
-from agents.testbench_agent.testbench_linter import streaming_shape
+from agents.testbench_agent.lint.testbench_linter import streaming_shape
 from observability.callback import ObservabilityCallbackHandler
 from prompts.testbench_agent_prompt import (
     STREAMING_NO_M_TREADY,
@@ -93,6 +94,7 @@ class TestbenchGenerator:
             system += TESTBENCH_FIX_ADDENDUM
             payload.update(previous_code=previous_testbench.get("code"), lint_issues=lint_issues)
         system += streaming_hint(spec)      # last, so it is the freshest instruction before the request
+        system += closed_loop_hint(spec)    # "" unless the spec is a closed loop (closed_loop_compare.py)
         handler = ObservabilityCallbackHandler(source=AGENT_NAME)
         response = self.llm.invoke(
             [SystemMessage(content=system), HumanMessage(content=json.dumps(payload, indent=2))],

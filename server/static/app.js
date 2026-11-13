@@ -88,7 +88,7 @@ $all("header .tab-btn").forEach((btn) => {
     $all("main > .tab").forEach((t) => t.classList.remove("active"));
     btn.classList.add("active");
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
-    if (btn.dataset.tab === "observability") loadTraces();
+    if (btn.dataset.tab === "observability") initObsTab();
     if (btn.dataset.tab === "agents") initAgentsTab();
   });
 });
@@ -2911,6 +2911,732 @@ $("#pipeline-approve-btn").addEventListener("click", async () => {
 });
 
 // ── Observability tab ────────────────────────────────────────────────
+// Two views. "Run trace": a tree of everything one run did (left) and the
+// selected row's input / output / attributes (right). "All LLM calls": the
+// flat log of every model call. Read-only; uses GET /api/agent-runs,
+// /api/agent-runs/{id}, /api/agents and /api/traces only.
+
+function obsSvg(d) {
+  return `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+}
+const OBS_ICONS = {
+  run: obsSvg('<path d="M4 2.5v8a2 2 0 0 0 2 2h3M4 6h5"/><circle cx="11.5" cy="6" r="1.6"/><circle cx="11.5" cy="12.5" r="1.6"/>'),
+  llm: obsSvg('<circle cx="8" cy="8" r="5.5"/><path d="M8 5v6M5.4 6.5l5.2 3M10.6 6.5l-5.2 3"/>'),
+  step: obsSvg('<path d="M6.8 9.2a2.6 2.6 0 0 0 3.7 0l2-2a2.6 2.6 0 0 0-3.7-3.7l-.8.8"/><path d="M9.2 6.8a2.6 2.6 0 0 0-3.7 0l-2 2a2.6 2.6 0 0 0 3.7 3.7l.8-.8"/>'),
+  tool: obsSvg('<path d="M10.2 2.2a3.3 3.3 0 0 0-3.9 4.4L2.4 10.5a1.5 1.5 0 0 0 2.1 2.1l3.9-3.9a3.3 3.3 0 0 0 4.4-3.9L10.7 6.9 9.1 5.3z"/>'),
+  event: obsSvg('<circle cx="8" cy="8" r="2.5"/>'),
+  user: obsSvg('<circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5a5 5 0 0 1 10 0"/>'),
+  system: obsSvg('<path d="M3 4h10M3 8h10M3 12h6"/>'),
+  reason: obsSvg('<path d="M6 12.5h4M6.5 14.5h3M5.2 10a4.2 4.2 0 1 1 5.6 0c-.5.5-.8 1-.8 1.5H6c0-.5-.3-1-.8-1.5z"/>'),
+  clock: obsSvg('<circle cx="8" cy="9" r="5"/><path d="M8 6.5V9l1.6 1.2M6.5 2h3"/>'),
+  copy: obsSvg('<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>'),
+  token: obsSvg('<ellipse cx="8" cy="8" rx="5" ry="2.6"/>'),
+};
+const OBS_ROLES = {
+  system: ["System", "system"], human: ["User", "user"], user: ["User", "user"],
+  ai: ["AI", "llm"], assistant: ["AI", "llm"], tool: ["Tool result", "tool"],
+};
+const OBS_EVENT_NAMES = {
+  run_started: "run started", run_completed: "run finished", run_failed: "run failed", run_stopped: "run stopped",
+  run_resumed: "run resumed", stop_requested: "stop requested", question: "question to you", answer: "your answer",
+  state: "saved state", error: "error", progress: "progress",
+};
+const OBS_CLAMP_CHARS = 1500, OBS_CLAMP_LINES = 20;
+
+let obsReady = false, obsRun = null, obsRoot = null, obsNodes = [], obsSelected = null, obsLoadSeq = 0;
+
+function obsDur(ms) { return `${(Number(ms) / 1000).toFixed(2)}s`; }
+function obsTok(n) {
+  if (n < 1000) return String(n);
+  return n < 1e6 ? `${(n / 1000).toFixed(2)}K` : `${(n / 1e6).toFixed(2)}M`;
+}
+function obsStamp(sec) {
+  const d = new Date(sec * 1000), two = (v) => String(v).padStart(2, "0");
+  return `${two(d.getMonth() + 1)}/${two(d.getDate())} ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+}
+function obsFullTime(sec) { return sec == null ? null : new Date(sec * 1000).toLocaleString(); }
+function obsShortModel(model) { return String(model || "AI model").split("/").pop(); }
+function obsOneLine(text) { return String(text || "").replace(/\s+/g, " ").trim().slice(0, 240); }
+function obsValueText(v) {
+  if (v == null) return "";
+  return typeof v === "string" ? v : JSON.stringify(v, null, 2);
+}
+// Message content is a string, or a list of {type:"text", text} blocks.
+function obsContentText(c) {
+  if (c == null) return "";
+  if (typeof c === "string") return c;
+  if (Array.isArray(c) && c.length && c.every((b) => b && typeof b === "object" && typeof b.text === "string")) {
+    return c.map((b) => b.text).join("\n");
+  }
+  return JSON.stringify(c, null, 2);
+}
+// The model's stated reasoning, when the saved answer carries one: a
+// <think>…</think> prefix, or a JSON answer with a "reasoning"/"reason" text.
+function obsSplitReasoning(text) {
+  const think = /^\s*<think>([\s\S]*?)<\/think>\s*/.exec(text);
+  if (think) return { reasoning: think[1].trim(), rest: text.slice(think[0].length) };
+  const body = text.trim().replace(/^```(?:json)?\s*/, "").replace(/```\s*$/, "");
+  if (body.startsWith("{")) {
+    try {
+      const obj = JSON.parse(body);
+      const why = obj && (obj.reasoning || obj.reason);
+      if (typeof why === "string" && why.trim()) return { reasoning: why.trim(), rest: text };
+    } catch (_) { /* not JSON: no reasoning to show */ }
+  }
+  return { reasoning: "", rest: text };
+}
+
+// ── building the tree from one run's recorded events ──
+// Events arrive ordered by step. `data.path` lists the names of the steps an
+// event happened inside, so a row hangs under the latest step with that name
+// one level up. A worker's own steps hang under the tool call that started it.
+function obsBuildTree(run, listRow) {
+  const mk = (kind, name, extra) => Object.assign({
+    kind, name: String(name || kind), tag: "", durMs: null, status: null, tokIn: null, tokOut: null,
+    ts: null, step: null, id: null, event: null, rec: null, path: null, children: [], parent: null,
+  }, extra);
+  const add = (parent, node) => { node.parent = parent; parent.children.push(node); return node; };
+  const group = (list) => {
+    const map = new Map();
+    (list || []).forEach((c) => { if (!map.has(c.step)) map.set(c.step, []); map.get(c.step).push(c); });
+    return map;
+  };
+  const take = (map, step, pred) => {
+    const arr = map.get(step) || [];
+    const i = pred ? arr.findIndex(pred) : 0;
+    return i >= 0 && i < arr.length ? arr.splice(i, 1)[0] : null;
+  };
+  const final = run.final_result && typeof run.final_result === "object" ? run.final_result : {};
+  const root = mk("run", run.agent_name || "run", {
+    id: run.id, ts: run.started_at, status: run.status, run,
+    tag: (listRow && listRow.requirement_title) || "",
+    durMs: run.duration_ms != null ? run.duration_ms : null,
+    agentStatus: final.status || null,
+  });
+  const llmRecs = group(run.llm_calls), toolRecs = group(run.tool_calls);
+  const lastAt = [];            // lastAt[d] = latest step row at depth d
+  const openTools = new Map();  // "step|tool" -> tool row waiting for its result
+  const toolNodes = [];
+
+  const parentFor = (path) => {
+    if (!Array.isArray(path) || !path.length) return root;
+    const direct = lastAt[path.length - 1];
+    if (direct && direct.name === path[path.length - 1]) return direct;
+    for (let d = Math.min(path.length, lastAt.length) - 1; d >= 0; d--) if (lastAt[d]) return lastAt[d];
+    return root;
+  };
+  // Older runs were saved without `data.path`: there a row hangs under the
+  // latest earlier step or tool call whose time span contains it.
+  const spans = [];
+  const spanParent = (t) => {
+    while (spans.length) {
+      const top = spans[spans.length - 1];
+      if (t >= top.from - 0.002 && t <= top.to) return top.node;
+      spans.pop();
+    }
+    return root;
+  };
+  // A step that ran inside a tool call (a worker's own step): the latest tool
+  // row under the same parent that had already started when the step ended.
+  const toolHost = (parent, endTs) => {
+    for (let i = parent.children.length - 1; i >= 0; i--) {
+      const c = parent.children[i];
+      if (c.kind === "tool" && c.ts != null && c.ts <= endTs + 0.5) return c;
+    }
+    return parent;
+  };
+  const llmNode = (step, d, e, rec) => mk("llm", obsShortModel((d && d.model) || (rec && rec.model) || run.model), {
+    id: (rec && rec.id) || (e && e.id), step, event: e, rec, path: d && d.path,
+    ts: e ? e.timestamp : null, status: (e && e.status) || (rec && rec.status),
+    durMs: e && e.duration_ms != null ? e.duration_ms : rec ? rec.latency_ms : null,
+    tokIn: d && d.input_tokens != null ? d.input_tokens : rec ? rec.input_tokens : null,
+    tokOut: d && d.output_tokens != null ? d.output_tokens : rec ? rec.output_tokens : null,
+  });
+  const toolNode = (step, name, d, e, rec) => mk("tool", name || "tool", {
+    id: (rec && rec.id) || (e && e.id), step, event: e, rec, path: d && d.path,
+    ts: e ? e.timestamp : null, status: rec ? rec.status : "running", durMs: rec ? rec.latency_ms : null,
+  });
+
+  for (const e of run.events || []) {
+    const d = e.data && typeof e.data === "object" && !Array.isArray(e.data) ? e.data : {};
+    const hasPath = Array.isArray(d.path);
+    const path = hasPath ? d.path : [];
+    const secs = (e.duration_ms || 0) / 1000;
+    switch (e.event_type) {
+      case "agent_step": {
+        const node = mk("step", d.node || "step", {
+          id: e.id, step: e.step, event: e, path, ts: e.timestamp, status: e.status, durMs: e.duration_ms,
+        });
+        if (!hasPath) {
+          add(spanParent(e.timestamp - secs / 2), node);
+          spans.push({ node, from: e.timestamp - secs, to: e.timestamp });
+          break;
+        }
+        const parent = parentFor(path);
+        add(parent === root ? root : toolHost(parent, e.timestamp), node);
+        lastAt[path.length] = node;
+        lastAt.length = path.length + 1;
+        break;
+      }
+      case "llm_call":
+        add(hasPath ? parentFor(path) : spanParent(e.timestamp - secs / 2), llmNode(e.step, d, e, take(llmRecs, e.step)));
+        break;
+      case "tool_call": {
+        const rec = take(toolRecs, e.step, (c) => c.tool_name === d.tool) || take(toolRecs, e.step);
+        const node = add(hasPath ? parentFor(path) : spanParent(e.timestamp), toolNode(e.step, d.tool, d, e, rec));
+        node.args = d.input;
+        if (!hasPath && rec && rec.latency_ms != null) {
+          spans.push({ node, from: e.timestamp, to: e.timestamp + rec.latency_ms / 1000 });
+        }
+        openTools.set(`${e.step}|${d.tool}`, node);
+        toolNodes.push(node);
+        break;
+      }
+      case "tool_result": {
+        const key = `${e.step}|${d.tool}`;
+        let node = openTools.get(key);
+        if (node) openTools.delete(key);
+        else {
+          node = add(parentFor(path), toolNode(e.step, d.tool, d, e, take(toolRecs, e.step)));
+          toolNodes.push(node);
+        }
+        node.resultEvent = e;
+        node.status = e.status || node.status;
+        if (e.duration_ms != null) node.durMs = e.duration_ms;
+        break;
+      }
+      case "agent_input": {
+        const node = toolNodes.filter((t) => t.name === d.stage && t.step === e.step).pop() ||
+          toolNodes.filter((t) => t.name === d.stage && t.workerInput === undefined).pop();
+        if (node) { node.workerInput = d.input; break; }
+      }
+      // falls through: no matching tool row, keep it as its own row
+      case "agent_output": {
+        if (e.event_type === "agent_output") {
+          const node = toolNodes.filter((t) => t.name === d.stage && t.workerOutput === undefined).pop();
+          if (node) { node.workerOutput = d.output; node.workerStatus = e.status; break; }
+        }
+      }
+      // falls through
+      default: {
+        const base = OBS_EVENT_NAMES[e.event_type] || String(e.event_type || "event").replace(/_/g, " ");
+        add(root, mk("event", d.stage ? `${base} · ${d.stage}` : base, {
+          id: e.id, step: e.step, event: e, ts: e.timestamp, status: e.status, durMs: e.duration_ms,
+        }));
+      }
+    }
+  }
+  // Saved calls that have no matching event still get a row.
+  [...llmRecs.values()].flat().sort((a, b) => a.step - b.step)
+    .forEach((rec) => add(root, llmNode(rec.step, null, null, rec)));
+  [...toolRecs.values()].flat().sort((a, b) => a.step - b.step)
+    .forEach((rec) => { add(root, toolNode(rec.step, rec.tool_name, null, null, rec)).args = rec.input; });
+
+  // A step whose only content is one model call is shown as that model call.
+  let tokIn = 0, tokOut = 0, anyTok = false;
+  const tidy = (node, depth) => {
+    node.children = node.children.map((c) => {
+      if (c.kind === "step" && c.children.length === 1 && c.children[0].kind === "llm") {
+        const call = c.children[0];
+        call.tag = c.name === "model" ? "" : c.name;
+        call.stepEvent = c.event;
+        call.parent = node;
+        return call;
+      }
+      return c;
+    });
+    node.open = depth <= 1;
+    node.hay = `${node.name} ${node.tag}`.toLowerCase();
+    if (node.kind === "llm" && (node.tokIn != null || node.tokOut != null)) {
+      anyTok = true; tokIn += node.tokIn || 0; tokOut += node.tokOut || 0;
+    }
+    node.children.forEach((c) => tidy(c, depth + 1));
+  };
+  tidy(root, 0);
+  if (anyTok) { root.tokIn = tokIn; root.tokOut = tokOut; }
+  return root;
+}
+
+function obsIsError(n) {
+  const s = String(n.status || "").toLowerCase();
+  return s === "error" || s === "failed" || (n.kind === "event" && n.event && ["error", "run_failed"].includes(n.event.event_type));
+}
+function obsPillHtml(n) {
+  if (n.tokIn == null && n.tokOut == null) return "";
+  const total = (n.tokIn || 0) + (n.tokOut || 0);
+  const tip = `tokens: ${n.tokIn != null ? n.tokIn : "?"} sent to the model, ${n.tokOut != null ? n.tokOut : "?"} in its answer`;
+  return `<span class="obs-pill" title="${escapeHtml(tip)}">${OBS_ICONS.token}${escapeHtml(obsTok(total))}</span>`;
+}
+function obsNodeHtml(n) {
+  n.idx = obsNodes.push(n) - 1;
+  const kids = n.children.length > 0;
+  const durText = n.durMs != null ? obsDur(n.durMs)
+    : n.kind === "run" ? (n.status === "running" ? "running" : "")
+      : n.kind === "tool" && !n.resultEvent && !n.rec ? "no result" : "";
+  const dur = durText
+    ? `<span class="obs-dur${n.kind === "run" ? " obs-dur-run" : ""}">${n.kind === "run" ? OBS_ICONS.clock : ""}${escapeHtml(durText)}</span>` : "";
+  const meta = dur + obsPillHtml(n);
+  const twoLine = n.kind === "run" || n.kind === "llm";
+  const name = `<span class="obs-name">${escapeHtml(n.name)}</span>`;
+  const stamp = n.kind === "run" && n.ts != null ? `<span class="obs-stamp">${escapeHtml(obsStamp(n.ts))}</span>` : "";
+  const tag = n.tag ? `<span class="obs-tag">${escapeHtml(n.tag)}</span>` : "";
+  const state = n.kind === "run" && n.agentStatus ? `<span class="obs-state">${escapeHtml(n.agentStatus)}</span>` : "";
+  const lines = twoLine
+    ? `<span class="obs-line">${name}${stamp}${n.kind === "llm" ? tag : ""}</span>` +
+      (n.kind === "run" && n.tag ? `<span class="obs-line obs-line-sub">${tag}</span>` : "") +
+      `<span class="obs-line obs-line-meta">${meta}${state}</span>`
+    : `<span class="obs-line">${name}${tag}${meta}</span>`;
+  const title = `${n.name}${n.tag ? " · " + n.tag : ""}${n.status ? " · " + n.status : ""}`;
+  return `<div class="obs-node${n.open ? "" : " closed"}" data-n="${n.idx}">` +
+    `<div class="obs-row obs-k-${n.kind}${obsIsError(n) ? " obs-err" : ""}" data-n="${n.idx}" tabindex="0" title="${escapeHtml(title)}">` +
+    `<span class="obs-ico obs-ico-${n.kind}">${OBS_ICONS[n.kind] || OBS_ICONS.event}</span>` +
+    `<span class="obs-main">${lines}</span>` +
+    (kids ? `<button type="button" class="obs-chev" title="Open or close this group (${n.children.length})" aria-label="Open or close this group">&#8250;</button>` : "") +
+    `</div>` +
+    (kids ? `<div class="obs-children">${n.children.map(obsNodeHtml).join("")}</div>` : "") +
+    `</div>`;
+}
+
+function obsRenderTree() {
+  const tree = $("#obs-tree");
+  obsNodes = [];
+  tree.innerHTML = obsRoot ? obsNodeHtml(obsRoot) : "";
+  tree.querySelectorAll(".obs-node").forEach((el) => { obsNodes[Number(el.dataset.n)].el = el; });
+  obsApplyFilter();
+}
+
+function obsApplyFilter() {
+  const q = $("#obs-filter").value.trim().toLowerCase();
+  const status = $("#obs-tree-status");
+  $("#obs-tree").classList.toggle("obs-filtering", !!q);
+  status.classList.remove("error");
+  if (!obsRoot) return;
+  let hits = 0;
+  const visit = (n) => {
+    let below = false;
+    n.children.forEach((c) => { if (visit(c)) below = true; });
+    const self = !q || n.hay.includes(q);
+    if (self) hits++;
+    n.el.classList.toggle("hidden", !(self || below));
+    n.el.firstElementChild.classList.toggle("obs-dim", !!q && !self);
+    return self || below;
+  };
+  visit(obsRoot);
+  status.textContent = q ? `${hits} of ${obsNodes.length} rows match` : `${obsNodes.length} rows`;
+}
+
+function obsSetOpen(n, open) {
+  n.open = open;
+  if (n.el) n.el.classList.toggle("closed", !open);
+}
+function obsSelect(n) {
+  if (obsSelected && obsSelected.el) obsSelected.el.firstElementChild.classList.remove("selected");
+  obsSelected = n;
+  n.el.firstElementChild.classList.add("selected");
+  obsRenderDetail($("#obs-detail"), n);
+}
+
+// ── right pane ──
+function obsCopyBtn(getText, label, title) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "obs-copy";
+  btn.title = title || "Copy";
+  btn.innerHTML = (label ? `<span>${escapeHtml(label)}</span>` : "") + OBS_ICONS.copy;
+  btn.addEventListener("click", async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const ok = await copyText(String(getText()));
+    btn.classList.add(ok ? "copied" : "copy-failed");
+    setTimeout(() => btn.classList.remove("copied", "copy-failed"), 1200);
+  });
+  return btn;
+}
+function obsNote(text) {
+  const p = document.createElement("p");
+  p.className = "obs-note";
+  p.textContent = text;
+  return p;
+}
+// Text shown exactly as saved (never as HTML). Long text is cut to a few
+// lines with a "Show all" switch.
+function obsTextBlock(text) {
+  const wrap = document.createElement("div");
+  const pre = document.createElement("pre");
+  pre.className = "obs-text";
+  pre.textContent = text;
+  wrap.appendChild(pre);
+  const lines = text.length > OBS_CLAMP_CHARS ? OBS_CLAMP_LINES + 1 : text.split("\n").length;
+  if (lines > OBS_CLAMP_LINES) {
+    pre.classList.add("obs-clamp");
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "obs-more";
+    const label = () => {
+      more.textContent = pre.classList.contains("obs-clamp")
+        ? `Show all (${text.length.toLocaleString()} characters)` : "Show less";
+    };
+    more.addEventListener("click", () => { pre.classList.toggle("obs-clamp"); label(); });
+    label();
+    wrap.appendChild(more);
+  }
+  return wrap;
+}
+// One collapsible card: icon, role name, a one-line preview while closed, a
+// copy button. The body is only built the first time the card is opened.
+function obsCard(label, kind, text, open, fill, preview) {
+  const det = document.createElement("details");
+  det.className = "obs-card";
+  const sum = document.createElement("summary");
+  sum.innerHTML = `<span class="obs-ico obs-ico-${kind}">${OBS_ICONS[kind] || OBS_ICONS.event}</span>` +
+    `<span class="obs-role">${escapeHtml(label)}</span>` +
+    `<span class="obs-preview">${escapeHtml(preview || obsOneLine(text))}</span>`;
+  sum.appendChild(obsCopyBtn(() => text, "", `Copy ${label}`));
+  const body = document.createElement("div");
+  body.className = "obs-card-body";
+  det.appendChild(sum);
+  det.appendChild(body);
+  let built = false;
+  const build = () => {
+    if (built) return;
+    built = true;
+    if (fill) fill(body);
+    else body.appendChild(text ? obsTextBlock(text) : obsNote("(empty)"));
+  };
+  det.addEventListener("toggle", () => { if (det.open) build(); });
+  if (open) { det.open = true; build(); }
+  return det;
+}
+function obsKvEl(pairs) {
+  const box = document.createElement("div");
+  box.className = "obs-kv";
+  pairs.forEach(([key, value]) => {
+    const k = document.createElement("div");
+    k.className = "obs-kv-key";
+    k.textContent = key;
+    const v = document.createElement("div");
+    v.className = "obs-kv-val";
+    const text = obsValueText(value);
+    if (text.length > 120 || text.includes("\n")) v.appendChild(obsTextBlock(text));
+    else v.textContent = text === "" ? "(empty)" : text;
+    box.appendChild(k);
+    box.appendChild(v);
+  });
+  return box;
+}
+function obsToolCallEl(tc) {
+  const fn = tc && tc.function && typeof tc.function === "object" ? tc.function : {};
+  let args = tc && (tc.args !== undefined ? tc.args : tc.arguments !== undefined ? tc.arguments : fn.arguments);
+  if (typeof args === "string") { try { args = JSON.parse(args); } catch (_) { /* keep the text */ } }
+  const box = document.createElement("div");
+  box.className = "obs-call";
+  const head = document.createElement("div");
+  head.className = "obs-call-head";
+  head.innerHTML = `<span class="obs-ico obs-ico-tool">${OBS_ICONS.tool}</span><span class="obs-role">${escapeHtml((tc && tc.name) || fn.name || "tool")}</span>`;
+  box.appendChild(head);
+  const pairs = args && typeof args === "object" && !Array.isArray(args) ? Object.entries(args)
+    : args == null || args === "" ? [] : [["input", args]];
+  box.appendChild(pairs.length ? obsKvEl(pairs) : obsNote("(no inputs)"));
+  return box;
+}
+function obsMessageCard(m, open) {
+  if (!m || typeof m !== "object") return obsCard("Message", "event", obsValueText(m), open);
+  const role = String(m.role || "message").toLowerCase();
+  const [label, kind] = OBS_ROLES[role] || [role, "event"];
+  const text = obsContentText(m.content);
+  const calls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+  const callNames = calls.map((tc) => (tc && tc.name) || "tool").join(", ");
+  const copy = text || (calls.length ? JSON.stringify(calls, null, 2) : "");
+  return obsCard(label, kind, copy, open, (body) => {
+    if (text) body.appendChild(obsTextBlock(text));
+    calls.forEach((tc) => body.appendChild(obsToolCallEl(tc)));
+    if (!text && !calls.length) body.appendChild(obsNote("(empty)"));
+  }, text ? "" : callNames ? `calls ${callNames}` : "");
+}
+function obsAiOutputCard(out) {
+  const text = obsContentText(out.content);
+  const calls = Array.isArray(out.tool_calls) ? out.tool_calls : [];
+  const { reasoning, rest } = obsSplitReasoning(text);
+  const copy = text || (calls.length ? JSON.stringify(calls, null, 2) : "");
+  return obsCard("AI", "llm", copy, true, (body) => {
+    if (reasoning) {
+      const box = document.createElement("div");
+      box.className = "obs-call";
+      box.innerHTML = `<div class="obs-call-head"><span class="obs-ico obs-ico-reason">${OBS_ICONS.reason}</span><span class="obs-role">Reasoning</span></div>`;
+      const p = document.createElement("div");
+      p.className = "obs-reasoning";
+      p.textContent = reasoning;
+      box.appendChild(p);
+      body.appendChild(box);
+    }
+    if (rest.trim()) body.appendChild(obsTextBlock(rest));
+    calls.forEach((tc) => body.appendChild(obsToolCallEl(tc)));
+    if (!text && !calls.length) body.appendChild(obsNote("(the model returned no text and asked for no tool)"));
+  });
+}
+function obsErrorCard(text) {
+  const card = obsCard("Error", "event", text, true);
+  card.classList.add("obs-card-err");
+  return card;
+}
+
+// What goes under Input / Output / Attributes for one row.
+function obsSections(n) {
+  const input = [], output = [], attrs = [];
+  const e = n.event || {}, d = e.data && typeof e.data === "object" ? e.data : {}, rec = n.rec;
+  const path = Array.isArray(n.path) && n.path.length ? n.path.join(" > ") : null;
+  if (n.kind === "run") {
+    const run = n.run, fr = run.final_result;
+    const inp = run.input && typeof run.input === "object" ? run.input : null;
+    const req = inp && (inp.requirement_text || inp.spec_text);
+    if (typeof req === "string") input.push(obsCard("Requirement", "user", req, true));
+    if (run.input != null) input.push(obsCard("Full input", "event", obsValueText(run.input), typeof req !== "string"));
+    if (run.error) output.push(obsErrorCard(String(run.error)));
+    if (fr != null) output.push(obsCard("Final result", "run", obsValueText(fr), true));
+    attrs.push(["Run ID", run.id], ["Agent", run.agent_name], ["Version", run.agent_version], ["Model", run.model],
+      ["Requirement", n.tag || null], ["Run status", run.status], ["Agent result", n.agentStatus],
+      ["Why it stopped", fr && typeof fr === "object" ? fr.stop_reason : null],
+      ["Started", obsFullTime(run.started_at)], ["Finished", obsFullTime(run.completed_at)],
+      ["Duration", n.durMs != null ? obsDur(n.durMs) : null],
+      ["LLM calls", (run.llm_calls || []).length], ["Tool calls", (run.tool_calls || []).length],
+      ["Recorded events", (run.events || []).length],
+      ["Tokens sent to the model", n.tokIn], ["Tokens in the answers", n.tokOut]);
+  } else if (n.kind === "llm") {
+    const msgs = rec && Array.isArray(rec.input) ? rec.input : null;
+    if (msgs) {
+      // System prompts start closed; in a long conversation only the last 3 start open.
+      msgs.forEach((m, i) => {
+        const role = String((m && m.role) || "").toLowerCase();
+        input.push(obsMessageCard(m, role !== "system" && (msgs.length <= 6 || i >= msgs.length - 3)));
+      });
+    } else if (rec && rec.input != null) input.push(obsCard("Input", "event", obsValueText(rec.input), true));
+    const err = (rec && rec.error) || d.error || d.llm_error;
+    if (err) output.push(obsErrorCard(String(err)));
+    const out = rec ? rec.output : null;
+    if (out && typeof out === "object" && !Array.isArray(out)) output.push(obsAiOutputCard(out));
+    else if (out != null && out !== "") output.push(obsAiOutputCard({ content: obsValueText(out) }));
+    else if (d.output_preview) output.push(obsCard("AI (preview only)", "llm", String(d.output_preview), true));
+    attrs.push(["Call ID", n.id], ["Step name", n.tag || (n.stepEvent ? "model" : null)],
+      ["Model", (rec && rec.model) || d.model], ["Source", n.source], ["Status", n.status],
+      ["Duration", n.durMs != null ? obsDur(n.durMs) : null],
+      ["Tokens sent to the model", n.tokIn], ["Tokens in the answer", n.tokOut],
+      ["Messages sent", msgs ? msgs.length : d.messages], ["Tools it asked for", Array.isArray(d.tool_calls) && d.tool_calls.length ? d.tool_calls.join(", ") : null],
+      ["Prompt version", rec && rec.prompt_version], ["Step number", n.step], ["Finished at", obsFullTime(n.ts)],
+      ["Inside", path]);
+    (n.extraAttrs || []).forEach((pair) => attrs.push(pair));
+  } else if (n.kind === "tool") {
+    const args = rec && rec.input != null ? rec.input : n.args;
+    if (args && typeof args === "object" && !Array.isArray(args) && Object.keys(args).length) {
+      input.push(obsCard("Inputs given to the tool", "tool", JSON.stringify(args, null, 2), true,
+        (body) => body.appendChild(obsKvEl(Object.entries(args)))));
+    } else if (args != null && typeof args !== "object") input.push(obsCard("Inputs given to the tool", "tool", obsValueText(args), true));
+    if (n.workerInput !== undefined) {
+      const given = Array.isArray(n.workerInput) ? n.workerInput : [n.workerInput];
+      given.forEach((item, i) => input.push(obsCard(
+        given.length > 1 ? `What the AI worker was given (${i + 1} of ${given.length})` : "What the AI worker was given",
+        "user", obsValueText(item), true)));
+    }
+    if (rec && rec.error) output.push(obsErrorCard(String(rec.error)));
+    const rd = n.resultEvent && n.resultEvent.data && typeof n.resultEvent.data === "object" ? n.resultEvent.data : {};
+    const out = rec && rec.output != null ? obsContentText(rec.output) : rd.output_preview != null ? String(rd.output_preview) : "";
+    if (out) output.push(obsCard("Tool result", "tool", out, true));
+    if (n.workerOutput !== undefined) output.push(obsCard("What the AI worker returned", "run", obsValueText(n.workerOutput), true));
+    attrs.push(["Call ID", n.id], ["Tool", n.name], ["Status", n.status], ["Worker result", n.workerStatus],
+      ["Duration", n.durMs != null ? obsDur(n.durMs) : null], ["Step number", n.step],
+      ["Started at", obsFullTime(n.ts)], ["Inside", path], ["Steps inside", n.children.length || null]);
+  } else if (n.kind === "step") {
+    attrs.push(["Event ID", n.id], ["Step name", n.name], ["Status", n.status],
+      ["Duration", n.durMs != null ? obsDur(n.durMs) : null], ["Step number", n.step],
+      ["Finished at", obsFullTime(n.ts)], ["Inside", path], ["Rows inside", n.children.length || null]);
+  } else {
+    const type = e.event_type;
+    if (type === "state") {
+      if (d.before != null) input.push(obsCard("Saved state before", "event", obsValueText(d.before), true));
+      if (d.after != null) output.push(obsCard("Saved state after", "event", obsValueText(d.after), true));
+    } else if (type === "question") {
+      output.push(obsCard("Question from the AI", "llm", String(d.question || ""), true));
+      if (Array.isArray(d.suggestions) && d.suggestions.length) {
+        output.push(obsCard("Suggested answers", "event", d.suggestions.map((s) => `- ${obsValueText(s)}`).join("\n"), true));
+      }
+    } else if (type === "answer") {
+      input.push(obsCard("Your answer", "user", String(d.answer || ""), true));
+    } else if (type === "error" || type === "run_failed") {
+      output.push(obsErrorCard(obsValueText(d.error || d.llm_error || e.data)));
+    } else if (e.data != null && !(typeof e.data === "object" && !Object.keys(e.data).length)) {
+      output.push(obsCard("Recorded details", "event", obsValueText(e.data), true));
+    }
+    attrs.push(["Event ID", n.id], ["Event type", type], ["Stage", d.stage], ["Status", n.status],
+      ["Duration", n.durMs != null ? obsDur(n.durMs) : null], ["Step number", n.step], ["Time", obsFullTime(n.ts)]);
+  }
+  return { input, output, attrs: attrs.filter(([, v]) => v != null && v !== "") };
+}
+
+function obsRenderDetail(container, n) {
+  container.innerHTML = "";
+  const { input, output, attrs } = obsSections(n);
+
+  const head = document.createElement("div");
+  head.className = "obs-detail-head";
+  head.innerHTML = `<span class="obs-ico obs-ico-${n.kind} obs-ico-lg">${OBS_ICONS[n.kind] || OBS_ICONS.event}</span>` +
+    `<span class="obs-detail-name">${escapeHtml(n.name)}</span>` +
+    (n.tag ? `<span class="obs-tag">${escapeHtml(n.tag)}</span>` : "") +
+    (n.durMs != null ? `<span class="obs-dur">${escapeHtml(obsDur(n.durMs))}</span>` : "") + obsPillHtml(n);
+  if (n.id) head.appendChild(obsCopyBtn(() => n.id, "ID", `Copy this row's ID (${n.id})`));
+  if (n.kind === "run") {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "obs-mini";
+    open.textContent = "Open in Agents tab";
+    open.title = "Show this run in the Agents tab (timeline, errors, generated files)";
+    open.addEventListener("click", async () => {
+      $('header .tab-btn[data-tab="agents"]').click();
+      await showAgentRun(n.id);
+      showAgentsView("run");
+    });
+    head.appendChild(open);
+  }
+  container.appendChild(head);
+
+  const tabs = document.createElement("div");
+  tabs.className = "obs-tabs";
+  const body = document.createElement("div");
+  body.className = "obs-detail-body";
+  const section = (title, items, emptyText) => {
+    const det = document.createElement("details");
+    det.className = "obs-sec";
+    det.open = true;
+    const sum = document.createElement("summary");
+    sum.textContent = title;
+    det.appendChild(sum);
+    if (items.length) items.forEach((el) => det.appendChild(el));
+    else det.appendChild(obsNote(emptyText));
+    body.appendChild(det);
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "obs-tab";
+    tab.textContent = title;
+    tab.addEventListener("click", () => {
+      tabs.querySelectorAll(".obs-tab").forEach((b) => b.classList.toggle("active", b === tab));
+      det.open = true;
+      det.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    tabs.appendChild(tab);
+  };
+  section("Input", input, "Nothing was recorded as input for this row.");
+  section("Output", output, "Nothing was recorded as output for this row.");
+  section("Attributes", attrs.length ? [obsKvEl(attrs)] : [], "No other details were recorded.");
+  tabs.firstElementChild.classList.add("active");
+  container.appendChild(tabs);
+  container.appendChild(body);
+  container.scrollTop = 0;
+}
+
+// ── run picker ──
+function obsRunLabel(r) {
+  const title = r.requirement_title ? ` · ${String(r.requirement_title).replace(/^#+\s*/, "").slice(0, 60)}` : "";
+  return `${obsStamp(r.started_at)} · ${r.agent_name}${title} · ${r.agent_status || r.status}`;
+}
+function obsClear(message, isError) {
+  obsRun = null; obsRoot = null; obsSelected = null; obsNodes = [];
+  $("#obs-tree").innerHTML = "";
+  $("#obs-detail").innerHTML = "";
+  const status = $("#obs-tree-status");
+  status.textContent = message;
+  status.classList.toggle("error", !!isError);
+}
+let obsRunRows = [];
+async function loadObsRuns(reloadRun) {
+  const sel = $("#obs-run-select");
+  const agent = $("#obs-agent-filter").value;
+  try {
+    const res = await fetch(`/api/agent-runs?limit=100${agent ? "&agent_name=" + encodeURIComponent(agent) : ""}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    obsRunRows = await res.json();
+  } catch (err) {
+    obsClear(`Could not load the run list: ${err.message}`, true);
+    return;
+  }
+  sel.innerHTML = obsRunRows.map((r) => `<option value="${escapeHtml(r.id)}">${escapeHtml(obsRunLabel(r))}</option>`).join("");
+  if (!obsRunRows.length) { obsClear("No runs recorded yet."); return; }
+  const keep = obsRun && obsRunRows.some((r) => r.id === obsRun.id) ? obsRun.id : obsRunRows[0].id;
+  sel.value = keep;
+  if (reloadRun || !obsRun || obsRun.id !== keep) await loadObsRun(keep);
+}
+async function loadObsRun(runId) {
+  const seq = ++obsLoadSeq;
+  const status = $("#obs-tree-status");
+  status.classList.remove("error");
+  status.textContent = "Loading the run…";
+  let run;
+  try {
+    const res = await fetch(`/api/agent-runs/${encodeURIComponent(runId)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    run = await res.json();
+  } catch (err) {
+    if (seq === obsLoadSeq) obsClear(`Could not load this run: ${err.message}`, true);
+    return;
+  }
+  if (seq !== obsLoadSeq) return;
+  obsRun = run;
+  obsSelected = null;
+  obsRoot = obsBuildTree(run, obsRunRows.find((r) => r.id === runId));
+  obsRenderTree();
+  obsSelect(obsRoot);
+  $("#obs-tree").scrollTop = 0;
+}
+async function initObsTab() {
+  if (!obsReady) {
+    obsReady = true;
+    try {
+      const agents = await (await fetch("/api/agents")).json();
+      const sel = $("#obs-agent-filter");
+      agents.forEach((a) => {
+        const opt = document.createElement("option");
+        opt.value = a.name;
+        opt.textContent = a.name;
+        sel.appendChild(opt);
+      });
+    } catch (_) { /* the agent filter just stays on "All agents" */ }
+  }
+  if ($("#obs-view-calls").classList.contains("active")) loadTraces();
+  else loadObsRuns(false);
+}
+
+$("#obs-agent-filter").addEventListener("change", () => loadObsRuns(false));
+$("#obs-run-select").addEventListener("change", (ev) => loadObsRun(ev.target.value));
+$("#obs-refresh-btn").addEventListener("click", () => loadObsRuns(true));
+$("#obs-filter").addEventListener("input", obsApplyFilter);
+$("#obs-expand-all").addEventListener("click", () => obsNodes.forEach((n) => obsSetOpen(n, true)));
+$("#obs-collapse-all").addEventListener("click", () => obsNodes.forEach((n) => obsSetOpen(n, n === obsRoot)));
+$("#obs-tree").addEventListener("click", (ev) => {
+  const row = ev.target.closest(".obs-row");
+  if (!row) return;
+  const n = obsNodes[Number(row.dataset.n)];
+  if (!n) return;
+  if (ev.target.closest(".obs-chev")) obsSetOpen(n, !n.open);
+  else obsSelect(n);
+});
+$("#obs-tree").addEventListener("dblclick", (ev) => {
+  const row = ev.target.closest(".obs-row");
+  const n = row && obsNodes[Number(row.dataset.n)];
+  if (n && n.children.length && !ev.target.closest(".obs-chev")) obsSetOpen(n, !n.open);
+});
+$("#obs-tree").addEventListener("keydown", (ev) => {
+  const row = ev.target.closest(".obs-row");
+  const n = row && obsNodes[Number(row.dataset.n)];
+  if (!n || ev.target.closest(".obs-chev")) return;
+  if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); obsSelect(n); }
+  else if (ev.key === "ArrowRight" && n.children.length) obsSetOpen(n, true);
+  else if (ev.key === "ArrowLeft" && n.children.length) obsSetOpen(n, false);
+});
+$all(".obs-switch .tab-btn").forEach((btn) => btn.addEventListener("click", () => {
+  $all(".obs-switch .tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+  $all("#tab-observability .obs-view").forEach((v) => v.classList.toggle("active", v.id === `obs-view-${btn.dataset.obsView}`));
+  if (btn.dataset.obsView === "calls") loadTraces();
+  else if (!obsRun) loadObsRuns(false);
+}));
+
+// ── "All LLM calls" view: the flat log of every model call ──
 $("#refresh-traces-btn").addEventListener("click", loadTraces);
 $("#close-detail-btn").addEventListener("click", () => {
   $("#trace-detail").classList.add("hidden");
@@ -2919,6 +3645,7 @@ $("#close-detail-btn").addEventListener("click", () => {
 async function loadTraces() {
   const tbody = $("#traces-tbody");
   const res = await fetch("/api/traces?limit=100");
+  if (!res.ok) return;
   const traces = await res.json();
 
   tbody.innerHTML = "";
@@ -2934,14 +3661,17 @@ async function loadTraces() {
     const preview = escapeHtml((t.output_text || t.error || "").slice(0, 80));
 
     tr.innerHTML = `
-      <td>${time}</td>
+      <td>${escapeHtml(time)}</td>
       <td>${escapeHtml(t.source || "")}</td>
       <td>${escapeHtml(t.model || "")}</td>
       <td>${duration}</td>
       <td>${statusHtml}</td>
       <td>${preview}</td>
     `;
-    tr.addEventListener("click", () => showTraceDetail(t.id));
+    tr.addEventListener("click", () => {
+      $all("#traces-tbody tr").forEach((row) => row.classList.toggle("selected", row === tr));
+      showTraceDetail(t.id);
+    });
     tbody.appendChild(tr);
   }
 }
@@ -2950,41 +3680,22 @@ async function showTraceDetail(id) {
   const res = await fetch(`/api/traces/${id}`);
   if (!res.ok) return;
   const t = await res.json();
-
+  const usage = t.usage && typeof t.usage === "object" ? t.usage : {};
+  const pick = (...keys) => { for (const k of keys) if (usage[k] != null) return usage[k]; return null; };
+  // The same detail view as a model-call row in the run tree.
+  const node = {
+    kind: "llm", name: obsShortModel(t.model), tag: t.source || "", id: t.id, source: t.source,
+    durMs: t.duration_ms, status: t.error ? "error" : "ok", ts: t.created_at, step: null, path: null,
+    tokIn: pick("prompt_tokens", "input_tokens"), tokOut: pick("completion_tokens", "output_tokens"),
+    children: [], event: null,
+    rec: { id: t.id, model: t.model, input: t.input_messages || [], error: t.error,
+      output: t.error && !t.output_text ? null : { role: "ai", content: t.output_text || "" } },
+    extraAttrs: t.usage ? [["Usage (as reported by the model service)", t.usage]] : [],
+  };
+  obsRenderDetail($("#trace-detail-body"), node);
   const panel = $("#trace-detail");
-  const body = $("#trace-detail-body");
-
-  const messagesHtml = (t.input_messages || [])
-    .map(
-      (m) => `
-      <div class="msg-block">
-        <div class="msg-role">${escapeHtml(m.role)}</div>
-        ${escapeHtml(m.content)}
-      </div>`
-    )
-    .join("");
-
-  const usageHtml = t.usage
-    ? `<div class="msg-block"><div class="msg-role">usage</div>${escapeHtml(
-        JSON.stringify(t.usage, null, 2)
-      )}</div>`
-    : "";
-
-  const outputHtml = t.error
-    ? `<div class="msg-block"><div class="msg-role">error</div>${escapeHtml(t.error)}</div>`
-    : `<div class="msg-block"><div class="msg-role">output</div>${escapeHtml(t.output_text)}</div>`;
-
-  body.innerHTML = `
-    <p><strong>Model:</strong> ${escapeHtml(t.model || "")} &nbsp;
-       <strong>Source:</strong> ${escapeHtml(t.source || "")} &nbsp;
-       <strong>Duration:</strong> ${t.duration_ms != null ? t.duration_ms.toFixed(0) : "-"} ms</p>
-    <label>Input messages</label>
-    ${messagesHtml}
-    <label>Output</label>
-    ${outputHtml}
-    ${usageHtml}
-  `;
   panel.classList.remove("hidden");
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 // Agents is the default tab.

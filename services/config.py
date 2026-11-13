@@ -118,7 +118,7 @@ def require_llm_model() -> str:
     return require_llm_config()["model"]
 
 
-# Optional Vivado pinning (used by agents/rtl_agent/rtl_linter.py)
+# Optional Vivado pinning (used by agents/rtl_agent/lint/rtl_linter.py)
 VIVADO_SETTINGS64 = os.getenv("VIVADO_SETTINGS64", "").strip()
 
 # Target FPGA part for synthesis/implementation (agents/implementation_agent).

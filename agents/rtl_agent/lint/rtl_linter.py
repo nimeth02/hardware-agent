@@ -1,4 +1,4 @@
-# agents/rtl_agent/rtl_linter.py — lint check for generated VHDL RTL.
+# agents/rtl_agent/lint/rtl_linter.py — lint check for generated VHDL RTL.
 #
 # Static checks always run (deterministic, no tools needed): entity
 # present, name matches the spec, architecture present, every spec port
@@ -13,10 +13,12 @@ import re
 import tempfile
 
 from agents.lint_utils import compiler_errors
-from agents.mcp_utils import mcp_run_xvhdl, mcp_write_files
+from agents.mcp_utils import mcp_run_xelab, mcp_run_xvhdl, mcp_write_files
 from agents.rtl_agent.copy_guard import copied_answer
-from agents.rtl_agent.rtl_smoke_check import smoke_issues
-from agents.rtl_agent.rtl_widths import (
+from agents.rtl_agent.lint.rtl_equation_check import equation_issues, loop_gain_issues, polynomial_issues
+from agents.rtl_agent.lint.rtl_fixed_point import fixed_point_issues
+from agents.rtl_agent.lint.rtl_smoke_check import smoke_issues
+from agents.rtl_agent.lint.rtl_widths import (
     additive_terms, assignments, expr_width, int_value, scoped_widths, source_line, split_top, strip_comments,
 )
 from agents.vhdl_version import VHDL_93, resolve_vhdl_version, xvhdl_std
@@ -131,12 +133,17 @@ def _width_name(code: str, name: str, widths) -> tuple[str, str | None]:
 
 def _natural_factor(factor: str, widths: dict[str, int]) -> tuple[str, int | None]:
     """A multiplier factor with its resize() wrapper taken off, and the width
-    of what is left: `resize(signed('0' & mu_q8), 22)` -> ("signed('0' & mu_q8)", 9)."""
+    of what is left: `resize(signed('0' & mu_q8), 22)` -> ("signed('0' & mu_q8)", 9).
+    The width may be a number or written from constants (`I_W+V2_W-1`):
+    timing_recovery 2026-11-11 wrote `p0 := resize(xm, I_W+V2_W-1) * c0;`
+    into a p0 of the right size, the wrapper was not taken off, and three
+    rounds were told to make p0 43 bits "with no resize() around any factor"."""
     factor = factor.strip()
     m = _CALL_RE.match(factor)
     if m and m.group(1).lower() == "resize":
         args = split_top(m.group(2), ",")
-        inner = args[0].strip() if len(args) == 2 and _INT_RE.match(args[1].strip()) else ""
+        sized = len(args) == 2 and int_value(args[1], getattr(widths, "constants", None)) is not None
+        inner = args[0].strip() if sized else ""
         if inner and inner.count("(") == inner.count(")"):
             return inner, expr_width(inner, widths)
     return factor, expr_width(factor, widths)
@@ -199,7 +206,7 @@ def _multiplier_width_issues(code: str) -> list[dict]:
                 head = (f"line {n}: {line} puts a {wa + wb}-bit product into the {left}-bit '{target}' ({fa} is {wa} "
                         f"bits, {fb} is {wb} bits; a product is as wide as both factors added, and the simulation "
                         f"stops with 'Array sizes do not match'). ")
-                issues.append({"code": "multiplier_width", "detail": head + fix})
+                issues.append({"code": "multiplier_width", "detail": head + fix, "_resized": (key, wa + wb, n)})
             elif _TYPED_RANGE_RE.search(widths.types.get(key, "")):
                 head = (f"line {n}: {line} stores the product in '{target}', declared with a typed-in width "
                         f"`{widths.types[key]}`. The number is right today ({wa} + {wb} = {wa + wb} bits), but a "
@@ -213,14 +220,23 @@ def _multiplier_width_issues(code: str) -> list[dict]:
         head = (f"line {n}: {line} puts a {wa + wb}-bit product into the "
                 f"{left}-bit '{target}' ({fa} is {wa} bits, {fb} is {wb} bits; a product is as wide as both factors "
                 f"added, and the simulation stops with 'Array sizes do not match'). ")
+        resized = wa + wb                   # the width this message asks `target` to be declared at
         if na is not None and nb is not None and decl:
             keyword, kind = decl
-            natural = na + nb
+            natural = resized = na + nb
             plain = (f"`{target} {op} {plain_a} * {plain_b};` ({na} + {nb} = {natural} bits: each factor at its own "
                      f"width, no resize() around any factor)")
             if natural == left:
+                resized = None
                 fix = (f"'{target}' is already {natural} bits: write {plain}. A resize() around a factor only makes "
                        f"the product wider; it never makes it fit.")
+            elif all(_PLAIN_NAME_RE.match(f) and f.lower() in widths for f in (plain_a, plain_b)):
+                # two declared names once the wrappers are off: the width is written from their width names
+                (name_a, hint_a), (name_b, hint_b) = _width_name(code, plain_a, widths), _width_name(code, plain_b, widths)
+                steps = [h for h in (hint_a, hint_b) if h]
+                steps.append(f"declare `{keyword} {target} : {kind}({name_a}+{name_b}-1 downto 0);` and write {plain}")
+                fix = ("Fix it in ONE step, the width written from the factors' width names: " + "; then ".join(steps) +
+                       f". Where another width is needed later, `resize({target}, N)` on its own line.")
             else:
                 fix = (f"Fix it in ONE step, exactly like this: declare `{keyword} {target} : {kind}({natural - 1} "
                        f"downto 0);` and write {plain}. Where a narrower value is needed later, `resize({target}, N)` "
@@ -228,7 +244,8 @@ def _multiplier_width_issues(code: str) -> list[dict]:
         else:
             fix = (f"Make '{target}' {wa + wb} bits, then resize() it afterwards on its own line. Do NOT widen the "
                    f"factors to match the target: resize() around a factor makes the product wider again.")
-        issues.append({"code": "multiplier_width", "detail": head + fix})
+        issues.append({"code": "multiplier_width", "detail": head + fix,
+                       **({"_resized": (key, resized, n)} if resized else {})})
     return issues
 
 
@@ -270,10 +287,58 @@ def _lines_of(issues: list[dict]) -> set[int]:
 def _width_issues(code: str) -> list[dict]:
     """All width checks, each bad line explained once: the power-of-two
     message (it carries the fix) beats the multiplier message, which beats
-    the general one."""
+    the general one. A product the multiplier message asks to be declared
+    at a new width is counted at that new width on the other lines."""
     pow2 = _power_of_two_multiply_issues(code)
     mult = [i for i in _multiplier_width_issues(code) if _lines_of([i]) - _lines_of(pow2)]
-    return pow2 + mult + _assignment_width_issues(code, _lines_of(pow2 + mult))
+    resized = [r for i in mult if (r := i.pop("_resized", None))]
+    return pow2 + mult + _assignment_width_issues(code, _lines_of(pow2 + mult), resized)
+
+
+def _multiplies_by(expr: str, name: str) -> bool:
+    """True when `expr` is a two-factor product and `name` is read in one factor."""
+    factors = split_top(expr, "*")
+    return len(factors) == 2 and len(additive_terms(expr)) == 1 and \
+        any(re.search(rf"\b{re.escape(name)}\b", f, re.IGNORECASE) for f in factors)
+
+
+def _unconstrained_parameter_issues(code: str) -> list[dict]:
+    """A function input written without a width (`mu : signed`) that the
+    function multiplies. Such an input is as wide as whatever the call passes,
+    so no reader of the file (the model included) can size `v2 * mu` from
+    the function alone; a wrong product width then compiles and shows up only
+    as a dry-run crash that names the process, not the line. timing_recovery
+    (2026-11-10 14:43): `p1 := v2 * mu` was 13 + 18 bits into a 30-bit p1,
+    and four fix rounds over two attempts returned the same file. The fix is
+    the header: the width the calls pass, as its declared name (`mu :
+    signed(MU_W-1 downto 0)`). Inputs that are only clamped or resized
+    (`sat12(x : signed)`) are left alone: the recipe's helper shape."""
+    scopes = scoped_widths(code)
+    issues = []
+    for p in scopes.parameters:
+        if p["declared"]:
+            continue
+        first, last = p["span"]
+        uses = [(n, expr) for n, _, _, expr in assignments(code)
+                if first <= n <= last and _multiplies_by(expr, p["name"])]
+        if not uses:
+            continue
+        n, _ = uses[0]
+        head = (f"line {p['line']}: function `{p['function']}` takes `{p['name']} : {p['kind']}` with no width, and "
+                f"line {n} multiplies by it (`{source_line(code, n)}`). An input with no width is as wide as whatever "
+                f"each call passes, so the product's width cannot be read from the function, and a wrong product "
+                f"width is found only by a dry-run crash that names the process, not the line. ")
+        if p["width"] is not None:
+            passed = sorted({arg for _, arg, _ in p["calls"]})
+            fix = (f"Every call passes {', '.join(f'`{a}`' for a in passed[:3])} ({p['width']} bits): write "
+                   f"`{p['name']} : {p['type']}` in the function header and keep the calls as they are.")
+        else:
+            seen = "; ".join(f"line {line} passes `{arg}`" for line, arg, _ in p["calls"][:3]) or "no call found"
+            fix = (f"Give it the width of the value the call passes ({seen}): write "
+                   f"`{p['name']} : {p['kind']}(<WIDTH_NAME>-1 downto 0)` in the function header, with the "
+                   f"constant that sizes that value, and make every call pass a value of that width.")
+        issues.append({"code": "unconstrained_function_parameter", "detail": head + fix})
+    return issues
 
 
 # `to_signed(65536, 16)`, `to_unsigned(ONE, E_BITS)`: a number given with a width (both may be constants)
@@ -405,7 +470,8 @@ def _widened(expr: str, width: int) -> str:
     return f"resize({expr}, {width})"
 
 
-def _assignment_width_issues(code: str, skip_lines: set[int]) -> list[dict]:
+def _assignment_width_issues(code: str, skip_lines: set[int],
+                             resized: list[tuple[str, int, int]] | None = None) -> list[dict]:
     """Left and right side of `target <= expr` must have the same width; the
     compiler accepts a mismatch and the dry run then crashes ('Array sizes do
     not match, left array has L elements, right array has R elements') with
@@ -417,9 +483,29 @@ def _assignment_width_issues(code: str, skip_lines: set[int]) -> list[dict]:
     the two-step advice. One message for both (timing_recovery, 2026-10-30)
     told `y_sym_i <= std_logic_vector(y_sat)` (12 into 24 bits) to "compute
     at the natural width, then resize as a separate step", which fits only
-    the wide case, and the line survived two rounds."""
+    the wide case, and the line survived two rounds.
+
+    `resized` is (name, new width, line) for every product the multiplier
+    check asks, this same round, to be declared at a new width. Lines that
+    read such a name are counted at the NEW width. timing_recovery
+    2026-11-11: `v2m1_2` (16 bits) was to become 32, and on the same round
+    `c0 := V2_ONE + V2_QUARTER * v2m1_2` was told "a variable of exactly 32
+    bits" (16 + 16); the model did both, the product was then 16 + 32 = 48
+    bits, and the next round reported the helper it had just been told to
+    add."""
     scopes = scoped_widths(code)
     all_assignments = list(assignments(code))
+
+    def widths_at(line: int):
+        """The widths on `line`, plus the names (and their new widths) other messages redeclare."""
+        widths, here, changed = scopes.at(line), scopes._innermost(line), {}
+        for name, width, at in resized or []:
+            home = scopes._innermost(at)
+            local = bool(home and name in home[2])              # declared inside that process / function
+            if (here is home) if local else not (here and name in here[2]):
+                if widths.get(name) != width:
+                    widths[name], changed[name] = width, at
+        return widths, changed
 
     def stored_into(name: str, line: int) -> tuple[str, int, int] | None:
         """The first later plain `X <= name;` / `X := name;` with X's width known: (X, width, line)."""
@@ -437,7 +523,7 @@ def _assignment_width_issues(code: str, skip_lines: set[int]) -> list[dict]:
 
     issues = []
     for n, target, op, expr in all_assignments:
-        widths = scopes.at(n)
+        widths, changed = widths_at(n)
         if n in skip_lines or target.lower() not in widths:
             continue
         right = expr_width(expr, widths)
@@ -445,6 +531,9 @@ def _assignment_width_issues(code: str, skip_lines: set[int]) -> list[dict]:
         if right is None or right == left:
             continue
         shown = " ".join(expr.split())
+        read = [(name, at) for name, at in changed.items() if re.search(rf"\b{re.escape(name)}\b", expr, re.IGNORECASE)]
+        counted = ("" if not read else " (counted with " + ", ".join(
+            f"`{name}` at {widths[name]} bits, as the message for line {at} asks" for name, at in read) + ")")
         if right < left:
             fix = (f"The right-hand side (`{shown}`) is NARROWER than the target. Widen it on this very line, "
                    f"exactly like this: `{target} {op} {_widened(shown, left)};` (resize() takes a signed/unsigned "
@@ -472,7 +561,7 @@ def _assignment_width_issues(code: str, skip_lines: set[int]) -> list[dict]:
                        f"on this line: put `{shown}` into a signal or variable of exactly {right} bits, then "
                        f"`{target} {op} resize(<that>, {want});` on its own line (or take the slice of it you need){note}")
         issues.append({"code": "assignment_width",
-                       "detail": f"line {n}: '{target}' is {left} bits but the right-hand side is {right} bits; the "
+                       "detail": f"line {n}: '{target}' is {left} bits but the right-hand side is {right} bits{counted}; the "
                                  f"simulation stops with 'Array sizes do not match'. {fix} >> {source_line(code, n)}"})
     return issues
 
@@ -1155,6 +1244,70 @@ def _constant_output_valid_issues(spec: dict, code: str) -> list[dict]:
     return issues
 
 
+# "if advance = '1' then" / "elsif advance = '1' and valid_pipe(0) = '1' then" — the word a clocked write is gated by
+_ENABLE_WORD_RE = re.compile(r"\b(?:if|elsif|and|or)\s+(\w+)\s*=\s*'1'", re.IGNORECASE)
+
+
+def _self_blocking_advance_issues(spec: dict, code: str) -> list[dict]:
+    """A pipeline enable (`advance`, or any word the stage processes are gated
+    by, `elsif advance = '1' then`) computed from the pipeline's own valid
+    flag, `advance <= not valid_pipe(9);` or `not m_axis_tvalid_i`, with no
+    downstream ready term. The recipe's handshake line is `advance <=
+    m_axis_tready or not valid_pipe(last);` and the ready term is what
+    empties the last bit. Without it nothing ever clears valid_pipe(last)
+    once it is '1' (the chain only moves while advance is '1'), so at that
+    clock advance drops to '0' and every register, the valid chain and the
+    output flag keep their values for the rest of the run. timing_recovery
+    18:52 (2026-11-06): the spec has no m_axis_tready port, the rewrite
+    dropped the ready term and kept `not valid_pipe(9)`; from cycle 14 (reset
+    plus ten stages) m_axis_tvalid stayed '1' with one constant value on
+    every cycle, 801 mismatches, the same picture for three attempts. The
+    fix text names `advance <= '1';`: `advance <= s_axis_tvalid;` gave the
+    right beat rate there but never empties the pipe after the last input
+    (equalizer 2026-11-12 16:57, 88 extra beats; the dry run reports that
+    one as smoke_more_outputs_than_inputs)."""
+    stripped = "\n".join(line.split("--", 1)[0] for line in code.splitlines())
+    lines = stripped.splitlines()
+    ports = [p for p in (spec.get("ports") or []) if isinstance(p, dict) and p.get("name")]
+    inputs = [p["name"] for p in ports if str(p.get("direction", "")).lower().startswith("in")]
+    ready_inputs = [n for n in inputs if "ready" in n.lower()]
+    valid_inputs = [n for n in inputs if "valid" in n.lower()]
+    input_valid = {n.lower() for n in valid_inputs}
+
+    enables = {"advance"} | {m.group(1) for m in _ENABLE_WORD_RE.finditer(stripped)}
+    enables = {e for e in enables if not re.search(r"valid|rst|reset|strobe|ready|clk|clock", e, re.IGNORECASE)}
+    issues = []
+    for name in sorted(enables):
+        for n, expr in _writes_of(stripped, name):
+            words = re.findall(r"\b[A-Za-z_]\w*", expr)
+            if any("ready" in w.lower() for w in words):
+                continue                                # `m_axis_tready or not valid_pipe(k)`: the ready term empties the pipe
+            own = next((w for w in words if "valid" in w.lower() and w.lower() not in input_valid), None)
+            if own is None:
+                continue                                # `advance <= s_axis_tvalid;` or `'1'`: never waits for itself
+            bit = re.search(rf"\b{re.escape(own)}\s*\(\s*\d+\s*\)", expr)
+            own_ref = bit.group(0) if bit else own
+            if ready_inputs:
+                fix = (f"Add the ready term the recipe shows: `{name} <= {ready_inputs[0]} or not {own_ref};` "
+                       f"(the output is free, or the pipeline is empty).")
+            else:
+                first = f"valid_pipe(0) <= {valid_inputs[0]};" if valid_inputs else "the first valid bit's line"
+                fix = (f"The spec has no downstream ready port, so the pipeline must never wait: write "
+                       f"`{name} <= '1';` (every register advances on every clock; keep `{first}` so a clock "
+                       f"with no input sends a '0' down the valid chain and the output valid drops) and do not read "
+                       f"valid_pipe or the output valid flag in it. A history chain or loop value is still "
+                       f"written only under the valid bit of the row above it.")
+            issues.append({"code": "self_blocking_advance",
+                           "detail": f"line {n}: the pipeline enable `{name}` is computed from the pipeline's own valid "
+                                     f"flag {own_ref} with no downstream ready term. Nothing can clear {own_ref} once "
+                                     f"it is '1' (the valid chain only moves while `{name}` is '1'), so at that clock "
+                                     f"`{name}` drops to '0' and every register, the valid chain and the output flag "
+                                     f"keep their values for the rest of the run: m_axis_tvalid stuck at '1' with one "
+                                     f"constant value on every cycle (timing_recovery 2026-11-06 18:52, 801 "
+                                     f"mismatches). {fix} >> {lines[n - 1].strip()}"})
+    return issues
+
+
 def _spec_lines(spec: dict) -> list[str]:
     """The spec's prose, one entry per line: behavior first (the rules), then
     constraints, assumptions and the description."""
@@ -1791,6 +1944,115 @@ def _history_chain_reset_issues(code: str) -> list[dict]:
     return issues
 
 
+# the input samples a spec reads around sample n: `x[m-3]`, `x[n+2]`, `x[m]`; and the base point `m = n - 2`
+_SPEC_SAMPLE_INDEX_RE = re.compile(r"\bx\s*\[\s*([mn])\s*(?:([+-])\s*(\d+))?\s*\]", re.IGNORECASE)
+_SPEC_BASE_POINT_RE = re.compile(r"\bm\s*=\s*n\s*([+-])\s*(\d+)", re.IGNORECASE)
+_FIRST_NUMBER_RE = re.compile(r"\d+")
+
+
+def _spec_history_window(spec: dict) -> tuple[int, int, str] | None:
+    """(oldest, newest, how the spec spells it): offsets from sample n of the
+    input samples the spec reads. `x[m-3]` with `m = n - 2` is -5. None when
+    the spec names no `x[...]` sample, or uses m without saying what m is."""
+    text = "\n".join(_spec_lines(spec))
+    base = _SPEC_BASE_POINT_RE.search(text)
+    m_off = int(base.group(2)) * (1 if base.group(1) == "+" else -1) if base else None
+    offsets, words = [], []
+    for hit in _SPEC_SAMPLE_INDEX_RE.finditer(text):
+        var, sign, k = hit.group(1).lower(), hit.group(2), int(hit.group(3) or 0)
+        off = (k if sign == "+" else -k) if sign else 0
+        if var == "m":
+            if m_off is None:
+                return None
+            off += m_off
+        offsets.append(off)
+        words.append(re.sub(r"\s+", "", hit.group(0)))
+    if not offsets:
+        return None
+    oldest, newest = min(offsets), max(offsets)
+    rel = lambda o: "x[n]" if o == 0 else f"x[n{o:+d}]"
+    spelled = f"{words[offsets.index(oldest)]}..{words[offsets.index(newest)]}"
+    if base:
+        spelled += f" with m = n {base.group(1)} {base.group(2)}, that is {rel(oldest)}..{rel(newest)}"
+    return oldest, newest, spelled
+
+
+def _history_depth_issues(spec: dict, code: str) -> list[dict]:
+    """A numbered history chain (`x0_s2 <= i_s1; x1_s2 <= x0_s2; ...`) with
+    fewer registers than the window of input samples the spec reads.
+    timing_recovery (2026-11-10, the reviewed RTL): x0..x3 per channel, four
+    taps, while `y_mid = farrow(x[m-3], x[m-2], x[m-1], x[m], mu)` with
+    m = n-2 reaches back to x[n-5]: six samples. The midpoint window read a
+    sample the chain never stored, on every beat, and pipeline_stage_map.md
+    showed four taps too. The register in the row above (`i_s1`) does not
+    count: reading it from the Farrow row is the pipeline_stage_skip bug.
+    Copies whose names are not one stem plus a number (`yprev_s2 <=
+    ysym_s2`) and designs without a chain are left to the dry run."""
+    window = _spec_history_window(spec)
+    if window is None:
+        return []
+    oldest, newest, spelled = window
+    needed = newest - oldest + 1
+    if needed < 2:
+        return []
+    stripped = _code_only(code)
+    edges: list[tuple[str, str, int]] = []           # (target, same-row source, line)
+    for _, _, line, target, op, expr, _ in _clocked_statements(stripped):
+        k = _row_of(target)
+        if op != "<=" or k is None:
+            continue
+        src = _names_in(expr)
+        if len(src) != 1 or _OPERATOR_RE.search(expr.replace("=>", " ")):
+            continue
+        s = next(iter(src))
+        if s != target and _row_of(s) == k:
+            edges.append((target, s, line))
+    if not edges:
+        return []
+    parent: dict[str, str] = {}
+
+    def root(a: str) -> str:
+        while parent.setdefault(a, a) != a:
+            a = parent[a]
+        return a
+
+    for t, s, _ in edges:
+        parent[root(t)] = root(s)
+    chains: dict[str, set[str]] = {}
+    for t, s, _ in edges:
+        chains.setdefault(root(t), set()).update({t, s})
+    stem = lambda n: _FIRST_NUMBER_RE.sub("#", n, count=1)
+    natural = lambda n: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", n)]
+    short: dict[int, list[tuple[list[str], int]]] = {}
+    for members in chains.values():
+        names = sorted(members, key=natural)
+        if len(names) < 2 or len(names) >= needed or len({stem(n) for n in names}) != 1:
+            continue
+        line = min(l for t, _, l in edges if t in members)
+        short.setdefault(_row_of(names[0]), []).append((names, line))
+    source = code.splitlines()
+    issues = []
+    for k, found in sorted(short.items()):
+        found.sort(key=lambda f: f[1])
+        names, line = found[0]
+        stmt = source[line - 1].strip() if 0 < line <= len(source) else ""
+        chains_text = ", ".join(f"`{f[0][0]}`..`{f[0][-1]}`" for f in found)
+        last = names[-1]
+        m = _FIRST_NUMBER_RE.search(last)
+        new = [f"{last[:m.start()]}{int(m.group(0)) + i}{last[m.end():]}" for i in range(1, needed - len(names) + 1)] if m else []
+        add = " ".join(f"`{n} <= {p};`" for p, n in zip([last] + new, new))
+        issues.append({"code": "history_too_short",
+                       "detail": f"line {line}: the history chain in row {k} ({chains_text}) holds {len(names)} samples, "
+                                 f"but the spec reads {spelled}: {needed} input samples side by side. The oldest window "
+                                 f"reads a sample this chain never stored, so that part of the result is wrong on every "
+                                 f"beat. Add {needed - len(names)} more register(s) to EACH chain, shifted the same way "
+                                 f"({add}), declared and reset with the chain, and read the older window from the new "
+                                 f"taps (oldest first: the midpoint of a timing-error detector uses x[m-3]..x[m], the "
+                                 f"symbol uses x[m-1]..x[m+2]). Do not reach for the row above instead "
+                                 f"(pipeline_stage_map.md, OLDER SAMPLES). >> {stmt}"})
+    return issues
+
+
 _STROBE_WORD_RE = re.compile(r"\bstrobe\b", re.IGNORECASE)
 # the bare form of the output flag: "m_axis_tvalid_i <= valid_pipe(10);" / "<= valid_s4;" with nothing else
 _BARE_VALID_OUT_RE = re.compile(r"(?:^|;|\bbegin\b)\s*(\w*valid\w*)\s*<=\s*(valid_pipe\s*\(\s*\d+\s*\)|valid_s\d+(?:\.\w+)?)\s*;",
@@ -1837,6 +2099,324 @@ def _output_valid_without_strobe_issues(spec: dict, code: str) -> list[dict]:
                            f"(`if eta_next < 0 then strobe_s2 <= '1'`) and carried down the rows to the output "
                            f"row, never copied round a ring (pipeline_stage_map.md, LOOP VALUES)."}]
     return []
+
+
+# Two different registers given exactly the same computed expression.
+# timing_recovery 2026-11-09 14:18 (run 35b45c09): ymid_i_s7 and ysym_i_s7
+# were both `sat12(resize(p2i_s6, ..) + resize(p1i_s6, ..) + resize(v0i_s6, ..))`.
+# The mid-point of the Gardner error was the symbol itself, the error came
+# out 0 on every strobe, and mu never left its reset value ("expected 249
+# got 0" on every beat).
+_NAME_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _signals_in(expr: str, widths) -> set[str]:
+    """The declared signals / variables an expression reads (constants,
+    functions and keywords are not in the width map)."""
+    return {n.lower() for n in _NAME_RE.findall(expr) if n.lower() in widths}
+
+
+_CAST_CALL_RE = re.compile(r"(?:resize|signed|unsigned|std_logic_vector|std_ulogic_vector)\s*\((.*)\)",
+                           re.IGNORECASE | re.DOTALL)
+
+
+def _is_plain_copy(expr: str, widths) -> bool:
+    """`x`, `x(11 downto 0)`, `resize(x, W)`, `std_logic_vector(x)`: one
+    signal moved or re-typed, nothing computed. `sat12(x)` (a function of
+    the design) is a computation."""
+    core = expr.strip()
+    while True:
+        m = _CAST_CALL_RE.fullmatch(core)
+        if not m:
+            break
+        core = split_top(m.group(1), ",")[0].strip()
+    m = re.fullmatch(r"([A-Za-z_]\w*)(?:\s*\([^()]*\))?", core)
+    return bool(m) and m.group(1).lower() in widths
+
+
+def _duplicate_expression_issues(code: str) -> list[dict]:
+    """`a <= f(x, y, z); b <= f(x, y, z);` with a and b different signals and
+    the expression computed (two or more signals, or a function of one such
+    as `sat12(t2i_s6)`): the two registers hold the same value on every
+    clock, so one of the two computations the design needs was never written.
+    Plain copies (`a_s5 <= a_s4`, `resize(x, W)`, a slice) are not reported;
+    neither are reset aggregates (`(valid => '0', ...)`) or a register
+    written in more than one place (an if/else that swaps two expressions
+    between two registers).
+
+    2026-11-09 18:59 (run a3133ede): `ysym_i_s7 <= sat12(t2i_s6); ymid_i_s7 <=
+    sat12(t2i_s6);` slipped past the first version of this check, which only
+    looked at expressions reading two or more signals."""
+    scopes = scoped_widths(code)
+    # a process variable (`diff := a - b; d0 <= abs(diff); diff := c - d; d1 <= abs(diff);`) changes between
+    # two lines with the same text, so an expression that reads one proves nothing
+    variables = {target.lower() for _, target, op, _ in assignments(code) if op == ":="}
+    computed = [(line, target, expr) for line, target, op, expr in assignments(code)
+                if op == "<=" and "=>" not in expr and not ({n.lower() for n in _NAME_RE.findall(expr)} & variables)]
+    written: dict[str, int] = {}
+    for _, target, _ in computed:
+        written[target.lower()] = written.get(target.lower(), 0) + 1
+    first: dict[str, tuple[int, str]] = {}
+    issues, reported = [], set()
+    for line, target, expr in computed:
+        if written[target.lower()] != 1:
+            continue
+        key = re.sub(r"\s+", "", expr).lower()
+        widths = scopes.at(line)
+        signals = _signals_in(expr, widths)
+        if not signals or (len(signals) < 2 and _is_plain_copy(expr, widths)):
+            continue
+        seen = first.setdefault(key, (line, target))
+        if seen[1].lower() == target.lower() or target.lower() in reported:
+            continue
+        reported.add(target.lower())
+        issues.append({"code": "duplicate_expression",
+                       "detail": f"line {line}: `{target}` is given exactly the same expression as `{seen[1]}` (line "
+                                 f"{seen[0]}), so the two registers hold the same value on every clock and one of the "
+                                 f"two computations the spec asks for is missing. If `{target}` is a different value "
+                                 f"(a mid-point interpolated from the OLDER samples x[m-3]..x[m] while the symbol uses "
+                                 f"x[m-1]..x[m+2]; a second filter output), give it its own expression built from its "
+                                 f"own inputs, with its own product registers in the rows above. If the two really are "
+                                 f"the same value, delete `{target}` and read `{seen[1]}` in both places "
+                                 f">> {source_line(code, line)}"})
+    return issues
+
+
+# A product added to a plain value without scaling it back.
+# timing_recovery 2026-11-09 14:18 (run 35b45c09): `p2i_s6 <= s2i_s5 * mu_s5`
+# (mu is a fraction: 1.0 = 2**MU_F) and then
+# `sat12(resize(p2i_s6, W) + resize(p1i_s6, W) + resize(v0i_s6, W))`: the two
+# products were 2**32 times too big next to the 12-bit v0, the output sat at
+# +2047/-2048 whenever mu was not 0, and equalled the raw input sample when
+# it was.
+MIN_FACTOR_BITS = 8           # both factors at least this wide: a data value times a fraction, not `x * 3`
+
+
+def _strip_resize(term: str) -> str:
+    """`resize(resize(x, A), B)`, `(x)`, `signed(x)` -> `x`; anything else unchanged."""
+    term = term.strip()
+    while True:
+        m = re.fullmatch(r"(?:resize|signed|unsigned)\s*\((.*)\)", term, re.IGNORECASE | re.DOTALL)
+        if m:
+            args = split_top(m.group(1), ",")
+            if len(args) in (1, 2):
+                term = args[0].strip()
+                continue
+        if term.startswith("(") and term.endswith(")") and len(split_top(term[1:-1], ",")) == 1 \
+                and term[1:-1].count("(") == term[1:-1].count(")") and not _unbalanced_prefix(term[1:-1]):
+            term = term[1:-1].strip()
+            continue
+        return term
+
+
+def _unbalanced_prefix(text: str) -> bool:
+    """True when a `)` closes before its `(` opens: `a) + (b` is not one bracketed expression."""
+    depth = 0
+    for ch in text:
+        depth += ch == "("
+        depth -= ch == ")"
+        if depth < 0:
+            return True
+    return False
+
+
+def _bracketed_parts(expr: str) -> list[str]:
+    """The expression itself and the inside of every bracket pair in it."""
+    parts, stack = [expr], []
+    for i, ch in enumerate(expr):
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            parts.append(expr[stack.pop() + 1:i])
+    return parts
+
+
+def _unscaled_product_sum_issues(code: str) -> list[dict]:
+    """A register that only ever holds `a * b` (both factors signals of
+    MIN_FACTOR_BITS or more) added, as it is or inside resize(), to a plain
+    signal that is at least MIN_FACTOR_BITS narrower and is not itself built
+    from products. The product carries the fraction bits of its multiplier
+    and must be shifted back (or the plain value shifted up) before the add.
+    Sums of products with products, `shift_right(p, F) + v` and
+    `p + shift_left(v, F)` are not reported. Variables count like signals:
+    the reviewed timing_recovery RTL (2026-11-10) had `p1 := v2 * mu` and
+    `(resize(p1, P2_W) + resize(v1, P2_W)) * mu` inside a `farrow` function,
+    and a check that only read `<=` lines let it through."""
+    scopes = scoped_widths(code)
+    writes: dict[str, list[tuple[int, str, str]]] = {}
+    for line, target, op, expr in assignments(code):
+        if op in ("<=", ":=") and not re.fullmatch(r"\(\s*others\s*=>\s*'.'\s*\)", expr.strip(), re.IGNORECASE):
+            writes.setdefault(target.lower(), []).append((line, expr, op))
+
+    def factors_of(expr: str, line: int) -> tuple[str, str] | None:
+        parts = split_top(_strip_resize(expr), "*")
+        if len(parts) != 2:
+            return None
+        widths = scopes.at(line)
+        sizes = [expr_width(p, widths) for p in parts]
+        if None in sizes or min(sizes) < MIN_FACTOR_BITS or not all(_signals_in(p, widths) for p in parts):
+            return None
+        return parts[0].strip(), parts[1].strip()
+
+    products = {name: ws[0] for name, ws in writes.items() if all(factors_of(e, l) for l, e, _ in ws)}
+    # product-scale: a product, or a register that only ever holds sums / copies of product-scale registers
+    scaled = set(products)
+    changed = True
+    while changed:
+        changed = False
+        for name, ws in writes.items():
+            if name in scaled:
+                continue
+            terms = [_strip_resize(t).lower() for _, e, _ in ws for t in additive_terms(_strip_resize(e))]
+            if terms and all(t in scaled for t in terms):
+                scaled.add(name)
+                changed = True
+
+    issues, reported = [], set()
+    for line, target, op, expr in assignments(code):
+        widths = scopes.at(line)
+        for part in _bracketed_parts(expr):
+            terms = [_strip_resize(t) for t in additive_terms(part)]
+            if len(terms) < 2:
+                continue
+            prods = [t.lower() for t in terms if t.lower() in products]
+            plains = [t for t in terms if _NAME_RE.fullmatch(t) and t.lower() in widths and t.lower() not in scaled]
+            for p in prods:
+                for z in plains:
+                    wp, wz = widths.get(p), widths.get(z.lower())
+                    if wp is None or wz is None or wz > wp - MIN_FACTOR_BITS or (p, z.lower()) in reported:
+                        continue
+                    reported.add((p, z.lower()))
+                    p_line, p_expr, p_op = products[p]
+                    a, b = factors_of(p_expr, p_line)
+                    issues.append({"code": "product_added_unscaled",
+                                   "detail": f"line {line}: `{p}` is a product (line {p_line}: `{p} {p_op} "
+                                             f"{' '.join(p_expr.split())}`, {wp} bits) and is added to the plain "
+                                             f"{wz}-bit `{z}` without being scaled back. A value times a fraction "
+                                             f"carries the fraction's bits: when 1.0 in `{b}` is 2**F, the product is "
+                                             f"2**F times too big next to `{z}`, and the sum saturates on every "
+                                             f"sample where the fraction is not 0. Shift the product back before the "
+                                             f"add: `shift_right({p}, F)` with F = the number of fraction bits of "
+                                             f"`{b}` (use the named constant), or shift `{z}` up by F and shift the "
+                                             f"sum back once. Do this after EVERY multiply by a fraction: "
+                                             f"y = shift_right((shift_right(v2*mu, F) + v1) * mu, F) + v0 "
+                                             f">> {source_line(code, line)}"})
+    return issues
+
+
+# "{I[11:0], Q[11:0]}" in a spec line: several values packed in one port, the first in the top bits
+_PACKED_FIELD = r"[A-Za-z_]\w*(?:\s*\[\s*\d+\s*:\s*\d+\s*\])?"
+_PACKED_RE = re.compile(rf"\{{\s*({_PACKED_FIELD}(?:\s*,\s*{_PACKED_FIELD})+)\s*\}}")
+_PACKED_FIELD_RE = re.compile(r"([A-Za-z_]\w*)(?:\s*\[\s*(\d+)\s*:\s*(\d+)\s*\])?")
+
+
+def _packed_ports(spec: dict) -> dict[str, tuple[str, list[tuple[str, int, int]]]]:
+    """{port: (the spec's text, [(value name, high bit, low bit)])} for every
+    port a spec line describes as `{A[h:l], B[h:l]}` whose widths add up to
+    the port's width."""
+    ports = {str(p["name"]).lower(): p for p in spec.get("ports") or [] if isinstance(p, dict) and p.get("name")}
+    out: dict[str, tuple[str, list[tuple[str, int, int]]]] = {}
+    for line in _spec_lines(spec):
+        m = _PACKED_RE.search(line)
+        named = [n for n in ports if re.search(rf"\b{re.escape(n)}\b", line, re.IGNORECASE)]
+        if not m or len(named) != 1 or named[0] in out:
+            continue
+        try:
+            total = int(str(ports[named[0]].get("width")))
+        except ValueError:
+            continue
+        items = [_PACKED_FIELD_RE.fullmatch(item.strip()) for item in m.group(1).split(",")]
+        names = [i.group(1).lower() for i in items]
+        widths = [int(i.group(2)) - int(i.group(3)) + 1 if i.group(2) else 0 for i in items]
+        if not any(widths) and total % len(items) == 0:
+            widths = [total // len(items)] * len(items)     # {I, Q}: equal shares
+        if min(widths) < 1 or sum(widths) != total or len(set(names)) != len(names):
+            continue
+        fields, high = [], total - 1
+        for name, width in zip(names, widths):
+            fields.append((name, high, high - width + 1))
+            high -= width
+        out[named[0]] = (m.group(0), fields)
+    return out
+
+
+def _packed_value_of(name: str, values: list[str], known: set[str]) -> str | None:
+    """Which packed value an RTL name is for: `i_s1`, `ysym_q_s10` carry the
+    value's name as a word; `xi_s1` counts when its twin `xq_s1` exists too.
+    None unless exactly one value fits."""
+    tokens, hits = name.lower().split("_"), set()
+    for value in values:
+        for n, token in enumerate(tokens):
+            if token == value:
+                hits.add(value)
+            for other in values:
+                twins = [other + token[len(value):]] if token.startswith(value) else []
+                twins += [token[:-len(value)] + other] if token.endswith(value) else []
+                if other != value and any("_".join(tokens[:n] + [t] + tokens[n + 1:]) in known for t in twins):
+                    hits.add(value)
+    return hits.pop() if len(hits) == 1 else None
+
+
+def _packed_field_order_issues(spec: dict, code: str) -> list[dict]:
+    """A port the spec packs as {I[11:0], Q[11:0]} has I in the top bits.
+    Reported: a register named for one value that takes exactly the bits of
+    another (`i_s1 <= signed(s_axis_tdata(11 downto 0))`), and an output
+    joined in another order (`m_axis_tdata <= q & i`). timing_recovery
+    (2026-11-11 13:09): I and Q were read swapped; no check and no compiler
+    can see it, and every compared value was wrong."""
+    packed = _packed_ports(spec)
+    if not packed:
+        return []
+    stripped = strip_comments(code)
+    constants = scoped_widths(code).constants
+    statements = list(assignments(code))
+    known = {target.lower() for _, target, _, _ in statements}
+    issues = []
+    for port, (text, fields) in packed.items():
+        values = [f for f, _, _ in fields]
+        layout = ", ".join(f"{f.upper()} is bits {h} downto {l}" for f, h, l in fields)
+        bits_of = {(h, l): f for f, h, l in fields}
+        spot = {f: f"{port}({h} downto {l})" for f, h, l in fields}
+
+        def value_in(expr: str) -> str | None:
+            found = {_packed_value_of(n, values, known) for n in re.findall(r"[A-Za-z_]\w*", expr)} - {None}
+            return found.pop() if len(found) == 1 else None
+
+        def wrong_bits(line: int, name: str, high: str, low: str, value: str | None, verb: str) -> None:
+            taken = bits_of.get((int_value(high, constants), int_value(low, constants)))
+            if value and taken and taken != value:
+                issues.append({
+                    "code": "packed_field_order",
+                    "detail": f"line {line}: `{name}` {verb} bits {high.strip()} downto {low.strip()} of `{port}`, "
+                              f"and those bits are {taken.upper()}, not {value.upper()}. The spec packs the port as "
+                              f"{text}: the first name is in the top bits, so {layout}. Use `{spot[value]}` for "
+                              f"{value.upper()} >> {source_line(code, line)}"})
+
+        piece = rf"\b{re.escape(port)}\s*\(\s*([^()]+?)\s+downto\s+([^()]+?)\s*\)"
+        for line, target, _, expr in statements:
+            if target.lower() == port:                  # the whole output written as a & b
+                parts = split_top(expr, "&")
+                while len(parts) == 1:
+                    inner = re.fullmatch(r"\s*\w+\s*\((.*)\)\s*", parts[0], re.DOTALL)
+                    if not inner:
+                        break
+                    parts = split_top(inner.group(1), "&")
+                got = [value_in(p) for p in parts]
+                if len(parts) == len(fields) and None not in got and len(set(got)) == len(got) and got != values:
+                    issues.append({
+                        "code": "packed_field_order",
+                        "detail": f"line {line}: `{port}` is joined as {{{', '.join(g.upper() for g in got)}}}, "
+                                  f"but the spec packs it as {text}: the first name is in the top bits, so "
+                                  f"{layout}. In `a & b` the left operand is the top bits: put the "
+                                  f"{values[0].upper()} value first >> {source_line(code, line)}"})
+                continue
+            reads = re.findall(piece, expr, re.IGNORECASE)
+            if len(reads) == 1:
+                wrong_bits(line, target, reads[0][0], reads[0][1], _packed_value_of(target, values, known), "takes")
+        for m in re.finditer(piece + r"\s*<=\s*([^;]+);", stripped, re.IGNORECASE):
+            line = stripped.count("\n", 0, m.start()) + 1
+            wrong_bits(line, m.group(3).strip(), m.group(1), m.group(2), value_in(m.group(3)), "is written to")
+    return issues
 
 
 def _static_checks(spec: dict, rtl: dict) -> list[dict]:
@@ -1891,13 +2471,49 @@ def _compile(code: str, entity: str | None, version: str) -> tuple[str | None, l
     (compiler, issues); compiler is None when Vivado is unavailable (static
     checks only)."""
     name = f"{entity or 'design'}.vhd"
-    with tempfile.TemporaryDirectory() as tmp:
+    built: dict = {}
+    # xelab leaves files of its own in the folder; a leftover must not fail the lint
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         mcp_write_files(tmp, {name: code})
         result = mcp_run_xvhdl(tmp, [(name, xvhdl_std(version))])[0]
+        top = _ENTITY_RE.search(code)
+        if result.get("status") == "ok" and top:
+            try:
+                built = mcp_run_xelab(tmp, top.group(1), name, xvhdl_std(version))
+            except Exception:           # xelab could not be started: the xvhdl result still stands
+                built = {}
     if result.get("error_class") == "environment":
         return None, []
     output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
-    return "xvhdl", compiler_errors(output, code, 0 if result.get("status") == "ok" else 1)
+    issues = compiler_errors(output, code, 0 if result.get("status") == "ok" else 1)
+    if built.get("status") == "error" and built.get("error_class") != "environment":
+        issues += _elaboration_errors((built.get("stdout") or "") + "\n" + (built.get("stderr") or ""), code)
+    return "xvhdl", issues
+
+
+_ELEMENTS_RE = re.compile(r"expression has (\d+) elements?\s*;\s*expected (\d+)", re.IGNORECASE)
+
+
+def _elaboration_errors(output: str, code: str) -> list[dict]:
+    """xelab's ERROR lines as `elaboration_error` issues. xvhdl only reads the
+    grammar; xelab works out every width, so a start value of the wrong width
+    on a declaration line passes xvhdl and stops here. timing_recovery
+    2026-11-11, attempt 3: `constant V2_HALF : signed(V2_W-1 downto 0) :=
+    to_signed(1, V2_W-1);` (15 bits into 16) was first seen by the real
+    simulation, whose analyst called it a missing comma; the plain meaning of
+    that message is added here."""
+    # "Static elaboration of top level ... failed" is xelab's closing summary, not a cause
+    causes = "\n".join(ln for ln in output.splitlines() if "Static elaboration" not in ln)
+    issues = compiler_errors(causes, code, 0, label="xelab (the build step after xvhdl)")
+    for i in issues:
+        i["code"] = "elaboration_error"
+        m = _ELEMENTS_RE.search(i["detail"])
+        if m:
+            i["detail"] += (f"  [a {m.group(1)}-bit value is given to a {m.group(2)}-bit name on this line: a width "
+                            f"mistake, not a missing comma. Make the value {m.group(2)} bits wide (the width "
+                            f"argument of to_signed/to_unsigned/resize must be the declared width). xelab stops at "
+                            f"the first such line: check the declarations after it for the same mistake]")
+    return issues
 
 
 _UNDECLARED_ERROR_RE = re.compile(r"'(\w+)' is not declared", re.IGNORECASE)
@@ -1932,6 +2548,7 @@ def lint_rtl(spec: dict, rtl: dict) -> dict:
         issues += _unbalanced_parentheses_issues(rtl["code"])
         issues += _block_balance_issues(rtl["code"])
         issues += _width_issues(rtl["code"])
+        issues += _unconstrained_parameter_issues(rtl["code"])
         issues += _literal_width_issues(rtl["code"])
         issues += _multiple_driver_issues(rtl["code"])
         issues += _pipeline_stage_skip_issues(rtl["code"])
@@ -1940,11 +2557,22 @@ def lint_rtl(spec: dict, rtl: dict) -> dict:
         issues += _abs_without_sign_check_issues(rtl["code"])
         issues += _stage_map_issues(rtl)
         issues += _constant_output_valid_issues(spec, rtl["code"])
+        issues += _self_blocking_advance_issues(spec, rtl["code"])
         issues += _loop_value_never_computed_issues(spec, rtl["code"])
         issues += _loop_state_ring_issues(rtl["code"])
         issues += _state_read_before_valid_issues(rtl["code"])
         issues += _history_chain_reset_issues(rtl["code"])
+        issues += _history_depth_issues(spec, rtl["code"])
         issues += _output_valid_without_strobe_issues(spec, rtl["code"])
+        issues += _duplicate_expression_issues(rtl["code"])
+        unscaled = _unscaled_product_sum_issues(rtl["code"])
+        issues += unscaled
+        # the same add explained once: product_added_unscaled names the product's own line
+        issues += [i for i in fixed_point_issues(rtl["code"]) if _lines_of([i]) - _lines_of(unscaled)]
+        issues += equation_issues(_spec_lines(spec), rtl["code"])
+        issues += polynomial_issues(_spec_lines(spec), rtl["code"])
+        issues += loop_gain_issues(_spec_lines(spec), rtl["code"])
+        issues += _packed_field_order_issues(spec, rtl["code"])
         try:
             compiler, compile_issues = _compile(rtl["code"], spec.get("entity_name") or rtl.get("entity_name"),
                                                 version)

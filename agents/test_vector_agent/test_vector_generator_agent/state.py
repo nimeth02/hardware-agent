@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from agents.test_vector_agent.test_vector_validator import INPUT_CSV, OUTPUT_CSV
+from agents.test_vector_agent.lint.test_vector_validator import INPUT_CSV, OUTPUT_CSV
 
 MAX_AGENT_STEPS = 30       # LLM steps (tool calls + replies) per attempt; checked by the tool loop's recursion limit
 MAX_RUN_FAILURES = 3       # failed MATLAB runs (run_matlab_script OR matlab_eval) per attempt before it gives up (RunAttemptsExceeded)

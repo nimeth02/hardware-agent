@@ -17,7 +17,7 @@ from typing import Callable
 from agents.test_vector_agent.test_vector_decider import TestVectorDecider
 from agents.test_vector_agent.test_vector_generator_agent.test_vector_generator import TestVectorGenerator
 from agents.test_vector_agent.test_vector_skill_loader import TestVectorSkillLoader
-from agents.test_vector_agent.test_vector_validator import validate_test_vectors
+from agents.test_vector_agent.lint.test_vector_validator import validate_test_vectors
 
 Validator = Callable[[dict, str, dict], dict]   # (spec, run_dir, result) -> {csv, num_vectors, columns, issues}
 

@@ -25,22 +25,28 @@ skipping breaks the result.
 OLDER SAMPLES ARE A HISTORY CHAIN INSIDE ONE ROW, NOT OLDER ROWS.
 `i_s1` is NOT "the sample before `i_s2`": it is the SAME sample, one
 stage earlier. A filter, interpolator or timing-error detector that needs
-the last N input values side by side (x[m-1], x[m], x[m+1], x[m+2]) keeps
-its own history chain in ONE row, reset to 0, shifted only when the sample
-it takes in is valid, that is under the valid bit of the row ABOVE (for a
-chain in s2: `valid_pipe(0)`, the same bit p_loop uses for eta), and the
-next row reads the chain:
+the last N input values side by side keeps its own history chain in ONE
+row, reset to 0, shifted only when the sample it takes in is valid, that is
+under the valid bit of the row ABOVE (for a chain in s2: `valid_pipe(0)`,
+the same bit p_loop uses for eta), and the next row reads the chain.
+THE CHAIN IS AS LONG AS THE SPEC'S WINDOW: count from the newest sample the
+spec reads to the oldest, over EVERY formula. y_sym reads x[m-1]..x[m+2] and
+y_mid reads x[m-3]..x[m]; with m = n-2 that is x[n]..x[n-5], SIX registers
+(x0_s2..x5_s2), not the four of one formula (the linter's history_too_short):
 
-    s2: x0_s2 x1_s2 x2_s2 x3_s2 mu_s2 valid_pipe(1)   <- s1 (history chain, reset to 0) + p_loop (mu_s2)
+    s2: x0_s2 .. x5_s2 mu_s2 valid_pipe(1)   <- s1 (history chain, reset to 0) + p_loop (mu_s2)
         if rst = '1' then
           x0_s2 <= (others => '0');          -- one line per register of the chain
         elsif advance = '1' and valid_pipe(0) = '1' then
-          x0_s2 <= i_s1;
-          x1_s2 <= x0_s2;
-          x2_s2 <= x1_s2;
-          x3_s2 <= x2_s2;
+          x0_s2 <= i_s1;                     -- x[n]   = x[m+2]
+          x1_s2 <= x0_s2;                    -- x[n-1] = x[m+1]
+          x2_s2 <= x1_s2;                    -- x[n-2] = x[m]
+          x3_s2 <= x2_s2;                    -- x[n-3] = x[m-1]
+          x4_s2 <= x3_s2;                    -- x[n-4] = x[m-2]
+          x5_s2 <= x4_s2;                    -- x[n-5] = x[m-3]
         end if;
-    s3: y_s3 <= farrow(x3_s2, x2_s2, x1_s2, x0_s2, mu_s2)   <- s2 (oldest first)
+    s3: ysym_s3 <= farrow(x3_s2, x2_s2, x1_s2, x0_s2, mu_s2)   <- s2, oldest first: x[m-1], x[m], x[m+1], x[m+2]
+        ymid_s3 <= farrow(x5_s2, x4_s2, x3_s2, x2_s2, mu_s2)   <- the four OLDEST taps: x[m-3], x[m-2], x[m-1], x[m]
 
 Inside the chain `x1_s2 <= x0_s2` reads its own row: that is a one-clock
 delay and correct. Reaching for `i_s1` from stage 3 to get "an older

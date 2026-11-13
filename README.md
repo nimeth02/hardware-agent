@@ -54,16 +54,17 @@ enforced, not hoped for.
 
 ```
 agents/                 one package per agent (state, tools, planner, guard, graph) + orchestrator_agent/ (state, steps, tools, tracing, project_writer)
-                        + pipeline_agent/ (fixed-order flow) + vhdl_version.py (which VHDL edition a design uses)
+                        + pipeline_agent/ (fixed-order flow) + vhdl_version.py (which VHDL edition a design uses);
+                        the code checkers live in a lint/ folder inside rtl_agent/, testbench_agent/ and test_vector_agent/
 prompts/                system and planner prompts, one file per agent
-skills/                 markdown rule files loaded into generator prompts (RTL: one rulebook per VHDL edition, TESTBENCH, TEST_VECTOR)
+skills/                 markdown rule files loaded into generator prompts (RTL: one rulebook per VHDL edition, RTL_EXAMPLES: complete worked designs shown to the RTL agent when the spec matches, TESTBENCH, TEST_VECTOR)
 mcp_servers/            file_server.py, vivado_server.py (+ vivado_env.py), matlab_server/ (matlab_server.py + matlab_engine.py)
 services/               .env config, LLM client, MCP client, checkpoint store
 observability/          tracing callback, run store, SQLite schema
 server/                 FastAPI app (server/app.py), static UI (server/static/, third-party JS in server/static/vendor/) and Streamlit UI (server/streamlit_app.py)
 projects/               example projects the simulation/implementation agents run as-is (see projects/README.md)
-docs/                   developer notes: how state is handed between orchestrator and agents (state_handover.md), RTL linter review
-tests/                  unit tests per agent
+docs/                   developer notes: how state is handed between orchestrator and agents (state_handover.md), what each agent remembers (agent_memory.md), RTL linter review
+tests/                  unit tests per agent (tests/fixtures/: small hand-made wave files the tests read)
 .claude/agents/         Claude Code subagents used during development (ui-backend, project-guide, source-control)
 .claude/hooks/          Claude Code hooks: pre_commit_tests.py runs the unit tests before any git commit Claude issues
 CLAUDE.md               how Claude Code must explain things to the owner (plain words, no jargon)

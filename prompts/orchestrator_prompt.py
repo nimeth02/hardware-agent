@@ -88,6 +88,11 @@ Always read "error", "issues", "lint" and "analysis" before deciding.
   the RTL, the testbench, the test vectors or the spec. The blamed tool's
   next call automatically receives that failure in its attempt history, so
   re-running the blamed tool is how you ask for a fix.
+- While the blamed tool has not been re-run and still has a call left,
+  a call to a DIFFERENT generate_* tool is not run: it returns status
+  "BLOCKED" naming the blamed tool. Call the blamed tool first. Re-making
+  the test vectors or the testbench does not fix a failure that blames
+  the RTL.
 - After such a fix: regenerate what depends on the changed artifact, run
   write_project again, simulate again. New test vectors (likely_cause
   "test_vectors") need only write_project and simulate: the RTL and the

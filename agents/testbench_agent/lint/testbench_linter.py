@@ -1,4 +1,4 @@
-# agents/testbench_agent/testbench_linter.py — lint check for a generated
+# agents/testbench_agent/lint/testbench_linter.py — lint check for a generated
 # VHDL testbench.
 #
 # Static checks always run (deterministic, no tools needed): testbench
@@ -14,6 +14,7 @@ import tempfile
 
 from agents.lint_utils import compiler_errors
 from agents.mcp_utils import mcp_run_xvhdl, mcp_write_files
+from agents.testbench_agent.lint.closed_loop_compare import closed_loop_compare_issues
 from agents.vhdl_version import resolve_vhdl_version, xvhdl_std
 
 _ENTITY_RE = re.compile(r"\bentity\s+(\w+)\s+is", re.IGNORECASE)
@@ -100,6 +101,7 @@ def _static_checks(spec: dict, rtl: dict, testbench: dict) -> list[dict]:
 
     issues += _replay_checks(spec, code)
     issues += _streaming_checks(spec, code)
+    issues += closed_loop_compare_issues(spec, code)     # tolerance + settle window (closed_loop_compare.py)
     return issues
 
 
@@ -478,7 +480,53 @@ def _streaming_checks(spec: dict, code: str) -> list[dict]:
     idle = _idle_row_hold_issue(lines)
     if idle:
         issues.append(idle)
+    field = _field_source_mismatch(lines, payload)
+    if field:
+        issues.append(field)
     return issues
+
+
+_FIELD_ASSIGN_RE = re.compile(r"\b(got|exp)_(\w+)\s*:=\s*(.+)", re.IGNORECASE | re.DOTALL)
+_SLICE_RE = re.compile(r"\(\s*(\d+)\s+downto\s+(\d+)\s*\)", re.IGNORECASE)
+
+
+def _field_source_mismatch(lines: list[str], payload: list[str]) -> dict | None:
+    """A decoded field whose expected value is read from another place than
+    the DUT value it is compared with: `got_q := ...dut_m_axis_tdata(11 downto 0)`
+    next to `exp_q := ...exp_tuser(k_exp)(7 downto 0)`. timing_recovery,
+    2026-11-11: expected Q was read from the mu column, so every compared
+    beat reported a Q mismatch on an RTL that could have been correct."""
+    short = {p: p.lower().rsplit("_", 1)[-1] for p in payload}         # m_axis_tdata -> tdata
+
+    def source(rhs: str) -> tuple[str | None, tuple[int, int] | None]:
+        words = re.findall(r"[a-z_]\w*", rhs.lower())
+        cols = [p for p, s in short.items() if any(s in w for w in words)]
+        cut = _SLICE_RE.search(rhs)
+        return (cols[0] if len(cols) == 1 else None), ((int(cut.group(1)), int(cut.group(2))) if cut else None)
+
+    seen: dict[tuple[str, str], str] = {}
+    for stmt in "\n".join(lines).split(";"):
+        m = _FIELD_ASSIGN_RE.search(_no_strings(stmt))
+        if m:
+            seen.setdefault((m.group(1).lower(), m.group(2).lower()), " ".join(m.group(3).split()))
+    for (kind, name), got_rhs in seen.items():
+        exp_rhs = seen.get(("exp", name))
+        if kind != "got" or exp_rhs is None:
+            continue
+        got_col, got_cut = source(got_rhs)
+        exp_col, exp_cut = source(exp_rhs)
+        wrong_col = got_col and exp_col and got_col != exp_col
+        wrong_cut = got_cut and exp_cut and got_cut != exp_cut
+        if wrong_col or wrong_cut:
+            fix_col = short.get(got_col, "tdata") if got_col else "tdata"
+            fix_cut = f"({got_cut[0]} downto {got_cut[1]})" if got_cut else ""
+            return {"code": "field_source_mismatch",
+                    "detail": f"'exp_{name} := {exp_rhs}' reads the expected value from another place than "
+                              f"'got_{name} := {got_rhs}' reads the DUT value, so the compare of {name} fails on "
+                              f"every beat even when the RTL is right. Both sides of one field must come from the "
+                              f"same output column and the same bit range: read exp_{name} from "
+                              f"exp_{fix_col}(k_exp){fix_cut}."}
+    return None
 
 
 # The bounded "hold the row until s_axis_tready" loop (its deadlock report

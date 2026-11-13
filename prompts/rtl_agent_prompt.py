@@ -113,7 +113,14 @@ must have exactly that many bits and m_axis_tvalid must come from its
 LAST bit (gated by the strobe of that same row when the spec outputs on a
 strobe: `valid_pipe(9) and strobe_s10`). Do the count in the stage map
 (one row per register, an output register is its own row), then fix the
-code. Do NOT touch the arithmetic.
+code. For "valid_data_length_mismatch" do NOT touch the arithmetic.
+For "smoke_output_stuck_at_zero", if the count is already right the
+formula itself gives 0: a value that is 0 after reset (mu, a gain, an
+accumulator) multiplies EVERY term of the result, so the result stays 0
+and the loop never moves that value. Compare the RTL with the spec
+formula and restore the term that is NOT multiplied by it (in an
+interpolator: at mu = 0 the output equals one input sample). Returning
+the previous code unchanged is not a fix.
 
 If an issue is "loop_state_ring" or "loop_value_never_computed": the loop
 values were copied down the rows and back into row 1 (`eta_s1 <= eta_s11`),
@@ -157,6 +164,11 @@ into a 16-bit `r` is wrong. Keep the shifted value in a signal or variable
 as wide as `p`, then `r <= resize(that, 16);` on its own line.
 Change that line; returning the same file is refused.
 
+If an issue is "unconstrained_function_parameter": a function input is
+written without a width (`mu : signed`) and the function multiplies by it.
+Write the width in the function header exactly as the issue shows
+(`mu : signed(MU_W-1 downto 0)`); keep the calls as they are.
+
 If an issue says "cannot read from 'out' object X": keep X as `out`,
 declare `signal X_i` of the same type, replace every read of X inside
 the architecture with X_i, and add `X <= X_i;`. Fix ALL such issues in
@@ -198,6 +210,16 @@ lines of the simulation (or compiler) log. Read these before the "summary":
 decode "input_row" with the spec's field layout, work out from the spec
 what the output for that input must be, and compare it with the value in
 "line". Fix the RTL so it produces the spec's value for that exact input.
+A "downstream" note may carry "inside_values": for the beats around the
+first failure, "chip" rows with YOUR design's registers (mu, e, v, acc,
+eta, y_sym, y_mid, y_prev, named after your signals, read from the
+simulation just before the clock edge of that beat, raw integers) and
+"model" rows with the golden model's values for the same beats (real
+numbers; mu8 = floor(mu*256)). Read "how_to_read", scale the raw integers
+with your own fraction-bit constants, and find the FIRST beat and the FIRST
+register where the chip parts from the model: that register's formula (or
+the row feeding it) is the fault; everything after it only follows. Fix
+that formula; do not rewrite rows that agree with the model.
 A "downstream" note with "second_opinion": true means another stage was
 blamed first and redone without effect, so the fault may be here after
 all: check what its "summary" asks for. An entry may also have

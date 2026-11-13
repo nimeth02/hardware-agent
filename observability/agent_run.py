@@ -122,6 +122,12 @@ PAYLOAD_TAIL = 20_000
 
 def _preview(value: Any, limit: int = FULL_PAYLOAD_LIMIT, tail: int = PAYLOAD_TAIL) -> Any:
     if isinstance(value, str) and len(value) > limit:
+        if limit <= tail:
+            # a short one-line preview (limit 200 / 300): keep only the start.
+            # Without this branch limit - tail is negative and the "preview"
+            # was the marker followed by the WHOLE text (seen in the UI on
+            # 2026-11-11). The UI turns this end marker into "…".
+            return value[:limit] + f"... [truncated {len(value) - limit} chars]"
         return value[:limit - tail] + f"... [truncated {len(value) - limit} chars in the middle] ..." + value[-tail:]
     return value
 

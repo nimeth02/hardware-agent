@@ -117,3 +117,18 @@ def mcp_run_xvhdl(project_dir: str, files: list[tuple[str, str]]) -> list[dict]:
     library through the Vivado MCP server's run_xvhdl. Returns run_xvhdl's
     result dict per file compiled (stops after the first failure)."""
     return run_sync(_arun_xvhdl(project_dir, files))
+
+
+async def _arun_xelab(project_dir: str, top_entity: str, file: str, vhdl_std: str) -> dict:
+    client = get_mcp_client()
+    async with client.session("vivado") as session:
+        run_xelab = {t.name: t for t in await load_mcp_tools(session)}["run_xelab"]
+        return tool_json(await run_xelab.ainvoke({"top_entity": top_entity, "project_dir": project_dir,
+                                                  "file": file, "vhdl_std": vhdl_std}))
+
+
+def mcp_run_xelab(project_dir: str, top_entity: str, file: str, vhdl_std: str) -> dict:
+    """Build `top_entity` with the Vivado MCP server's run_xelab, after
+    mcp_run_xvhdl compiled `file` in the same project_dir. Returns run_xelab's
+    result dict. xelab works out the widths xvhdl does not."""
+    return run_sync(_arun_xelab(project_dir, top_entity, file, vhdl_std))

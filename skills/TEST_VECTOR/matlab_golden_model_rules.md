@@ -295,7 +295,50 @@ CSV LAYOUT (validated)
   thing (the validator rejects one value on 95 % of the input or output
   beats as constant_input / constant_output). Draw every symbol at random:
       sym = 2*randi([0 1], 2, nsym) - 1;        % rows I, Q in {-1, +1}
-  then pulse-shape and scale to codes (e.g. 1024*sym) before packing.
+  then pulse-shape and scale to codes exactly as the CLOSED-LOOP STIMULUS
+  rule below shows, before packing.
+- CLOSED-LOOP STIMULUS: clean, so the model and the RTL can be compared
+  beat by beat. HARD RULE for every closed-loop design:
+      nsym = 200;                                 % at least 200 symbols
+      sym  = 2*randi([0 1], 2, nsym) - 1;         % rows I, Q in {-1, +1}, drawn separately
+      p    = [0.25, 0.75, 0.75, 0.25];            % one symbol = these 4 samples
+      for s = 1:nsym
+          xI(4*(s-1)+1 : 4*s) = sym(1, s) * p;
+          xQ(4*(s-1)+1 : 4*s) = sym(2, s) * p;
+      end
+      Icode = min(max(round(xI * 2048), -2048), 2047);   % peak 1536
+  NO noise (no randn, no awgn), NO sample-rate error (no ppm / delta, no
+  resampling, no interp1), NO fractional start offset, NO RRC filter and
+  no conv. Why: the model applies the loop filter's new value on the next
+  sample, a pipelined RTL 4 to 24 samples later. On this clean stimulus
+  the two settle onto the same path (measured 2026-11-09, 40 seeds: after
+  64 beats within 2 steps on I/Q and 7 of 256 on mu, same beat count). On
+  a stimulus with noise or a rate error they never do: a CORRECT design
+  is then hundreds of steps away on some beats and the compare fails
+  whatever the RTL does (the scripts of 2026-11-06 / 11-09 with randn and
+  +500 ppm: up to 1361 steps, mu 128 of 256 away). The spec's Es/N0, ppm
+  and offset figures describe the graded performance test; this
+  simulation only checks that the RTL computes the spec's formulas. The
+  testbench does not compare the first 64 beats, so fewer than 200
+  symbols leaves too little to compare. The guard rejects a closed-loop
+  script that calls randn or awgn before it runs.
+- CLOSED-LOOP TRACE: every closed-loop script ALSO writes loop_trace.csv,
+  one row per output beat, so that when the dry run fails the RTL writer
+  sees the model's loop values next to the chip's registers for the same
+  beats (the testbench never reads it). HARD RULE; the guard rejects a
+  closed-loop script that does not write it. Exactly these columns:
+      trace_names = {'beat','cycle','mu8','e','v','acc','y_sym_i','y_sym_q','y_mid_i','y_mid_q'};
+      trace = zeros(0, numel(trace_names));
+      ... inside the strobe branch, after e, acc, v and the output codes:
+      trace(end+1, :) = [nOut, c, floor(mu*256), e, v, acc, oI, oQ, ...
+                         min(max(round(real(y_mid)*2048), -2048), 2047), ...
+                         min(max(round(imag(y_mid)*2048), -2048), 2047)];
+      nOut = nOut + 1;            % so 'beat' is 0-based like the testbench's beat k
+      ... after the loop, next to the two writetable lines:
+      writetable(array2table(trace, 'VariableNames', trace_names), 'loop_trace.csv');
+  'beat' counts the output beats from 0 in order (the testbench's beat k),
+  'cycle' is the row the beat is written on, mu8 the 8-bit mu, e / v / acc
+  the real values the loop used on that beat, y_* the codes.
 - SAMPLE HISTORY (an interpolator or filter that reads x[n-1], x[n-2], ...
   or a base point m = n-2): keep the last K samples in a fixed list,
   newest LAST, and read it with FIXED slot numbers, never with the running

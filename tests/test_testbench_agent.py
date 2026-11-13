@@ -232,7 +232,7 @@ def test_invalid_llm_output_is_kept_as_code():
 
 
 def test_linter_takes_the_dut_identity_from_the_rtl_not_the_spec():
-    from agents.testbench_agent.testbench_linter import _static_checks
+    from agents.testbench_agent.lint.testbench_linter import _static_checks
     spec_says_counter = {**SPEC, "entity_name": "counter"}
     tb = {"entity_name": "counter4_tb", "code": """library ieee; use ieee.std_logic_1164.all;
 entity counter4_tb is end entity;
@@ -268,7 +268,7 @@ def test_compiler_errors_are_stable_and_quote_the_source_line():
 
 
 def test_ellipsis_in_prose_is_not_a_placeholder():
-    from agents.testbench_agent.testbench_linter import _static_checks
+    from agents.testbench_agent.lint.testbench_linter import _static_checks
     base = """library ieee; use ieee.std_logic_1164.all;
 entity counter4_tb is end entity;
 architecture sim of counter4_tb is signal clk : std_logic := '0'; signal count : std_logic_vector(3 downto 0); begin
@@ -286,7 +286,7 @@ end architecture;"""
 
 
 def test_when_else_inside_a_process_is_caught_before_xelab_would_refuse_it():
-    from agents.testbench_agent.testbench_linter import _static_checks
+    from agents.testbench_agent.lint.testbench_linter import _static_checks
     code = """library ieee; use ieee.std_logic_1164.all;
 entity counter4_tb is end entity;
 architecture sim of counter4_tb is signal clk, rst : std_logic := '0'; signal count : std_logic_vector(3 downto 0);
@@ -310,7 +310,7 @@ end architecture;"""
 def test_read_wide_with_a_fixed_width_or_a_wrongly_sized_vector_variable_is_caught():
     """Run 17:04 on 2026-10-29: 'Array sizes do not match, left array has 24
     elements, right array has 32 elements' at time 0 inside read_wide."""
-    from agents.testbench_agent.testbench_linter import _replay_checks
+    from agents.testbench_agent.lint.testbench_linter import _replay_checks
     spec = {"entity_name": "demap", "ports": [
         {"name": "aclk", "direction": "input", "width": "1"},
         {"name": "s_axis_tdata", "direction": "input", "width": "32"},
@@ -338,7 +338,7 @@ def test_read_wide_with_a_fixed_width_or_a_wrongly_sized_vector_variable_is_caug
 
 
 def test_replay_mistakes_that_compile_but_break_the_simulation_are_caught():
-    from agents.testbench_agent.testbench_linter import _replay_checks
+    from agents.testbench_agent.lint.testbench_linter import _replay_checks
     spec = {"entity_name": "demap", "ports": [
         {"name": "aclk", "direction": "input", "width": "1"},
         {"name": "s_axis_tdata", "direction": "input", "width": "32"},
@@ -369,7 +369,7 @@ def test_replay_mistakes_that_compile_but_break_the_simulation_are_caught():
 def test_reading_the_outputs_file_in_two_passes_is_not_a_column_count_mismatch():
     """The LLR demapper run: the testbench reads test_vectors_out.csv twice (collect
     expected beats, then replay). 4 + 4 reads of `lo` are two whole rows, not 8 columns."""
-    from agents.testbench_agent.testbench_linter import _replay_checks
+    from agents.testbench_agent.lint.testbench_linter import _replay_checks
     spec = {"entity_name": "llr", "ports": [
         {"name": "aclk", "direction": "input", "width": "1"},
         {"name": "aresetn", "direction": "input", "width": "1"},
@@ -396,7 +396,7 @@ def test_right_number_of_reads_in_the_wrong_column_order_is_caught():
     """The LLR demapper run: s_axis_tready sounds like an input, so the testbench
     read it from the inputs file. Six reads per row (correct count), but the 32-bit
     tdata landed in the integer meant for tready -> 'integer value is out of range'."""
-    from agents.testbench_agent.testbench_linter import _replay_checks
+    from agents.testbench_agent.lint.testbench_linter import _replay_checks
     spec = {"entity_name": "llr", "ports": [
         {"name": "aclk", "direction": "input", "width": "1"},
         {"name": "aresetn", "direction": "input", "width": "1"},
@@ -424,7 +424,7 @@ def test_right_number_of_reads_in_the_wrong_column_order_is_caught():
 
 
 def test_std_logic_val_on_a_csv_value_is_caught():
-    from agents.testbench_agent.testbench_linter import _static_checks
+    from agents.testbench_agent.lint.testbench_linter import _static_checks
     code = "entity counter4_tb is end; architecture a of counter4_tb is begin process begin wait; " \
            "if detected /= std_logic'val(v_detected) then report \"x\"; end if; end process; end;"
     found = [i for i in _static_checks(SPEC, RTL, {"entity_name": "counter4_tb", "code": code})
@@ -436,7 +436,7 @@ def test_std_logic_val_on_a_csv_value_is_caught():
 
 
 def test_treating_a_one_bit_port_as_a_bus_is_caught():
-    from agents.testbench_agent.testbench_linter import _static_checks
+    from agents.testbench_agent.lint.testbench_linter import _static_checks
     spec = {**SPEC, "ports": [{"name": "clk", "width": "1"}, {"name": "detected", "width": "1"},
                               {"name": "count", "width": "4"}]}
     code = "entity counter4_tb is end; architecture a of counter4_tb is begin process begin wait; " \
@@ -461,7 +461,7 @@ def test_streaming_designs_must_be_compared_in_beat_order_not_per_cycle():
     """The LLR demapper runs: the vectors put the expected output on the row of
     the input beat, the testbench compared on that same cycle, and the pipeline
     answered later -> 'cycle 2: m_axis_tdata expected 24_50_141 got 0_0_0'."""
-    from agents.testbench_agent.testbench_linter import _streaming_checks
+    from agents.testbench_agent.lint.testbench_linter import _streaming_checks
     stream = {"entity_name": "llr", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
         ("aclk", "input", "1"), ("aresetn", "input", "1"),
         ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
@@ -516,7 +516,7 @@ def test_streaming_compare_against_the_current_row_is_caught_even_inside_the_han
     but it compared m_axis_tdata with v_m_axis_tdata of the CURRENT row -> the
     output was checked against the wrong beat ('cycle 17: expected hi=125
     lo=61440 got hi=0 lo=0', then 'cycle 20: ... got hi=125 lo=61440')."""
-    from agents.testbench_agent.testbench_linter import _streaming_checks
+    from agents.testbench_agent.lint.testbench_linter import _streaming_checks
     stream = {"entity_name": "llr", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
         ("aclk", "input", "1"), ("aresetn", "input", "1"),
         ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
@@ -548,7 +548,7 @@ def test_a_hold_loop_that_an_idle_row_cannot_leave_is_rejected():
     """llr_demap16, 2026-10-29 16:40: the hold loop exited only on
     `tvalid = 1 and tready = '1'`, so every idle row (cycles 0-1, 50-59) ran
     the 64-edge limit and reported a deadlock; the analyst blamed the RTL."""
-    from agents.testbench_agent.testbench_linter import _idle_row_hold_issue, _streaming_checks
+    from agents.testbench_agent.lint.testbench_linter import _idle_row_hold_issue, _streaming_checks
     stream = {"entity_name": "llr", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
         ("aclk", "input", "1"), ("aresetn", "input", "1"),
         ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "32"),
@@ -586,7 +586,7 @@ def test_streaming_rules_apply_without_an_m_axis_tready_port_and_flag_compares_a
     marker lost); the second reported 'missing m_axis_tvalid' on every expected
     row and the RTL's strobe timing was blamed, although the spec leaves the
     latency L to the RTL."""
-    from agents.testbench_agent.testbench_linter import _streaming_checks
+    from agents.testbench_agent.lint.testbench_linter import _streaming_checks
     stream = {"entity_name": "timing_recovery", "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
         ("aclk", "input", "1"), ("aresetn", "input", "1"),
         ("s_axis_tvalid", "input", "1"), ("s_axis_tready", "output", "1"), ("s_axis_tdata", "input", "24"),
@@ -688,6 +688,36 @@ def test_streaming_rules_apply_without_an_m_axis_tready_port_and_flag_compares_a
     assert "no m_axis_tready" in TESTBENCH_AGENT_SYSTEM_PROMPT and "FIRST 20" in TESTBENCH_AGENT_SYSTEM_PROMPT
 
 
+def test_expected_field_read_from_the_wrong_column_is_caught():
+    """timing_recovery, 2026-11-11: the testbench decoded got_q from
+    m_axis_tdata(11 downto 0) but exp_q from exp_tuser (the mu column), so
+    Q mismatched on every compared beat whatever the RTL did."""
+    from pathlib import Path
+    from agents.testbench_agent.lint.testbench_linter import _field_source_mismatch
+    payload = ["m_axis_tdata", "m_axis_tuser"]
+    good = """
+          got_i  := to_integer(signed(dut_m_axis_tdata(23 downto 12)));
+          exp_i  := to_integer(signed(exp_tdata(k_exp)(23 downto 12)));
+          got_q  := to_integer(signed(dut_m_axis_tdata(11 downto 0)));
+          exp_q  := to_integer(signed(exp_tdata(k_exp)(11 downto 0)));
+          got_mu := to_integer(unsigned(dut_m_axis_tuser));
+          exp_mu := to_integer(unsigned(exp_tuser(k_exp)));
+    """
+    decls = "    variable got_i, exp_i, got_q, exp_q : integer := 0;\n    variable exp_tdata : tdata_array;\n"
+    assert _field_source_mismatch((decls + good).splitlines(), payload) is None
+
+    wrong_column = good.replace("exp_tdata(k_exp)(11 downto 0)", "exp_tuser(k_exp)(7 downto 0)")
+    issue = _field_source_mismatch(wrong_column.splitlines(), payload)
+    assert issue["code"] == "field_source_mismatch"
+    assert "exp_q" in issue["detail"] and "exp_tdata(k_exp)(11 downto 0)" in issue["detail"]   # names the fix
+
+    wrong_bits = good.replace("exp_tdata(k_exp)(11 downto 0)", "exp_tdata(k_exp)(23 downto 12)")
+    assert _field_source_mismatch(wrong_bits.splitlines(), payload)["code"] == "field_source_mismatch"
+
+    rules = (Path(__file__).resolve().parents[1] / "skills" / "TESTBENCH" / "vhdl_2008_testbench_rules.md").read_text(encoding="utf-8")
+    assert "field_source_mismatch" in rules and "exp_tdata(k_exp)(11 downto 0)" in rules
+
+
 def _ports(rows):
     return [{"name": n, "direction": d, "width": w} for n, d, w in rows]
 
@@ -751,7 +781,7 @@ def test_the_rules_file_has_a_complete_streaming_testbench_the_checker_accepts()
     changes applied.)"""
     import re
     from pathlib import Path
-    from agents.testbench_agent.testbench_linter import _static_checks
+    from agents.testbench_agent.lint.testbench_linter import _static_checks
     rules = (Path(__file__).resolve().parents[1] / "skills" / "TESTBENCH" / "vhdl_2008_testbench_rules.md").read_text(encoding="utf-8")
     section = rules.split("COMPLETE STREAMING TESTBENCH. Copy this file", 1)[1].split("WITH AN m_axis_tready PORT", 1)[0]
     code_lines = [line[4:] if line.startswith("    ") else line for line in section.splitlines()]
@@ -781,3 +811,55 @@ def test_the_rules_tell_closed_loop_designs_to_compare_with_a_tolerance():
     assert "2 %" in section                                    # the beat count may differ by a few
     assert "TED, NCO, loop filter" in section                  # how the writer recognises such a design
     assert "TOL_SYM / TOL_MU" in rules.split("CHECK YOURSELF BEFORE ANSWERING", 1)[1]   # and the checklist repeats it
+
+
+# ── closed-loop designs: tolerance + settle window (closed_loop_compare.py) ──
+
+def test_a_closed_loop_testbench_that_compares_bit_for_bit_is_sent_back():
+    """timing_recovery 2026-11-11 15:04: the RTL was the proven worked example
+    and the test vectors were right (0 mismatches under a tolerant testbench);
+    the first-draft testbench compared the packed word bit for bit from beat 1,
+    reported 256 mismatches and the RTL was blamed. The rule was only prose."""
+    from agents.testbench_agent.lint.closed_loop_compare import closed_loop_compare_issues, closed_loop_hint, is_closed_loop
+    ports = [{"name": n, "direction": d} for n, d in (("aclk", "input"), ("s_axis_tvalid", "input"),
+             ("s_axis_tdata", "input"), ("m_axis_tvalid", "output"), ("m_axis_tdata", "output"))]
+    loop = {"entity_name": "timing_recovery", "ports": ports,
+            "behavior": ["Implement NCO phase eta (modulo-1).", "Update PI loop filter: acc = acc + K2 * e."]}
+    plain = {"entity_name": "llr_demap16", "ports": ports, "behavior": ["Compute the LLR of each bit."]}
+    strict = """
+      if dut_m_axis_tvalid = '1' then
+        if dut_m_axis_tdata /= exp_tdata(k_exp) then   -- abs(got - exp) > TOL and SETTLE_BEATS only in a comment
+          report "beat mismatch" severity error;
+        end if;
+        k_exp := k_exp + 1;
+      end if;"""
+    tolerant = """
+      constant SETTLE_BEATS : integer := 64;
+      elsif k_exp >= SETTLE_BEATS then
+        if abs(got_i - exp_i) > TOL_SYM or abs(got_q - exp_q) > TOL_SYM then
+          report "beat mismatch" severity error;
+        end if;"""
+    assert is_closed_loop(loop) and not is_closed_loop(plain)
+    issues = closed_loop_compare_issues(loop, strict)
+    assert [i["code"] for i in issues] == ["closed_loop_exact_compare"]
+    assert "no a settle window (SETTLE_BEATS) and no a tolerance compare" in issues[0]["detail"]
+    assert "constant SETTLE_BEATS : integer := 64;" in issues[0]["detail"] and "TOL_MU" in issues[0]["detail"]
+    assert closed_loop_compare_issues(loop, tolerant) == []
+    only_window = closed_loop_compare_issues(loop, tolerant.replace("abs(got_i - exp_i) > TOL_SYM or abs(got_q - exp_q) > TOL_SYM", "got_i /= exp_i"))
+    assert "no a tolerance compare" in only_window[0]["detail"] and "settle window" not in only_window[0]["detail"].split(":")[0]
+    assert closed_loop_compare_issues(plain, strict) == []                    # not a loop: bit-exact is right
+    assert "SETTLE_BEATS" in closed_loop_hint(loop) and closed_loop_hint(plain) == ""   # told before the first draft
+    # the exact beat count: every beat matched, 197 of 200 arrived, one strict line failed the run (15:12)
+    count = """
+      if k_exp < n_exp then
+        report "missing output beats: expected " & integer'image(n_exp)
+          & " got " & integer'image(k_exp) severity error;
+      end if;"""
+    allowed = count.replace("if k_exp < n_exp then", "if n_exp > 0 and abs(k_exp - n_exp) > n_exp / 50 and abs(k_exp - n_exp) >= 2 then")
+    exact = closed_loop_compare_issues(loop, tolerant + count)
+    assert [i["code"] for i in exact] == ["closed_loop_exact_beat_count"] and "`if k_exp < n_exp then`" in exact[0]["detail"]
+    assert "abs(k_exp - n_exp) > n_exp / 50" in exact[0]["detail"]
+    assert closed_loop_compare_issues(loop, tolerant + allowed) == []
+    assert closed_loop_compare_issues(plain, count) == []                     # not a loop: every beat must arrive
+    assert "abs(k_exp - n_exp) > n_exp / 50" in closed_loop_hint(loop)
+

@@ -5,6 +5,8 @@
 #   decider       rtl_decider.RTLDecider            (LLM, picks the next action)
 #   skill_loader  rtl_skill_loader.RTLSkillLoader   (file-server MCP, read-only)
 #   linter        rtl_linter.lint_rtl               (deterministic)
+#   examples      rtl_examples.examples_for         (file-server MCP, read-only:
+#                 the worked example that fits the spec, if any)
 #
 # Nothing here can run simulation/Vivado or write project files.
 
@@ -14,11 +16,13 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from agents.rtl_agent.rtl_decider import RTLDecider
+from agents.rtl_agent.rtl_examples import examples_for
 from agents.rtl_agent.rtl_generator import RTLGenerator
-from agents.rtl_agent.rtl_linter import lint_rtl
+from agents.rtl_agent.lint.rtl_linter import lint_rtl
 from agents.rtl_agent.rtl_skill_loader import RTLSkillLoader
 
 Linter = Callable[[dict, dict], dict]
+Examples = Callable[[dict], dict[str, str]]
 
 
 @dataclass
@@ -27,3 +31,4 @@ class RTLAgentTools:
     decider: RTLDecider = field(default_factory=RTLDecider)
     skill_loader: RTLSkillLoader = field(default_factory=RTLSkillLoader)
     linter: Linter = lint_rtl
+    examples: Examples = examples_for

@@ -19,7 +19,7 @@ import threading
 from langgraph.graph import END, START, StateGraph
 
 from agents.rtl_agent.rtl_guard import guard
-from agents.rtl_agent.rtl_linter import unchanged_on_retry_issue
+from agents.rtl_agent.lint.rtl_linter import unchanged_on_retry_issue
 from agents.rtl_agent.state import (
     MAX_ITERATIONS, MAX_STALLED_FIXES, Action, RTLAgentState, RTLStatus, initial_state,
 )
@@ -66,6 +66,13 @@ class RTLAgent:
         except Exception as e:  # skills improve quality but their absence must not kill the run
             return {"skills": {}, "skills_loaded": True,
                     "warnings": [*state.get("warnings", []), f"skills not loaded: {e}"]}
+        # after the rules: the one worked example that fits this spec, if any
+        # (rtl_examples.py decides which). Missing examples never stop the run.
+        try:
+            skills = {**skills, **self.tools.examples(state["spec"])}
+        except Exception as e:
+            return {"skills": skills, "skills_loaded": True,
+                    "warnings": [*state.get("warnings", []), f"worked example not loaded: {e}"]}
         return {"skills": skills, "skills_loaded": True}
 
     def generate_node(self, state: RTLAgentState) -> dict:

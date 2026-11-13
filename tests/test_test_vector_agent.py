@@ -194,7 +194,7 @@ def test_invalid_llm_output_becomes_a_failure_summary():
 
 
 def test_validator_checks_both_files_their_layout_and_that_they_line_up(monkeypatch):
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = {"ports": [{"name": "clk", "direction": "input", "width": "1"},
                       {"name": "rst", "direction": "input", "width": "1"},
                       {"name": "count", "direction": "output", "width": "4"}]}
@@ -226,7 +226,7 @@ def test_validator_checks_both_files_their_layout_and_that_they_line_up(monkeypa
 def test_an_input_beat_on_a_blocked_row_is_rejected(monkeypatch):
     """llr_demap16 run 2026-10-29 12:00: rows with s_axis_tvalid = 1 and
     m_axis_tready = 0 made the testbench wait forever (no_marker)."""
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = {"ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
         ("aclk", "input", "1"), ("s_axis_tvalid", "input", "1"), ("s_axis_tdata", "input", "8"),
         ("m_axis_tready", "input", "1"), ("s_axis_tready", "output", "1"),
@@ -279,7 +279,7 @@ def test_a_constant_input_column_is_rejected(monkeypatch):
     """timing_recovery run 2026-11-05 15:54: the golden model divided 0 by 0,
     every input became 8390656 and only one output beat was expected; every
     layout check passed and the analyst blamed the RTL."""
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
     files = _stream_files([8390656] * 40, out_beat_every=4)
     monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
@@ -297,7 +297,7 @@ def test_a_constant_input_column_is_rejected(monkeypatch):
 
 
 def test_an_expected_beat_count_far_from_the_spec_rate_is_rejected(monkeypatch):
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
     files = _stream_files(list(range(100, 140)), out_beat_every=40)          # 1 beat for 40 inputs
     monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
@@ -327,7 +327,7 @@ def test_a_nearly_constant_input_is_rejected_for_rated_designs(monkeypatch):
     """timing_recovery run 2026-11-06 11:45: 99 identical symbols plus one
     flipped symbol (396 of 400 beats the same) slipped past the exact
     'one constant' check and the loop had nothing to lock onto."""
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
     files = _stream_files([4195328] * 39 + [12585984], out_beat_every=4, out_value=lambda k: 100 + k)
     monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
@@ -349,7 +349,7 @@ def test_a_nearly_constant_input_is_rejected_for_rated_designs(monkeypatch):
 def test_a_nearly_constant_output_is_rejected_for_rated_designs(monkeypatch):
     """Same run: 190 of 193 expected beats were 4195328 because the loop
     repeated the first symbol forever; every earlier check passed."""
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
     files = _stream_files(list(range(100, 140)), out_beat_every=2, out_value=lambda k: 4195328 if k else 0)
     monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
@@ -370,10 +370,37 @@ def test_a_nearly_constant_output_is_rejected_for_rated_designs(monkeypatch):
     assert v.validate_test_vectors(spec, "x", {})["issues"] == []
 
 
+def test_an_all_zero_expected_output_is_rejected_when_the_input_varies(monkeypatch):
+    """timing_recovery 2026-11-06 18:47: the pulse filter ran on the symbols
+    BEFORE the x4 upsample, so 3 of 4 input samples were 0 and every strobe
+    (mu = 0) read a zero sample: 99 expected beats, all 0, all mu 0. The
+    warm-up exemption for zeros above let it through and attempt 1
+    ("expected 99 got 97") tested nothing. Every beat the same number while
+    the input varies is a test that proves nothing, zero included."""
+    import agents.test_vector_agent.lint.test_vector_validator as v
+    spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
+    files = _stream_files(list(range(100, 140)), out_beat_every=2, out_value=lambda k: 0)
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: files.get(name))
+
+    issues = v.validate_test_vectors(spec, "x", {})["issues"]
+    constant = [i for i in issues if i["code"] == "constant_output"]
+    assert len(constant) == 1 and "0 on ALL 20 expected output beats" in constant[0]["detail"]
+    assert "40 different values" in constant[0]["detail"] and "Upsample first" in constant[0]["detail"]
+
+    # a constant input with an all-zero output is the constant_input case, reported once
+    files = _stream_files([7] * 40, out_beat_every=2, out_value=lambda k: 0)
+    codes = [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]
+    assert codes.count("constant_input") == 1 and "constant_output" not in codes
+
+    # 19 of 20 zero then a real value (warm-up) still passes, as the test above checks; 20 of 20 does not
+    files = _stream_files(list(range(100, 140)), out_beat_every=2, out_value=lambda k: 0 if k < 19 else 777)
+    assert v.validate_test_vectors(spec, "x", {})["issues"] == []
+
+
 def test_output_beats_on_many_consecutive_rows_are_rejected(monkeypatch):
     """Same run: the strobe fired on every cycle from cycle 12 on (193 beats
     for 400 inputs), which the 2x beat-count tolerance accepted."""
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = _stream_spec(["Output strobe rate is approximately one per 4 input clocks."])
     # 400 inputs, 193 beats: 8 spaced beats then one on every row -> count passes, run fails.
     in_lines, out_lines = ["cycle,aclk,aresetn,s_axis_tvalid,s_axis_tdata,m_axis_tready"], ["cycle,s_axis_tready,m_axis_tvalid,m_axis_tdata"]
@@ -395,7 +422,7 @@ def test_output_beats_on_many_consecutive_rows_are_rejected(monkeypatch):
 
 
 def test_spec_output_rate_reads_the_common_phrasings():
-    from agents.test_vector_agent.test_vector_validator import spec_output_rate
+    from agents.test_vector_agent.lint.test_vector_validator import spec_output_rate
     assert spec_output_rate({"constraints": ["Output strobe rate is approximately one per 4 input clocks."]}) == 4
     assert spec_output_rate({"behavior": "Emit 1 symbol every 8 samples."}) == 8
     assert spec_output_rate({"description": "Decimate by 16 then filter."}) == 16
@@ -671,7 +698,7 @@ def test_a_beat_during_reset_is_rejected(monkeypatch):
     """llr_demap16 run 2026-10-29: the golden model wrote the first beat on
     cycle 3 while aresetn was still 0, so the design dropped it and every
     later beat was compared with the wrong expected value."""
-    import agents.test_vector_agent.test_vector_validator as v
+    import agents.test_vector_agent.lint.test_vector_validator as v
     spec = {"reset": {"name": "aresetn", "active": "low"},
             "ports": [{"name": n, "direction": d, "width": w} for n, d, w in [
                 ("aclk", "input", "1"), ("aresetn", "input", "1"), ("s_axis_tvalid", "input", "1"),
@@ -927,6 +954,34 @@ def test_scripts_that_index_a_sample_history_with_the_sample_count_are_rejected_
     assert history_index_by_counter("% xbufQ = zeros(1, 8); xbufQ = [xbufQ(2:8), cq]; y = xbufQ(m);\n") == []
 
 
+def test_an_assert_that_compares_a_length_with_itself_plus_an_offset_is_called_a_wrong_check():
+    """timing_recovery 2026-11-06 18:46 (run ce5d6a48): `Nc = numel(Ic) + sps - 1;
+    assert(numel(Ic) == Nc ...)` fired; the generic hint said "fix the values, not
+    the assert", the opposite of what was needed."""
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import contradicting_asserts, crash_note
+
+    code = ("sps = 4;\nIc = conv(sym(1,:), h);\nQc = conv(sym(2,:), h);\n"
+            "Nc = numel(Ic) + sps - 1;               % samples after upsampling\n"
+            "assert(numel(Ic) == Nc && numel(Qc) == Nc, 'pulse length mismatch');\n% upsample by 4\n")
+    err = '{"error": "line 5, in gen_test_vectors\\npulse length mismatch"}'
+    note = crash_note(code, err)
+    assert "-->   5 | assert(numel(Ic) == Nc" in note
+    assert "This check can never pass" in note and "Nc is defined on line 4 as `Nc = numel(Ic) + sps - 1`" in note
+    assert "The CHECK is wrong, not the values of Ic" in note and "Change the Nc line or the assert, not Ic" in note
+    assert "Your own assert" not in note
+    # the same shape with the names swapped (N == numel(x)) and length() is caught before the script runs
+    found = contradicting_asserts("N = length(x) - 1;\nassert(N == length(x), 'bad');\n")
+    assert len(found) == 1 and found[0].startswith("line 2 `assert(N == length(x), 'bad');`") and "never pass" in found[0]
+    # a length checked against a number built from something else is a real check and keeps the old hint
+    ok = "Nc = nsym*sps + numel(h) - 1;\nassert(numel(Ic) == Nc, 'pulse length mismatch');\n"
+    assert contradicting_asserts(ok) == []
+    note = crash_note(ok, err.replace("line 5", "line 2"))
+    assert "Your own assert" in note and "never pass" not in note
+    # `N = numel(x)` with no offset is a (pointless but true) check, not a contradiction; comments are ignored
+    assert contradicting_asserts("N = numel(x);\nassert(numel(x) == N);\n") == []
+    assert contradicting_asserts("% N = numel(x) + 1;\nN = 10;\nassert(numel(x) == N);\n") == []
+
+
 def test_scripts_whose_loop_reads_past_the_end_of_a_list_are_rejected_before_they_run():
     """timing_recovery 2026-11-06 16:48 (run cb9924de): `xs(i) = x(floor(inst(i+1)) + 1)`
     inside `for i = 1:nIn` with nIn = numel(inst) crashed, the LLM rewrote the block
@@ -1142,3 +1197,94 @@ def test_a_script_identical_to_one_that_crashed_is_rejected_without_spending_a_r
         await run.ainvoke({"script_name": "gen_test_vectors", "project_dir": "x"})
         assert runs == ["gen_test_vectors", "gen_test_vectors"] and state["failures"] == 2
     asyncio.run(scenario())
+
+
+def test_a_closed_loop_script_that_adds_noise_is_rejected_before_it_runs():
+    """2026-11-09: on a noisy stimulus the golden model's loop (reacts on the next
+    sample) and a pipelined RTL's loop (reacts 4..24 samples later) never settle
+    onto the same path, so a CORRECT design fails the beat-by-beat compare; on the
+    clean stimulus they agree within 2 steps after 64 beats (40 seeds)."""
+    from pathlib import Path
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import noisy_closed_loop_stimulus
+
+    loop_spec = {"ports": [{"name": "s_axis_tvalid"}, {"name": "m_axis_tvalid"}, {"name": "s_axis_tdata"}],
+                 "behavior": ["Loop filter output v initial value 0", "On strobe: acc = acc + K2 * e",
+                              "NCO phase eta is modulo-1, initial value 0"]}
+    noisy = "sym = 2*randi([0 1], 2, nsym) - 1;\nupI = upI + sigma*randn(1, Nup);\n"
+    why = noisy_closed_loop_stimulus(loop_spec, noisy)
+    assert why and why.startswith("line 2 `upI = upI + sigma*randn(1, Nup);` adds noise")
+    assert "CORRECT design fails" in why and "p = [0.25 0.75 0.75 0.25]" in why and "at least 200 symbols" in why
+    assert noisy_closed_loop_stimulus(loop_spec, "y = awgn(x, 12);\n")
+    # clean stimulus, noise only named in a comment, randi (not randn): fine
+    assert noisy_closed_loop_stimulus(loop_spec, "sym = 2*randi([0 1], 2, nsym) - 1;   % no randn here\n") is None
+    # a streaming design with no loop (the demapper) may use noise
+    demap = {"ports": loop_spec["ports"], "behavior": ["m_lsb = |I| - 2*d", "llr saturated to 8 bits"]}
+    assert noisy_closed_loop_stimulus(demap, noisy) is None
+    assert noisy_closed_loop_stimulus(None, noisy) is None and noisy_closed_loop_stimulus({}, noisy) is None
+
+    root = Path(__file__).resolve().parents[1]
+    matlab_rules = (root / "skills" / "TEST_VECTOR" / "matlab_golden_model_rules.md").read_text(encoding="utf-8")
+    assert "CLOSED-LOOP STIMULUS" in matlab_rules and "p    = [0.25, 0.75, 0.75, 0.25];" in matlab_rules
+    assert "NO noise (no randn, no awgn)" in matlab_rules
+    tb_rules = (root / "skills" / "TESTBENCH" / "vhdl_2008_testbench_rules.md").read_text(encoding="utf-8")
+    assert "constant SETTLE_BEATS : integer := 64;" in tb_rules and "elsif k_exp >= SETTLE_BEATS then" in tb_rules
+    assert "if d_mu > 128 then d_mu := 256 - d_mu; end if;" in tb_rules and "constant TOL_MU : integer := 16;" in tb_rules
+
+
+def test_a_closed_loop_script_without_a_loop_trace_is_rejected_before_it_runs():
+    """2026-11-10: loop_trace.csv is what lets the RTL writer see the model's
+    mu / e / v / acc per beat next to the chip's registers (inside_values)."""
+    from agents.test_vector_agent.test_vector_generator_agent.matlab_guard import missing_loop_trace
+
+    loop_spec = {"ports": [{"name": "s_axis_tvalid"}, {"name": "m_axis_tvalid"}, {"name": "s_axis_tdata"}],
+                 "behavior": ["Loop filter output v initial value 0", "On strobe: acc = acc + K2 * e"]}
+    why = missing_loop_trace(loop_spec, "writetable(array2table(outs, 'VariableNames', out_names), 'test_vectors_out.csv');\n")
+    assert why and why.startswith("the spec describes a closed loop but the script never writes loop_trace.csv")
+    assert "'beat','cycle','mu8','e','v','acc','y_sym_i','y_sym_q','y_mid_i','y_mid_q'" in why
+    assert missing_loop_trace(loop_spec, "writetable(array2table(trace, 'VariableNames', trace_names), 'loop_trace.csv');\n") is None
+    demap = {"ports": loop_spec["ports"], "behavior": ["m_lsb = |I| - 2*d"]}
+    assert missing_loop_trace(demap, "x = 1;\n") is None and missing_loop_trace(None, "x = 1;\n") is None
+
+
+def test_expected_outputs_pinned_at_full_scale_are_rejected(monkeypatch):
+    """timing_recovery 2026-11-11 17:15: the model ran on the raw integer
+    codes, so 174 of 192 expected beats had I = 2047 or -2048 while no input
+    went beyond 1536; every other check passed and the RTL was blamed."""
+    import agents.test_vector_agent.lint.test_vector_validator as v
+    from agents.test_vector_agent.lint.output_range_check import output_fields
+
+    def word(i, q):
+        return (i % 4096) * 4096 + (q % 4096)
+
+    layouts = ["Output m_axis_tdata is 24 bits wide with layout: I = bits 23:12, Q = bits 11:0.",
+               "m_axis_tdata[23:12] = I, m_axis_tdata[11:0] = Q",
+               "m_axis_tdata carries {I[11:0], Q[11:0]}"]
+    for layout in layouts:
+        assert output_fields({"ports": [{"name": "m_axis_tdata", "width": "24"}], "behavior": [layout]},
+                             "m_axis_tdata") == [("I", 23, 12), ("Q", 11, 0)], layout
+
+    rate_line = "Output rate: approximately one recovered symbol per 4 input samples."     # the 17:15 spec's wording
+    spec = _stream_spec([rate_line])
+    spec["behavior"] = ["Input s_axis_tdata is 24 bits wide with layout: I = bits 23:12, Q = bits 11:0.", layouts[0]]
+    assert v.spec_output_rate(spec) == 4
+    stimulus = [word(1536 if k % 3 else -512, 512 if k % 5 else -1536) for k in range(80)]
+
+    pinned = _stream_files(stimulus, out_beat_every=4, out_value=lambda k: word(2047 if k % 2 else -2048, 100 + k))
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: pinned.get(name))
+    found = [i for i in v.validate_test_vectors(spec, "x", {})["issues"] if i["code"] == "saturated_output"]
+    assert len(found) == 1 and "I (m_axis_tdata[23:12])" in found[0]["detail"]
+    assert "20 of 20 expected output beats while no input value goes beyond 1536" in found[0]["detail"]
+
+    # a real run: the expected values stay near the input's peak (1792 in the passing 15:49 run)
+    real = _stream_files(stimulus, out_beat_every=4, out_value=lambda k: word(1792 if k % 2 else -1792, 1791 - k))
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: real.get(name))
+    assert "saturated_output" not in [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]
+
+    # not judged: no output rate in the spec (a demapper), or a stimulus that itself sits at full scale
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: pinned.get(name))
+    no_rate = {**spec, "constraints": []}
+    assert "saturated_output" not in [i["code"] for i in v.validate_test_vectors(no_rate, "x", {})["issues"]]
+    loud = _stream_files([word(2047 if k % 2 else -2048, k) for k in range(80)], out_beat_every=4,
+                         out_value=lambda k: word(2047 if k % 2 else -2048, 100 + k))
+    monkeypatch.setattr(v, "mcp_read_file", lambda run_dir, name: loud.get(name))
+    assert "saturated_output" not in [i["code"] for i in v.validate_test_vectors(spec, "x", {})["issues"]]

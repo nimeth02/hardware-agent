@@ -45,6 +45,18 @@ architecture's declarative part and call it, e.g.:
       end if;
     end function;
 
+A function input that the function MULTIPLIES must carry its width in the
+header, written with the width name of the value the calls pass:
+
+    function farrow(xm1, xm, xp1, xp2 : signed(I_W-1 downto 0);
+                    mu : signed(MU_W-1 downto 0)) return signed is
+
+A plain `mu : signed` is as wide as whatever each call passes, so nobody
+reading the function can size `v2 * mu`; the wrong product width compiles
+and only crashes the dry run ("Array sizes do not match ... in process
+p_s7", no line). Inputs that are only clamped or resized (sat6 above) may
+stay unsized.
+
 A design that needs more than about 250 lines is almost always repeating
 itself; shorten it before adding more.
 
@@ -170,6 +182,29 @@ If a row needs more than 40 lines, move its arithmetic into a function
   bit a non-strobe row would stall the whole pipeline while m_tready is
   low, and a sink that waits for tvalid before raising tready would never
   see a beat.
+- NO DOWNSTREAM READY PORT (the spec says "No m_axis_tready port exists" /
+  "downstream is always ready"): the pipeline must never wait, so it moves
+  on EVERY clock:
+      advance <= '1';
+  `valid_pipe(0) <= s_axis_tvalid;` stays as it is: a clock with no input
+  loads a '0', that '0' travels down the chain, and m_axis_tvalid drops
+  when no result is left. Never `advance <= s_axis_tvalid;`: the chain then
+  moves only while an input arrives, so after the last input the results
+  still inside never come out and valid_pipe(last) stays '1' with the same
+  data on every clock (equalizer 2026-11-12 16:57: 20 inputs, 108 output
+  beats, the last 3 results missing; with `advance <= '1';` the same file
+  gave 0 mismatches; dry run: `smoke_more_outputs_than_inputs`).
+  Because the rows now move on clocks with no input too, every register
+  that REMEMBERS across samples (a history chain, the loop values of
+  `p_loop`, an accumulator) is written only under the valid bit of the row
+  above it, `elsif advance = '1' and valid_pipe(0) = '1' then`
+  (pipeline_stage_map.md). Plain stage registers need no such gate.
+  Never `advance <= not valid_pipe(last);` or `not m_tvalid_i`: without the
+  ready term nothing ever clears the last valid bit, so at the first clock
+  it is '1' advance drops to '0' and every register, the valid chain and the
+  output flag freeze for the rest of the run, m_axis_tvalid stuck at '1' with
+  one constant value on every cycle (timing_recovery 2026-11-06 18:52, 801
+  mismatches, three attempts in a row; linter: `self_blocking_advance`).
 - OUTPUT ON STROBE (timing recovery, symbol sync, any spec that says
   "output ... on strobe" or "one output per N inputs"): the output valid
   flag is the last valid bit AND the strobe bit of the SAME row, never the
@@ -335,6 +370,23 @@ target with exactly that width.
   rounding constant BEFORE the shift, using a constant sized like x.
 - Saturation: compare against constants, then `resize` (see the function
   above); do not rely on wrap-around.
+- Fractions: every value that is a fraction (1.0 = 2**F) gets a named
+  constant `<NAME>_F` for its fraction bits (`constant MU_F : integer :=
+  16;` for mu, mu_s3, mu_v). A product with that value has F extra
+  fraction bits: shift it back with the constant, `shift_right(v2 * mu,
+  MU_F)`, BEFORE it is added to anything that was not multiplied by the
+  same fraction. One shift at the very end is wrong when a plain value was
+  added in between: `y = shift_right((shift_right(v2*mu, MU_F) + v1) * mu,
+  MU_F) + v0` (linter: `fraction_bits_misaligned`, `product_added_unscaled`).
+- Weighted sums from the spec (`v1 = -0.5*x[m+2] + 1.5*x[m+1] - 0.5*x[m]
+  - 0.5*x[m-1]`): one term per sample, each with the spec's own sign and
+  weight. 0.5*x is `shift_right(x, 1)`, 1.5*x is `x + shift_right(x, 1)`.
+  When you keep twice the value and shift once at the end, 2*x is
+  `shift_left(x, 1)` and 3*x is `shift_left(x, 1) + x`: `shift_left(x, 1)`
+  alone for the 1.5 term gives 1.0*x after the final shift, the wrong
+  weight (32 of 41 timing_recovery files up to 2026-11-11). The linter
+  works every such sum out again and compares the weights with the spec
+  line (`equation_coefficients_differ`).
 
 ═══════════════════════════════════════════════════════════════════
 5. CHECK YOURSELF BEFORE ANSWERING

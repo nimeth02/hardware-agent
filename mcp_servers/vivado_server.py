@@ -153,6 +153,54 @@ def _remote_xvhdl(file: str, project_dir: str, vhdl_std: str) -> dict:
     }
 
 
+def _remote_xelab(file: str, top_entity: str, project_dir: str, vhdl_std: str) -> dict:
+    """
+    Upload one VHDL file, compile it with xvhdl and build it with xelab on the
+    remote host. _remote_xvhdl removes its folder after each call, so the
+    compile is repeated here in a fresh tmpdir.
+    """
+    target_file = Path(project_dir) / file
+    if not target_file.is_file():
+        return {"status": "error", "stdout": "", "stderr": f"File not found: {file}", "errors_found": -1}
+
+    try:
+        client = _make_ssh_client()
+    except Exception as e:
+        return {"status": "error", "stdout": "", "stderr": f"SSH connect failed: {e}", "errors_found": -1,
+                "error_class": "environment"}
+
+    try:
+        settings = _detect_remote_settings64(client)
+        if not settings:
+            return {"status": "error", "stdout": "", "stderr": "No settings64.sh on remote host",
+                    "errors_found": -1, "error_class": "environment"}
+
+        out, _, _ = _remote_run(client, "mktemp -d /tmp/vivado_xelab_XXXX")
+        tmpdir = out.strip()
+
+        sftp = client.open_sftp()
+        remote_file = f"{tmpdir}/{Path(file).name}"
+        sftp.put(str(target_file), remote_file)
+        sftp.close()
+
+        std_flag = "--2008" if vhdl_std == "2008" else ""
+        cmd = (f"source {settings} && mkdir -p {tmpdir}/work && cd {tmpdir}/work && "
+               f"xvhdl {std_flag} {remote_file} 2>&1 && xelab {top_entity} -s {top_entity}_elab 2>&1")
+        stdout, stderr, exit_code = _remote_run(client, cmd, timeout=180)
+
+        _remote_run(client, f"rm -rf {tmpdir}")
+    finally:
+        client.close()
+
+    errors_found = len(_ERROR_LINE_RE.findall(stdout)) + len(_ERROR_LINE_RE.findall(stderr))
+    return {
+        "status": "ok" if (exit_code == 0 and errors_found == 0) else "error",
+        "stdout": _cap(stdout),
+        "stderr": _cap(stderr),
+        "errors_found": errors_found,
+    }
+
+
 def _remote_simulation(tb_file: str, top_entity: str, project_dir: str, sim_time: str,
                        src_vhdl_std: str = "93") -> dict:
     """
@@ -452,6 +500,70 @@ def run_xvhdl(file: str, project_dir: str, vhdl_std: str = "93") -> dict:
         "errors_found": errors_found,
         "error_class":  None if ok else _classify_failure(stdout + stderr),
     }
+
+@mcp.tool()
+def run_xelab(top_entity: str, project_dir: str, file: str = "", vhdl_std: str = "93") -> dict:
+    """
+    Run xelab — Vivado's build step that follows xvhdl. xvhdl reads the
+    grammar of one file; xelab works out every width and connection, so it
+    reports mistakes xvhdl accepts (a 15-bit value given to a 16-bit constant).
+    No testbench is needed: the design entity itself can be the top.
+
+    Call run_xvhdl on the file first (same project_dir): locally xelab reads
+    the library that call left in work_proj/.
+
+    Args:
+        top_entity:  Name of the entity to build (e.g. the design's entity).
+        project_dir: Absolute path to the project root.
+        file:        Relative path to the entity's .vhd file. Only used by the
+                     remote pipeline, which compiles the file itself.
+        vhdl_std:    "93" (default) or "2008" — remote pipeline only.
+
+    Returns:
+        status:       "ok" or "error"
+        stdout:       xelab output
+        stderr:       xelab stderr
+        errors_found: count of lines starting with "ERROR:" — 0 means it builds
+    """
+    if is_remote_mode():
+        return _remote_xelab(file, top_entity, project_dir, vhdl_std)
+
+    if not _env_result["ok"]:
+        return {
+            "status": "error", "stdout": "",
+            "stderr": f"Vivado environment not available: {_env_result['reason']}",
+            "errors_found": -1, "error_class": "environment",
+        }
+
+    work_dir = Path(project_dir) / "work_proj"
+    if not work_dir.is_dir():
+        return {"status": "error", "stdout": "",
+                "stderr": "work_proj/ not found — run run_xvhdl on the design file first.",
+                "errors_found": -1, "error_class": "environment"}
+
+    cmd = [find_vivado_bin("xelab"), top_entity, "-s", f"{top_entity}_elab"]
+    try:
+        result = run_vivado_cmd(cmd, cwd=str(work_dir), capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "stdout": "", "stderr": "xelab timed out after 180s.",
+                "errors_found": -1, "error_class": "environment"}
+    except FileNotFoundError:
+        return {"status": "error", "stdout": "",
+                "stderr": "xelab binary not found — check Vivado installation.",
+                "errors_found": -1, "error_class": "environment"}
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    errors_found = len(_ERROR_LINE_RE.findall(stdout)) + len(_ERROR_LINE_RE.findall(stderr))
+    ok = result.returncode == 0 and errors_found == 0
+    return {
+        "status":       "ok" if ok else "error",
+        "stdout":       _cap(stdout),
+        "stderr":       _cap(stderr),
+        "errors_found": errors_found,
+        "error_class":  None if ok else _classify_failure(stdout + stderr),
+    }
+
 
 # ── TCL deletion guard ──────────────────────────────────────────────────
 # Layer 3 of the no-delete invariant. Layer 1 = no delete tool in

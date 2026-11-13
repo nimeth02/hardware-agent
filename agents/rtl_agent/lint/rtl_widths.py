@@ -1,4 +1,4 @@
-# agents/rtl_agent/rtl_widths.py — bit widths of simple VHDL expressions.
+# agents/rtl_agent/lint/rtl_widths.py — bit widths of simple VHDL expressions.
 #
 # Shared by the linter (static width checks) and the dry run (naming the
 # line behind an "Array sizes do not match" crash). numeric_std rules:
@@ -145,6 +145,26 @@ _SCOPE_RE = re.compile(
     r"\bprocess\b.*?\bend\s+process\b"
     r"|\b(?:function|procedure)\s+(\w+)\b.*?\bend\s+(?:(?:function|procedure)\b\s*)?(?:\1\b\s*)?;",
     re.IGNORECASE | re.DOTALL)
+# one group of a subprogram's parameter list: "mu : signed", "xm1, xm : in signed(I_W-1 downto 0)"
+_PARAM_RE = re.compile(
+    r"^\s*(?:constant|signal|variable)?\s*([\w\s,]+?)\s*:\s*(?:in|inout|out)?\s*"
+    r"(unsigned|signed|std_logic_vector|std_ulogic_vector)\s*(\(.*\))?\s*(?::=.*)?$",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _balanced(text: str, start: int) -> int:
+    """Index just past the ')' that closes the '(' at `start`, or -1."""
+    depth, i = 0, start
+    while i < len(text):
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+        if depth == 0:
+            return i
+    return -1
+
+
+def _line_of(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
 
 
 class Widths(dict):
@@ -177,16 +197,98 @@ class WidthScopes:
         self.file_level: dict[str, int] = {}
         self.file_types: dict[str, str] = {}
         # (first line, last line, widths, types) of every process / function / procedure
-        self.scopes: list[tuple[int, int, dict[str, int], dict[str, str]]] = [
-            (stripped.count("\n", 0, m.start()) + 1, stripped.count("\n", 0, m.end()) + 1, {}, {})
-            for m in _SCOPE_RE.finditer(stripped)]
+        self.scopes: list[tuple[int, int, dict[str, int], dict[str, str]]] = []
+        # lower-case function/procedure name -> (first line, last line)
+        self.functions: dict[str, tuple[int, int]] = {}
+        # one entry per vector parameter of a function/procedure (see _read_parameters)
+        self.parameters: list[dict] = []
+        spans: list[tuple[re.Match, tuple]] = []
+        for m in _SCOPE_RE.finditer(stripped):
+            scope = (_line_of(stripped, m.start()), _line_of(stripped, m.end()), {}, {})
+            self.scopes.append(scope)
+            if m.group(1):
+                self.functions[m.group(1).lower()] = scope[:2]
+                spans.append((m, scope))
         for offset, names, width, typ in vector_declarations(stripped, self.constants):
-            line = stripped.count("\n", 0, offset) + 1
+            line = _line_of(stripped, offset)
             scope = self._innermost(line)
             widths, types = (scope[2], scope[3]) if scope else (self.file_level, self.file_types)
             for name in names:
                 widths[name] = width
                 types[name] = typ
+        for m, scope in spans:
+            self._read_parameters(stripped, m, scope)
+        for _ in range(2):              # a call may pass another function's parameter: settle in two passes
+            for p in self.parameters:
+                if p["width"] is None:
+                    self._infer_parameter(stripped, p)
+
+    def _read_parameters(self, stripped: str, m: re.Match, scope: tuple) -> None:
+        """The vector parameters of one subprogram header. A parameter with a
+        range (`x : signed(I_W-1 downto 0)`) is a declared width of the body's
+        scope; one without (`mu : signed`) is recorded for _infer_parameter."""
+        name = m.group(1)
+        head = re.match(rf"\s*(?:function|procedure)\s+{re.escape(name)}\s*\(", stripped[m.start():], re.IGNORECASE)
+        if not head:
+            return
+        start = m.start() + head.end() - 1
+        end = _balanced(stripped, start)
+        if end < 0:
+            return
+        for group in split_top(stripped[start + 1:end - 1], ";"):
+            pm = _PARAM_RE.match(group)
+            if not pm:
+                continue
+            kind, rng = pm.group(2), pm.group(3)
+            width, typ = None, kind.lower()
+            if rng:
+                parts = _RANGE_SPLIT_RE.split(rng.strip()[1:-1], maxsplit=1)
+                if len(parts) == 3:
+                    hi, lo = int_value(parts[0], self.constants), int_value(parts[2], self.constants)
+                    if hi is not None and lo is not None:
+                        width, typ = abs(hi - lo) + 1, f"{kind}({' '.join(rng.strip()[1:-1].split())})"
+            for pname in (n.strip().lower() for n in pm.group(1).split(",")):
+                if width is not None:
+                    scope[2][pname] = width
+                    scope[3][pname] = typ
+                self.parameters.append({"function": name.lower(), "name": pname, "kind": kind.lower(),
+                                        "line": scope[0], "span": scope[:2], "scope": scope,
+                                        "declared": width is not None, "width": width, "type": typ, "calls": []})
+
+    def _infer_parameter(self, stripped: str, p: dict) -> None:
+        """An unconstrained parameter (`mu : signed`) is as wide as the value
+        each call passes. When every call outside the function's own body
+        passes the same width, the body is checked at that width and the
+        type text of a plain-name argument (`signed(MU_W-1 downto 0)`) is
+        kept so a fix can name it. timing_recovery (2026-11-10 14:43):
+        `p1 := v2 * mu` with `mu : signed` was 13 + 18 = 31 bits into a
+        30-bit p1; no static check could size it, and four fix rounds got
+        only 'Array sizes do not match ... in process p_s7'."""
+        first, last = p["span"]
+        position = [q["name"] for q in self.parameters if q["function"] == p["function"]].index(p["name"])
+        calls = []
+        for cm in re.finditer(rf"\b{re.escape(p['function'])}\s*\(", stripped, re.IGNORECASE):
+            line = _line_of(stripped, cm.start())
+            if first <= line <= last:
+                continue                                    # its own header or a recursive call
+            end = _balanced(stripped, cm.end() - 1)
+            if end < 0:
+                continue
+            args = split_top(stripped[cm.end():end - 1], ",")
+            if position >= len(args):
+                continue
+            arg = args[position].strip()
+            widths = self.at(line)
+            calls.append((line, arg, expr_width(arg, widths), widths.types.get(arg.lower())))
+        p["calls"] = [(line, arg, w) for line, arg, w, _ in calls]
+        known = {w for _, _, w, _ in calls if w is not None}
+        if len(known) != 1 or any(w is None for _, _, w, _ in calls):
+            return
+        width = known.pop()
+        typ = next((t for _, _, _, t in calls if t), None) or f"{p['kind']}({width - 1} downto 0)"
+        p["width"], p["type"] = width, typ
+        p["scope"][2][p["name"]] = width
+        p["scope"][3][p["name"]] = typ
 
     def _innermost(self, line: int) -> tuple[int, int, dict[str, int], dict[str, str]] | None:
         inside = [s for s in self.scopes if s[0] <= line <= s[1]]

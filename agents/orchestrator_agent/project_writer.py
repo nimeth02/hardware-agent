@@ -1,7 +1,8 @@
 # agents/orchestrator_agent/project_writer.py — assemble a project folder
 # (projects/<requirement id>/: spec.json, src/, tb/, the two test-vector
-# CSVs) from the agents' results, through the file-server MCP. This is the
-# layout the simulation and implementation agents read.
+# CSVs, the MATLAB script that made them) from the agents' results, through
+# the file-server MCP. This is the layout the simulation and implementation
+# agents read.
 
 from __future__ import annotations
 
@@ -12,6 +13,14 @@ from agents.mcp_utils import mcp_read_file, mcp_write_files
 from services.config import REPO_ROOT
 
 CSV_KEYS = ("input_csv", "output_csv")
+# written by the golden model of a closed-loop design (CLOSED-LOOP TRACE rule):
+# its mu / e / v / acc per output beat, shown next to the chip's registers
+# when the simulation fails (simulation_agent.inside_values)
+LOOP_TRACE_CSV = "loop_trace.csv"
+# the golden-model script the test-vector worker wrote in its run folder
+# (test_vector_generator_agent.state.SCRIPT_NAME); copied next to the CSVs
+# so the owner can see how the expected values were produced (2026-11-10)
+MATLAB_SCRIPT = "gen_test_vectors.m"
 
 
 def write_project(requirement_id: str, spec: dict, rtl: dict, testbench: dict,
@@ -32,6 +41,10 @@ def write_project(requirement_id: str, spec: dict, rtl: dict, testbench: dict,
             content = mcp_read_file(vectors["run_dir"], csv_name) if csv_name else None
             if content is not None:
                 files[f"projects/{name}/{csv_name}"] = content
+        for extra in (LOOP_TRACE_CSV, MATLAB_SCRIPT):
+            content = mcp_read_file(vectors["run_dir"], extra)
+            if content is not None:
+                files[f"projects/{name}/{extra}"] = content
     mcp_write_files(str(REPO_ROOT), files)
     return {"status": "COMPLETE", "project_dir": str(REPO_ROOT / "projects" / name), "files": list(files)}
 

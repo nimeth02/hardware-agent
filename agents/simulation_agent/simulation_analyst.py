@@ -20,8 +20,9 @@ from pathlib import Path
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.json_utils import extract_json
+from agents.simulation_agent.inside_values import WAVES_PATH, inside_values
 from agents.simulation_agent.state import AGENT_NAME
-from agents.test_vector_agent.test_vector_validator import spec_output_rate
+from agents.test_vector_agent.lint.test_vector_validator import spec_output_rate
 from observability.callback import ObservabilityCallbackHandler
 from prompts.simulation_agent_prompt import SIMULATION_AGENT_SYSTEM_PROMPT
 from services.llm_client import get_llm
@@ -257,11 +258,14 @@ def log_excerpt(compile_result: dict | None, sim: dict | None) -> str | None:
     return excerpt
 
 
-def with_evidence(analysis: dict, compile_result: dict | None, sim: dict | None, beats: list[dict]) -> dict:
+def with_evidence(analysis: dict, compile_result: dict | None, sim: dict | None, beats: list[dict],
+                  inside: dict | None = None) -> dict:
     """`analysis` plus the evidence behind it, for the blamed agent:
     "failing_beats" (failing_beats(): the input row the design received, the
-    expected row and the log line with the value it produced) and
-    "log_excerpt" (log_excerpt()). A passing verdict is returned as it is."""
+    expected row and the log line with the value it produced), "log_excerpt"
+    (log_excerpt()) and "inside_values" (inside_values(): the chip's loop
+    registers next to the golden model's values on the beats around the first
+    failure). A passing verdict is returned as it is."""
     if analysis.get("verdict") == "pass":
         return analysis
     if beats:
@@ -269,6 +273,8 @@ def with_evidence(analysis: dict, compile_result: dict | None, sim: dict | None,
     excerpt = log_excerpt(compile_result, sim)
     if excerpt:
         analysis["log_excerpt"] = excerpt
+    if inside:
+        analysis["inside_values"] = inside
     return analysis
 
 
@@ -573,6 +579,52 @@ def flag_cycle_compare_hint(sim_output) -> str | None:
             f"the RTL.")
 
 
+# "beat 2 (input cycle 22): m_axis_tuser expected 249 got 0 (tolerance 8)"
+_SIGNAL_EXPECTED_GOT = re.compile(r"\b([A-Za-z_]\w*)\s+expected\s+(.+?)\s+got\s+(.+?)\s*$", re.IGNORECASE)
+_TOLERANCE_NOTE = re.compile(r"\s*\(\s*tol\w*[^)]*\)\s*$", re.IGNORECASE)
+STUCK_MIN_LINES = 4           # lines of one output needed before "always the same value" means anything
+STUCK_MIN_EXPECTED = 3        # different expected values on those lines
+
+
+def stuck_output_hint(sim_output) -> str | None:
+    """A fixed-rule reading for an output that shows ONE value on every line
+    while the expected value keeps changing, or None.
+
+    timing_recovery, 2026-11-09 14:18 (run 35b45c09, attempt 4): every line
+    read "m_axis_tuser expected 249 / 246 / 229 / ... got 0". The RTL's
+    error value was always 0 (its mid-point used the same expression as its
+    symbol, and the I and Q products were subtracted), so the loop never
+    moved and mu stayed at its reset value. In attempts 2 and 3 the analyst
+    had blamed the test vectors for the same design."""
+    if not isinstance(sim_output, str):
+        return None
+    by_signal: dict[str, list[tuple[str, str]]] = {}
+    for line in sim_output.splitlines():
+        if _SUMMARY_LINE.search(line):
+            continue
+        m = _SIGNAL_EXPECTED_GOT.search(line)
+        if m:
+            got = _TOLERANCE_NOTE.sub("", m.group(3)).strip().lower()
+            by_signal.setdefault(m.group(1), []).append((m.group(2).strip().lower(), got))
+    for name, pairs in by_signal.items():
+        got_values = {g for _, g in pairs}
+        expected_values = {e for e, _ in pairs}
+        if len(pairs) >= STUCK_MIN_LINES and len(got_values) == 1 and len(expected_values) >= STUCK_MIN_EXPECTED:
+            stuck = next(iter(got_values))
+            return (f"FIXED RULE (not a guess): on all {len(pairs)} lines for {name} the design answered the same value "
+                    f"({stuck}) while the expected value took {len(expected_values)} different values. The logic that "
+                    f"drives {name} never updates: it still holds its reset value. Unless the spec says {name} is a "
+                    f"constant, likely_cause is 'rtl'; do not ask for the test vectors to be recomputed on this "
+                    f"evidence, and do not blame the testbench. For a design with a loop (timing recovery: mu, the NCO "
+                    f"phase, the loop filter) this means the error value that feeds the loop is always 0 or never "
+                    f"reaches it. Checks for the RTL: is the value computed from its OWN inputs (a mid-point "
+                    f"interpolated from the older samples, not the same expression as the symbol)? are the I and Q "
+                    f"products of the error ADDED (Re{{a*conj(b)}} = aI*bI + aQ*bQ)? is the loop filter updated on "
+                    f"every strobe, and does its output reach the NCO step? Any '{name}'-independent 'expected X got Y' "
+                    f"data lines follow from the same fault: a loop that never moves samples at the wrong instant.")
+    return None
+
+
 def fixed_rule_hint(sim_output, inputs_csv=None, outputs_csv=None, spec=None) -> str | None:
     """The first fixed rule that applies to the mismatch lines, or None. The
     flag rule comes first: when the testbench checks WHEN the design answers,
@@ -582,7 +634,48 @@ def fixed_rule_hint(sim_output, inputs_csv=None, outputs_csv=None, spec=None) ->
     return (flag_cycle_compare_hint(sim_output)
             or beat_count_hint(sim_output, wrong_vectors_reason(inputs_csv, outputs_csv, spec))
             or shifted_values_hint(sim_output) or all_zero_output_hint(sim_output)
+            or stuck_output_hint(sim_output)
             or idle_row_deadlock_hint(sim_output, inputs_csv))
+
+
+# A design whose answer on a beat depends on earlier rows cannot be judged
+# from one row. timing_recovery, 2026-11-09 14:18 (run 35b45c09, attempts 2
+# and 3): the python_check only receives the 8 failing beats (one input word
+# each); the analyst wrote in its own check "I cannot recompute the exact
+# state without the full input stream ... But I am forced to return
+# python_check", treated the output as the input sample of that row, printed
+# expected_matches_spec=no on every beat, and check_verdict() then FORCED the
+# blame onto test vectors that were correct. They were regenerated twice.
+_HISTORY_RE = re.compile(
+    r"\b[a-z_]\w*\[\s*[a-z]\s*[-+]\s*\d+\s*\]"                       # x[m-1], x[n+2]: an earlier / later sample
+    r"|\b\w+_prev\b|\bprevious\s+(?:\w+\s+)?(?:sample|symbol|output|value)s?\b"
+    r"|\bintegrator\b|\baccumulat\w*|\bloop\s+filter\b|\bfeedback\b|\bNCO\b|\bIIR\b", re.IGNORECASE)
+
+HISTORY_NOTE = (
+    "This design's answer on a beat depends on EARLIER input samples and on values it keeps between beats (a sample "
+    "history, a loop filter, an NCO phase), not only on the row shown in failing_beats. One row is not enough to "
+    "recompute the spec's answer, so python_check is not available for this design; do not do that arithmetic in "
+    "prose either. An expected value that differs from the input sample on the same row is NORMAL (the golden model "
+    "ran the whole input stream from reset: it interpolates between samples and carries the loop state) and is NOT "
+    "evidence that the test vectors are wrong. Name 'test_vectors' only when a fixed_rule_hint says so. Read the "
+    "pattern of the 'got' values instead: (a) got equals the raw input sample of that row or of a neighbouring row "
+    "on every beat, or one output shows the same value on every beat while its expected value changes: the design's "
+    "interpolator or loop is not working, likely_cause 'rtl'; (b) got sits at the saturation values (+2047 / -2048) "
+    "on most beats: a product was not scaled back, likely_cause 'rtl'; (c) otherwise decide from the log and "
+    "testbench_code as usual.")
+
+
+def depends_on_history(spec: dict | None, beats: list[dict] | None = None) -> bool:
+    """Whether one failing row is NOT enough to recompute the spec's answer:
+    the design produces fewer output beats than input beats (failing_beats
+    marked the entry), or the spec's behaviour reads earlier samples or
+    keeps a value between beats (x[m-1], y_prev, an integrator, a loop
+    filter, an NCO)."""
+    if any(b.get("input_row_note") for b in beats or []):
+        return True
+    spec = spec or {}
+    lines = [str(spec.get("description") or "")] + [str(b) for b in spec.get("behavior") or []]
+    return bool(_HISTORY_RE.search("\n".join(lines)))
 
 
 def forced_vector_cause(sim_output, inputs_csv, outputs_csv, spec) -> str | None:
@@ -826,9 +919,10 @@ class SimulationAnalyst:
         in_csv, out_csv, spec = project.get("test_vectors_in_csv"), project.get("test_vectors_out_csv"), project.get("spec")
         sim_output = (sim or {}).get("sim_output")
         beats = failing_beats(sim_output, in_csv, out_csv, spec)
+        inside = self._inside_values(project, beats) if beats else None
         verdict = deterministic_verdict(compile_result, sim, spec)
         if verdict is not None:
-            return with_evidence(verdict, compile_result, sim, beats)
+            return with_evidence(verdict, compile_result, sim, beats, inside)
         compile_for_llm, sim_for_llm = _trim_for_llm(compile_result, sim)
         payload = {
             "spec": project.get("spec"),
@@ -850,9 +944,15 @@ class SimulationAnalyst:
         forced_cause = forced_vector_cause(sim_output, in_csv, out_csv, spec)
         if beats:
             payload["failing_beats"] = beats
+        if inside:
+            payload["inside_values"] = inside
         # a log rule (shifted values, all zeros, idle-row deadlocks) already
         # settled it without arithmetic; the calculator is for value mismatches
-        payload["python_check_allowed"] = bool(beats) and hint is None
+        # of designs whose answer can be recomputed from the one failing row
+        stateful = depends_on_history(spec, beats)
+        payload["python_check_allowed"] = bool(beats) and hint is None and not stateful
+        if stateful and beats and hint is None:
+            payload["note"] = " ".join(n for n in (payload.get("note"), HISTORY_NOTE) if n)
 
         raw, reply = self._ask(payload)
         check: dict | None = None
@@ -871,6 +971,10 @@ class SimulationAnalyst:
             payload["python_check_allowed"] = False
             payload["note"] = "No further python_check is possible. Return the final verdict JSON now."
             raw, reply = self._ask(payload)
+        elif stateful and reply and reply.get("python_check") and not reply.get("likely_cause"):
+            # it sent a check although none is possible for this design; the check is not run
+            payload["note"] = HISTORY_NOTE + " No further python_check is possible. Return the final verdict JSON now."
+            raw, reply = self._ask(payload)
 
         analysis = reply if reply and reply.get("verdict") else parse_analysis_response(raw, sim)
         analysis.pop("python_check", None)
@@ -878,16 +982,35 @@ class SimulationAnalyst:
             analysis["python_check"] = check
             cause = check_verdict(check["stdout"]) if check["status"] == "ok" else None
             if cause:
+                # the check's reading travels as a FIXED RULE the analyst has already read; since
+                # 2026-11-10 it no longer overrides the verdict (run 35b45c09: a check that could not
+                # see the sample history forced the blame onto correct vectors, twice)
                 analysis["fixed_rule"] = check_rule_hint(cause, check)
-                if analysis.get("verdict") == "fail" and analysis.get("likely_cause") != cause:
-                    # the LLM contradicted the arithmetic it wrote itself; the arithmetic wins
-                    analysis["overridden_cause"] = analysis.get("likely_cause")
-                    analysis["likely_cause"] = cause
         if hint:
             analysis["fixed_rule"] = hint     # travels with the blame note, word for word (blame.downstream_note)
+        # The ONE override left: the vectors are provably wrong by code that read the CSV files
+        # themselves (constant input / the strobe never fires), no LLM arithmetic involved. Blaming
+        # the RTL or the testbench would only send a worker to fix a file it cannot fix.
         if forced_cause and analysis.get("verdict") == "fail" and analysis.get("likely_cause") != forced_cause:
-            # the vectors are provably wrong (constant input / strobe never fires); the LLM's blame of
-            # the RTL or testbench would only send the wrong worker to fix a file it cannot fix
             analysis["overridden_cause"] = analysis.get("likely_cause")
             analysis["likely_cause"] = forced_cause
-        return with_evidence(analysis, compile_result, sim, beats)
+        return with_evidence(analysis, compile_result, sim, beats, inside)
+
+    @staticmethod
+    def _inside_values(project: dict, beats: list[dict]) -> dict | None:
+        """The chip's loop registers (from the VCD the simulator wrote next to
+        the project) and the golden model's loop values (loop_trace.csv) on the
+        beats around the first failure; None when neither is there. The VCD is
+        read straight from disk: it sits in the project folder on this machine,
+        and a project without one (tests, a remote simulator) simply has none."""
+        vcd_text = None
+        try:
+            path = Path(str(project.get("dir") or "")) / WAVES_PATH
+            if project.get("dir") and path.is_file():
+                vcd_text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            vcd_text = None
+        try:
+            return inside_values(vcd_text, project.get("loop_trace_csv"), beats)
+        except Exception:                                   # a malformed wave file must never stop the analysis
+            return None
